@@ -1,6 +1,6 @@
 name: reference-replication
-version: "0.1"
-description: Phase 1 pipeline for converting a reference video into a choreography-first Reference Blueprint. No footage matching or rendering.
+version: "0.2"
+description: Reference replication pipeline through Phase 2: reference blueprint, user-footage profiling, and full-coverage reference-to-footage matching. Rendering begins in a later phase.
 category: custom
 stability: beta
 default_checkpoint_policy: guided
@@ -38,11 +38,75 @@ stages:
       - Semantic enrichment is complete
       - Choreography action order is explicit
       - No footage matching or rendering is performed
+
+  - name: footage
+    skill: pipelines/reference-replication/footage-director
+    required_artifacts_in:
+      - reference_blueprint
+    produces:
+      - footage_profiles
+    required_tools:
+      - footage_profile_builder
+    optional_tools:
+      - frame_sampler
+      - scene_detect
+    tools_available:
+      - footage_profile_builder
+      - frame_sampler
+      - scene_detect
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - Every intended user-footage file was actually inspected
+      - Final usable segments follow action or interaction boundaries rather than fixed sampling windows
+      - Segment boundaries and evidence timestamps are measured and source-grounded
+      - Camera, spatial, motion, and quality descriptions are useful for matching
+      - Unusable clips are marked honestly rather than forced into the candidate pool
+    success_criteria:
+      - Produces a schema-valid footage_profiles artifact
+      - semantic_enrichment_required is false
+      - At least one usable footage segment exists
+      - No local AI dependency is introduced
+      - No final reference matching or rendering is performed
+
+  - name: match
+    skill: pipelines/reference-replication/match-director
+    required_artifacts_in:
+      - reference_blueprint
+      - footage_profiles
+    produces:
+      - reference_matching
+    required_tools:
+      - reference_candidate_ranker
+      - reference_match_validator
+    optional_tools:
+      - frame_sampler
+    tools_available:
+      - reference_candidate_ranker
+      - reference_match_validator
+      - frame_sampler
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - Coverage is complete even when some footage is only a fallback
+      - Action and interaction fit take priority over superficial similarity
+      - Camera and spatial relationships are considered before duration-only matching
+      - Fallback choices are explicit and accompanied by better-footage requests
+      - Reuse is allowed only when necessary to keep the future timeline complete
+    success_criteria:
+      - Produces a schema-valid reference_matching artifact
+      - matched_segment_count equals reference_segment_count
+      - full_coverage is true
+      - Every fallback has an improvement request
+      - No timeline composition or rendering is performed
+
 extensions:
   custom_scripts: false
   custom_playbooks: false
   custom_skills: true
   custom_tools: true
 metadata:
-  phase: 1
-  output_contract: schemas/artifacts/reference_blueprint.schema.json
+  phase: 2
+  phase_1_contract: schemas/artifacts/reference_blueprint.schema.json
+  footage_contract: schemas/artifacts/footage_profiles.schema.json
+  output_contract: schemas/artifacts/reference_matching.schema.json
