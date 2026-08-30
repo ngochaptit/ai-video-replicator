@@ -28,6 +28,22 @@ class ImportResult:
         return {"stage": self.stage, "imported": self.imported}
 
 
+@dataclass(frozen=True)
+class BootstrapResult:
+    completed: tuple[str, ...]
+    inferred: tuple[str, ...]
+    imported: dict[str, str]
+    status: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "completed": list(self.completed),
+            "inferred": list(self.inferred),
+            "imported": self.imported,
+            "status": self.status,
+        }
+
+
 def _candidate_paths(project_root: Path, name: str) -> tuple[Path, ...]:
     filename = f"{name}.json"
     return (
@@ -84,3 +100,53 @@ def complete_from_imported_artifacts(runner: PipelineRunner, *, stage: str | Non
     }
     status = runner.complete(result.stage, checkpoint)
     return {"stage": result.stage, "imported": result.imported, "status": status}
+
+
+def bootstrap_legacy_state(runner: PipelineRunner) -> BootstrapResult:
+    """Advance a pristine Moon state only when legacy artifacts prove prior work.
+
+    The one inference allowed is proposal -> analyze: a complete pair of canonical
+    analyze artifacts proves the legacy run crossed the proposal gate, even when an
+    older run did not persist proposal_packet.json. No other missing stage is inferred.
+    """
+
+    if runner.state.completed or runner.state.next_stage() != "proposal":
+        raise ValueError("legacy bootstrap requires a pristine Moon state at 'proposal'")
+
+    discovered = discover_existing_artifacts(runner.project.root)
+    completed: list[str] = []
+    inferred: list[str] = []
+    imported: dict[str, str] = {}
+
+    analyze_required = _STAGE_ARTIFACTS["analyze"]
+    analyze_is_proven = all(name in discovered for name in analyze_required)
+
+    if "proposal_packet" in discovered:
+        result = complete_from_imported_artifacts(runner, stage="proposal")
+        completed.append("proposal")
+        imported.update(result["imported"])
+    elif analyze_is_proven:
+        evidence = {name: discovered[name] for name in analyze_required}
+        runner.complete(
+            "proposal",
+            {
+                "source": "legacy_downstream_evidence",
+                "inferred": True,
+                "evidence_stage": "analyze",
+                "evidence_artifacts": evidence,
+            },
+        )
+        completed.append("proposal")
+        inferred.append("proposal")
+    else:
+        return BootstrapResult(tuple(completed), tuple(inferred), imported, runner.status())
+
+    for stage in runner.state.stages[1:]:
+        required = _STAGE_ARTIFACTS[stage]
+        if not all(name in discovered for name in required):
+            break
+        result = complete_from_imported_artifacts(runner, stage=stage)
+        completed.append(stage)
+        imported.update(result["imported"])
+
+    return BootstrapResult(tuple(completed), tuple(inferred), imported, runner.status())
