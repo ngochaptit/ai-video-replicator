@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmontage/artifacts/replication_render_plan",
+  "title": "Replication Render Plan",
+  "description": "Phase 4 contract bridging the runtime-agnostic replication timeline to OpenMontage composition. Runtime choice is explicit and must already be user-approved; the plan never silently selects or swaps runtimes.",
+  "type": "object",
+  "required": ["version", "render_runtime", "renderer_family", "composition_mode", "runtime_approved", "edit_decisions", "asset_manifest", "text_overlays", "output", "warnings", "metadata"],
+  "properties": {
+    "version": {"type": "string", "const": "1.0"},
+    "render_runtime": {"type": "string", "enum": ["ffmpeg", "remotion", "hyperframes"]},
+    "renderer_family": {"type": "string", "enum": ["explainer-data", "explainer-teacher", "cinematic-trailer", "documentary-montage", "product-reveal", "screen-demo", "presenter", "animation-first"]},
+    "composition_mode": {"type": "string", "enum": ["templated", "atelier"]},
+    "runtime_approved": {"type": "boolean", "const": true},
+    "edit_decisions": {
+      "type": "object",
+      "required": ["version", "cuts", "render_runtime", "renderer_family", "composition_mode"],
+      "properties": {
+        "version": {"type": "string", "const": "1.0"},
+        "cuts": {"type": "array", "minItems": 1},
+        "render_runtime": {"type": "string", "enum": ["ffmpeg", "remotion", "hyperframes"]},
+        "renderer_family": {"type": "string"},
+        "composition_mode": {"type": "string", "enum": ["templated", "atelier"]},
+        "metadata": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "asset_manifest": {
+      "type": "object",
+      "required": ["version", "assets"],
+      "properties": {
+        "version": {"type": "string", "const": "1.0"},
+        "assets": {"type": "array"},
+        "metadata": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "text_overlays": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["reference_segment_id", "start_seconds", "end_seconds", "content", "position"],
+        "properties": {
+          "reference_segment_id": {"type": "string"},
+          "start_seconds": {"type": "number", "minimum": 0},
+          "end_seconds": {"type": "number", "minimum": 0},
+          "content": {"type": "string", "minLength": 1},
+          "position": {"type": ["string", "null"]},
+          "timing_notes": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "output": {
+      "type": "object",
+      "required": ["path", "width", "height", "fit"],
+      "properties": {
+        "path": {"type": "string"},
+        "profile": {"type": ["string", "null"]},
+        "width": {"type": "integer", "minimum": 2},
+        "height": {"type": "integer", "minimum": 2},
+        "fit": {"type": "string", "enum": ["pad", "cover"]}
+      },
+      "additionalProperties": false
+    },
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "metadata": {
+      "type": "object",
+      "required": ["generated_by", "replication_timeline_path", "reference_blueprint_path", "hold_segment_count", "non_cut_transition_count"],
+      "properties": {
+        "generated_by": {"type": "string"},
+        "replication_timeline_path": {"type": "string"},
+        "reference_blueprint_path": {"type": "string"},
+        "hold_segment_count": {"type": "integer", "minimum": 0},
+        "non_cut_transition_count": {"type": "integer", "minimum": 0},
+        "notes": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
