@@ -24,6 +24,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("resume", help="Clear transient blocked/running state and resume from the next incomplete stage")
     sub.add_parser("inspect-reference", help="Probe the configured reference video")
     sub.add_parser("inspect-footage", help="Probe every video in the configured footage directory")
+    sub.add_parser("discover-artifacts", help="Find canonical reference-replication JSON artifacts already present in the project")
+
+    import_artifacts = sub.add_parser("import-artifacts", help="Import canonical artifacts for the current or selected stage into .moon")
+    import_artifacts.add_argument("--stage")
+
+    complete_artifacts = sub.add_parser("complete-from-artifacts", help="Import canonical artifacts and checkpoint the current or selected stage")
+    complete_artifacts.add_argument("--stage")
 
     frames = sub.add_parser("frames", help="Extract timestamped local frames for an external agent")
     frames.add_argument("--source", required=True, help="Project-relative source video path")
@@ -61,6 +68,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = protocol.handle({"action": "media.inspect.reference"})["result"]
     elif args.command == "inspect-footage":
         result = protocol.handle({"action": "media.inspect.footage"})["result"]
+    elif args.command == "discover-artifacts":
+        result = protocol.handle({"action": "artifact.discover"})["result"]
+    elif args.command == "import-artifacts":
+        result = protocol.handle({"action": "artifact.import", "stage": args.stage})["result"]
+    elif args.command == "complete-from-artifacts":
+        result = protocol.handle({"action": "stage.complete_from_artifacts", "stage": args.stage})["result"]
     elif args.command == "frames":
         result = protocol.handle(
             {
