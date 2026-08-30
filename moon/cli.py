@@ -22,6 +22,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init", help="Initialize .moon state in a project")
     sub.add_parser("status", help="Print resumable pipeline status as JSON")
     sub.add_parser("resume", help="Clear transient blocked/running state and resume from the next incomplete stage")
+    sub.add_parser("stage-plan", help="Describe who owns the next stage and which agent artifact is required")
+    sub.add_parser("run-stage", help="Run deterministic work for the next stage or emit an agent task")
     sub.add_parser("inspect-reference", help="Probe the configured reference video")
     sub.add_parser("inspect-footage", help="Probe every video in the configured footage directory")
     sub.add_parser("discover-artifacts", help="Find canonical reference-replication JSON artifacts already present in the project")
@@ -65,6 +67,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = protocol.handle({"action": "status"})["result"]
     elif args.command == "resume":
         result = protocol.handle({"action": "resume"})["result"]
+    elif args.command == "stage-plan":
+        result = protocol.handle({"action": "stage.plan"})["result"]
+    elif args.command == "run-stage":
+        result = protocol.handle({"action": "stage.run"})["result"]
     elif args.command == "inspect-reference":
         result = protocol.handle({"action": "media.inspect.reference"})["result"]
     elif args.command == "inspect-footage":
