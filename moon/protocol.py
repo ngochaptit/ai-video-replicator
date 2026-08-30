@@ -9,6 +9,7 @@ from moon.bridge import (
     discover_existing_artifacts,
     import_existing_artifacts,
 )
+from moon.execution import StageExecutionService
 from moon.media.frames import sample_frames
 from moon.media.inspection import inspect_footage, inspect_reference, resolve_project_source
 from moon.runner.pipeline import PipelineRunner
@@ -26,6 +27,10 @@ class MoonProtocol:
             return {"ok": True, "result": self.runner.status()}
         if action == "resume":
             return {"ok": True, "result": self.runner.resume()}
+        if action == "stage.plan":
+            return {"ok": True, "result": StageExecutionService(self.runner).plan()}
+        if action == "stage.run":
+            return {"ok": True, "result": StageExecutionService(self.runner).run()}
         if action == "begin":
             stage = request.get("stage")
             return {"ok": True, "result": {"stage": self.runner.begin(stage)}}
