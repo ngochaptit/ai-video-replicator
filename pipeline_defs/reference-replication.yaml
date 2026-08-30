@@ -1,6 +1,6 @@
 name: reference-replication
-version: "0.4"
-description: Reference replication pipeline through Phase 4: reference blueprint, footage profiling, full-coverage matching, exact timeline construction, explicit runtime planning, and draft rendering. Semantic final QC is Phase 5.
+version: "0.5"
+description: Full reference replication workflow from reference analysis through footage matching, exact timeline, draft rendering, GPT semantic QC, revision routing, and QC-gated final delivery.
 category: custom
 stability: beta
 default_checkpoint_policy: guided
@@ -27,17 +27,10 @@ stages:
       - transcriber
     checkpoint_required: true
     human_approval_default: true
-    review_focus:
-      - Full-duration coverage without unintended gaps or overlaps
-      - Action and interaction boundaries, not hard cuts alone
-      - Camera and spatial relationships needed for later footage matching
-      - Evidence-grounded confidence and explicit uncertainty
-      - Critical versus soft replication constraints
     success_criteria:
       - Produces a schema-valid reference_blueprint artifact
       - Semantic enrichment is complete
       - Choreography action order is explicit
-      - No footage matching or rendering is performed
 
   - name: footage
     skill: pipelines/reference-replication/footage-director
@@ -56,18 +49,11 @@ stages:
       - scene_detect
     checkpoint_required: true
     human_approval_default: true
-    review_focus:
-      - Every intended user-footage file was actually inspected
-      - Final usable segments follow action or interaction boundaries rather than fixed sampling windows
-      - Segment boundaries and evidence timestamps are measured and source-grounded
-      - Camera, spatial, motion, and quality descriptions are useful for matching
-      - Unusable clips are marked honestly rather than forced into the candidate pool
     success_criteria:
       - Produces a schema-valid footage_profiles artifact
       - semantic_enrichment_required is false
       - At least one usable footage segment exists
       - No local AI dependency is introduced
-      - No final reference matching or rendering is performed
 
   - name: match
     skill: pipelines/reference-replication/match-director
@@ -87,18 +73,11 @@ stages:
       - frame_sampler
     checkpoint_required: true
     human_approval_default: true
-    review_focus:
-      - Coverage is complete even when some footage is only a fallback
-      - Action and interaction fit take priority over superficial similarity
-      - Camera and spatial relationships are considered before duration-only matching
-      - Fallback choices are explicit and accompanied by better-footage requests
-      - Reuse is allowed only when necessary to keep the future timeline complete
     success_criteria:
       - Produces a schema-valid reference_matching artifact
       - matched_segment_count equals reference_segment_count
       - full_coverage is true
       - Every fallback has an improvement request
-      - No timeline composition or rendering is performed
 
   - name: timeline
     skill: pipelines/reference-replication/timeline-director
@@ -114,19 +93,12 @@ stages:
       - reference_timeline_builder
     checkpoint_required: true
     human_approval_default: true
-    review_focus:
-      - Timeline order and timestamps preserve the Reference Blueprint exactly
-      - Every reference segment resolves to one concrete matched source range
-      - Fallbacks remain visible while keeping full timeline coverage
-      - Extreme speed or frame-hold requirements are surfaced as fidelity risks
-      - Render runtime remains unlocked until Phase 4
     success_criteria:
       - Produces a schema-valid replication_timeline artifact
       - Timeline starts at zero and ends at the reference duration
       - No unintended gaps or overlaps exist
       - full_coverage and timeline_contiguous are true
       - No render runtime is silently selected
-      - No video rendering is performed
 
   - name: render
     skill: pipelines/reference-replication/render-director
@@ -147,20 +119,57 @@ stages:
       - video_compose
     checkpoint_required: true
     human_approval_default: true
-    review_focus:
-      - Render runtime and composition mode were explicitly approved and logged before execution
-      - Draft preserves full Phase 3 segment coverage and target duration
-      - No runtime is silently substituted when the approved path is unavailable
-      - Final-frame holds are realized exactly when the approved runtime supports them
-      - Reference text cues are retained with explicit warnings where only segment-level timing is known
-      - Unmeasured transition durations are not invented
     success_criteria:
       - Produces a schema-valid replication_render_plan artifact
       - runtime_approved is true
       - Produces a complete draft_render artifact
       - Rendered duration stays within technical tolerance of the Phase 3 timeline
       - Phase 2 fallbacks remain represented rather than dropped
-      - Draft is not declared final before Phase 5 semantic QC
+
+  - name: qc
+    skill: pipelines/reference-replication/qc-director
+    required_artifacts_in:
+      - reference_blueprint
+      - reference_matching
+      - replication_timeline
+      - replication_render_plan
+      - draft_render
+    produces:
+      - replication_qc_evidence
+      - replication_qc
+      - final_render
+    required_tools:
+      - replication_qc_evidence_builder
+      - reference_qc_validator
+      - reference_finalizer
+    optional_tools:
+      - reference_match_validator
+      - reference_timeline_builder
+      - reference_render_plan_builder
+      - reference_video_renderer
+    tools_available:
+      - replication_qc_evidence_builder
+      - reference_qc_validator
+      - reference_finalizer
+      - reference_match_validator
+      - reference_timeline_builder
+      - reference_render_plan_builder
+      - reference_video_renderer
+    checkpoint_required: true
+    human_approval_default: false
+    review_focus:
+      - GPT compares every reference segment against paired draft evidence
+      - FidelityScore and QualityScore remain separate
+      - Fixable defects route back to match, timeline, or render before finalization
+      - Missing source footage becomes a concrete improvement request, not a timeline hole
+      - No local LLM, VLM, or CLIP dependency performs semantic QC
+    success_criteria:
+      - Produces schema-valid replication_qc_evidence and replication_qc artifacts
+      - QC status is pass or publishable footage_limited
+      - No fixable revision_actions remain
+      - final_decision.publishable is true
+      - final_decision.requires_rerender is false
+      - reference_finalizer produces renders/final.mp4
 
 extensions:
   custom_scripts: false
@@ -168,10 +177,14 @@ extensions:
   custom_skills: true
   custom_tools: true
 metadata:
-  phase: 4
+  phase: 5
+  core_workflow_complete: true
   phase_1_contract: schemas/artifacts/reference_blueprint.schema.json
   footage_contract: schemas/artifacts/footage_profiles.schema.json
   phase_2_contract: schemas/artifacts/reference_matching.schema.json
   phase_3_contract: schemas/artifacts/replication_timeline.schema.json
-  output_contract: schemas/artifacts/replication_render_plan.schema.json
+  phase_4_contract: schemas/artifacts/replication_render_plan.schema.json
+  qc_evidence_contract: schemas/artifacts/replication_qc_evidence.schema.json
+  output_contract: schemas/artifacts/replication_qc.schema.json
   draft_render_path: renders/draft.mp4
+  final_render_path: renders/final.mp4
