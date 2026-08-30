@@ -4,7 +4,12 @@ import json
 
 import pytest
 
-from moon.bridge import complete_from_imported_artifacts, discover_existing_artifacts, import_existing_artifacts
+from moon.bridge import (
+    bootstrap_legacy_state,
+    complete_from_imported_artifacts,
+    discover_existing_artifacts,
+    import_existing_artifacts,
+)
 from moon.core.project import MoonProject
 from moon.runner.pipeline import PipelineRunner
 
@@ -70,3 +75,54 @@ def test_bridge_does_not_skip_pipeline_stage(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="expected 'proposal'"):
         runner.complete("analyze", {"artifacts": {}})
+
+
+def test_bootstrap_legacy_infers_proposal_only_from_complete_analyze_evidence(tmp_path) -> None:
+    runner = PipelineRunner(MoonProject.open(tmp_path, create=True))
+    _write_json(tmp_path / "analysis" / "reference_blueprint.json", {"segments": []})
+    _write_json(tmp_path / "analysis" / "semantic_enrichment.json", {"style": "pov"})
+
+    result = bootstrap_legacy_state(runner)
+
+    assert result.completed == ("proposal", "analyze")
+    assert result.inferred == ("proposal",)
+    assert result.status["next_stage"] == "footage"
+    assert runner.checkpoints.read("proposal")["source"] == "legacy_downstream_evidence"
+    assert runner.checkpoints.read("proposal")["evidence_stage"] == "analyze"
+    assert runner.artifacts.read("reference_blueprint")["segments"] == []
+    assert runner.artifacts.read("semantic_enrichment")["style"] == "pov"
+
+
+def test_bootstrap_legacy_does_not_infer_from_partial_analyze_evidence(tmp_path) -> None:
+    runner = PipelineRunner(MoonProject.open(tmp_path, create=True))
+    _write_json(tmp_path / "analysis" / "reference_blueprint.json", {"segments": []})
+
+    result = bootstrap_legacy_state(runner)
+
+    assert result.completed == ()
+    assert result.inferred == ()
+    assert result.status["next_stage"] == "proposal"
+
+
+def test_bootstrap_legacy_continues_only_through_contiguous_proven_stages(tmp_path) -> None:
+    runner = PipelineRunner(MoonProject.open(tmp_path, create=True))
+    _write_json(tmp_path / "proposal_packet.json", {"approved": True})
+    _write_json(tmp_path / "analysis" / "reference_blueprint.json", {"segments": []})
+    _write_json(tmp_path / "analysis" / "semantic_enrichment.json", {"style": "pov"})
+    _write_json(tmp_path / "match_decisions.json", {"matches": []})
+
+    result = bootstrap_legacy_state(runner)
+
+    assert result.completed == ("proposal", "analyze")
+    assert result.inferred == ()
+    assert result.status["next_stage"] == "footage"
+    assert not runner.checkpoints.exists("match")
+
+
+def test_bootstrap_legacy_refuses_to_rewrite_non_pristine_state(tmp_path) -> None:
+    runner = PipelineRunner(MoonProject.open(tmp_path, create=True))
+    _write_json(tmp_path / "proposal_packet.json", {"approved": True})
+    complete_from_imported_artifacts(runner)
+
+    with pytest.raises(ValueError, match="pristine Moon state"):
+        bootstrap_legacy_state(runner)
