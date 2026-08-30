@@ -10,6 +10,7 @@ from moon.bridge import (
     import_existing_artifacts,
 )
 from moon.execution import StageExecutionService
+from moon.handoff import AgentHandoffService
 from moon.media.frames import sample_frames
 from moon.media.inspection import inspect_footage, inspect_reference, resolve_project_source
 from moon.runner.pipeline import PipelineRunner
@@ -31,6 +32,17 @@ class MoonProtocol:
             return {"ok": True, "result": StageExecutionService(self.runner).plan()}
         if action == "stage.run":
             return {"ok": True, "result": StageExecutionService(self.runner).run()}
+        if action == "handoff.package":
+            stage = request.get("stage")
+            if stage is not None and not isinstance(stage, str):
+                raise ValueError("handoff.package field 'stage' must be a string when provided")
+            return {"ok": True, "result": AgentHandoffService(self.runner).package(stage)}
+        if action == "handoff.submit":
+            stage = request.get("stage")
+            payload = request.get("payload")
+            if not isinstance(stage, str) or not isinstance(payload, dict):
+                raise ValueError("handoff.submit requires string 'stage' and object 'payload'")
+            return {"ok": True, "result": AgentHandoffService(self.runner).submit(stage, payload)}
         if action == "begin":
             stage = request.get("stage")
             return {"ok": True, "result": {"stage": self.runner.begin(stage)}}
@@ -82,14 +94,7 @@ class MoonProtocol:
             width = int(request.get("width", 320))
             source_path = resolve_project_source(self.runner.project, source)
             cache_dir = self.runner.project.cache_dir / "frames" / _safe_cache_name(Path(source).stem, start, end)
-            result = sample_frames(
-                source_path,
-                cache_dir,
-                start_seconds=start,
-                end_seconds=end,
-                count=count,
-                width=width,
-            )
+            result = sample_frames(source_path, cache_dir, start_seconds=start, end_seconds=end, count=count, width=width)
             return {"ok": True, "result": result}
         raise ValueError(f"unknown Moon action: {action!r}")
 
