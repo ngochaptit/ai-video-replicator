@@ -25,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("inspect-reference", help="Probe the configured reference video")
     sub.add_parser("inspect-footage", help="Probe every video in the configured footage directory")
     sub.add_parser("discover-artifacts", help="Find canonical reference-replication JSON artifacts already present in the project")
+    sub.add_parser("bootstrap-legacy", help="Safely migrate a pristine Moon state from proven legacy artifacts")
 
     import_artifacts = sub.add_parser("import-artifacts", help="Import canonical artifacts for the current or selected stage into .moon")
     import_artifacts.add_argument("--stage")
@@ -70,6 +71,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = protocol.handle({"action": "media.inspect.footage"})["result"]
     elif args.command == "discover-artifacts":
         result = protocol.handle({"action": "artifact.discover"})["result"]
+    elif args.command == "bootstrap-legacy":
+        result = protocol.handle({"action": "stage.bootstrap_legacy"})["result"]
     elif args.command == "import-artifacts":
         result = protocol.handle({"action": "artifact.import", "stage": args.stage})["result"]
     elif args.command == "complete-from-artifacts":
