@@ -38,10 +38,11 @@
           },
           "timing_fit": {
             "type": "object",
-            "required": ["mode", "speed", "extreme_speed"],
+            "required": ["mode", "speed", "hold_seconds", "extreme_speed"],
             "properties": {
-              "mode": {"type": "string", "const": "speed_fit"},
+              "mode": {"type": "string", "enum": ["speed_fit", "speed_fit_with_hold"]},
               "speed": {"type": "number", "minimum": 0.1},
+              "hold_seconds": {"type": "number", "minimum": 0},
               "extreme_speed": {"type": "boolean"}
             },
             "additionalProperties": false
@@ -77,13 +78,14 @@
     },
     "coverage": {
       "type": "object",
-      "required": ["segment_count", "full_coverage", "timeline_contiguous", "fallback_count", "extreme_speed_count"],
+      "required": ["segment_count", "full_coverage", "timeline_contiguous", "fallback_count", "extreme_speed_count", "hold_segment_count"],
       "properties": {
         "segment_count": {"type": "integer", "minimum": 1},
         "full_coverage": {"type": "boolean", "const": true},
         "timeline_contiguous": {"type": "boolean", "const": true},
         "fallback_count": {"type": "integer", "minimum": 0},
-        "extreme_speed_count": {"type": "integer", "minimum": 0}
+        "extreme_speed_count": {"type": "integer", "minimum": 0},
+        "hold_segment_count": {"type": "integer", "minimum": 0}
       },
       "additionalProperties": false
     },
