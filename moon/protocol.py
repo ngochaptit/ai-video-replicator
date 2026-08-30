@@ -3,7 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from moon.bridge import complete_from_imported_artifacts, discover_existing_artifacts, import_existing_artifacts
+from moon.bridge import (
+    bootstrap_legacy_state,
+    complete_from_imported_artifacts,
+    discover_existing_artifacts,
+    import_existing_artifacts,
+)
 from moon.media.frames import sample_frames
 from moon.media.inspection import inspect_footage, inspect_reference, resolve_project_source
 from moon.runner.pipeline import PipelineRunner
@@ -56,6 +61,8 @@ class MoonProtocol:
             if stage is not None and not isinstance(stage, str):
                 raise ValueError("stage.complete_from_artifacts field 'stage' must be a string when provided")
             return {"ok": True, "result": complete_from_imported_artifacts(self.runner, stage=stage)}
+        if action == "stage.bootstrap_legacy":
+            return {"ok": True, "result": bootstrap_legacy_state(self.runner).as_dict()}
         if action == "media.inspect.reference":
             return {"ok": True, "result": inspect_reference(self.runner.project)}
         if action == "media.inspect.footage":
