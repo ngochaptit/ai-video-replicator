@@ -41,6 +41,8 @@ stages:
 
   - name: footage
     skill: pipelines/reference-replication/footage-director
+    required_artifacts_in:
+      - reference_blueprint
     produces:
       - footage_profiles
     required_tools:
@@ -69,6 +71,9 @@ stages:
 
   - name: match
     skill: pipelines/reference-replication/match-director
+    required_artifacts_in:
+      - reference_blueprint
+      - footage_profiles
     produces:
       - reference_matching
     required_tools:
