@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmontage/artifacts/replication_qc",
+  "title": "Replication QC",
+  "description": "Canonical Phase 5 GPT semantic/technical review separating reference fidelity from standalone output quality and routing fixable defects back to earlier stages.",
+  "type": "object",
+  "required": ["version", "iteration", "status", "scores", "summary", "segment_reviews", "revision_actions", "improvement_requests", "final_decision", "metadata"],
+  "properties": {
+    "version": {"type": "string", "const": "1.0"},
+    "iteration": {"type": "integer", "minimum": 1},
+    "status": {"type": "string", "enum": ["pass", "revise", "footage_limited"]},
+    "scores": {
+      "type": "object",
+      "required": ["fidelity_score", "quality_score", "choreography", "timing", "camera_framing", "motion_speed", "transitions", "text", "audio", "technical_quality"],
+      "properties": {
+        "fidelity_score": {"type": "number", "minimum": 0, "maximum": 1},
+        "quality_score": {"type": "number", "minimum": 0, "maximum": 1},
+        "choreography": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "timing": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "camera_framing": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "motion_speed": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "transitions": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "text": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "audio": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "technical_quality": {"type": ["number", "null"], "minimum": 0, "maximum": 1}
+      },
+      "additionalProperties": false
+    },
+    "summary": {"type": "string", "minLength": 1},
+    "segment_reviews": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["reference_segment_id", "severity", "dimensions", "issue", "evidence_notes", "recommended_route", "recommended_action"],
+        "properties": {
+          "reference_segment_id": {"type": "string"},
+          "severity": {"type": "string", "enum": ["none", "low", "medium", "high"]},
+          "dimensions": {
+            "type": "array",
+            "items": {"type": "string", "enum": ["choreography", "timing", "camera_framing", "motion_speed", "transitions", "text", "audio", "technical_quality"]}
+          },
+          "issue": {"type": "string"},
+          "evidence_notes": {"type": "string"},
+          "recommended_route": {"type": "string", "enum": ["none", "match", "timeline", "render", "footage"]},
+          "recommended_action": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "revision_actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["reference_segment_id", "route", "priority", "instruction", "measurable_goal"],
+        "properties": {
+          "reference_segment_id": {"type": ["string", "null"]},
+          "route": {"type": "string", "enum": ["match", "timeline", "render"]},
+          "priority": {"type": "string", "enum": ["low", "medium", "high"]},
+          "instruction": {"type": "string", "minLength": 1},
+          "measurable_goal": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "improvement_requests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["reference_segment_id", "reason", "suggested_footage"],
+        "properties": {
+          "reference_segment_id": {"type": "string"},
+          "reason": {"type": "string", "minLength": 1},
+          "suggested_footage": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "final_decision": {
+      "type": "object",
+      "required": ["publishable", "requires_rerender", "reason"],
+      "properties": {
+        "publishable": {"type": "boolean"},
+        "requires_rerender": {"type": "boolean"},
+        "reason": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "metadata": {
+      "type": "object",
+      "required": ["generated_by", "semantic_review_completed", "source_evidence_path", "thresholds", "notes"],
+      "properties": {
+        "generated_by": {"type": "string"},
+        "semantic_review_completed": {"type": "boolean", "const": true},
+        "source_evidence_path": {"type": "string"},
+        "thresholds": {
+          "type": "object",
+          "required": ["fidelity_pass", "quality_pass"],
+          "properties": {
+            "fidelity_pass": {"type": "number", "minimum": 0, "maximum": 1},
+            "quality_pass": {"type": "number", "minimum": 0, "maximum": 1}
+          },
+          "additionalProperties": false
+        },
+        "notes": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
