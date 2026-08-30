@@ -43,7 +43,7 @@ proposal -> analyze -> footage -> match -> timeline -> render -> qc
 
 ## Agent-neutral protocol
 
-The first protocol surface is intentionally small:
+The protocol surface remains vendor-neutral:
 
 ```json
 {"action":"status"}
@@ -52,17 +52,23 @@ The first protocol surface is intentionally small:
 {"action":"complete","stage":"match","checkpoint":{...}}
 {"action":"artifact.write","name":"match_decision_seg_007","payload":{...}}
 {"action":"artifact.read","name":"match_decision_seg_007"}
+{"action":"media.inspect.reference"}
+{"action":"media.inspect.footage"}
+{"action":"media.frames","source":"footage/oneshot.mp4","start_seconds":120,"end_seconds":130,"count":8,"width":320}
 ```
 
 An MCP adapter can be added later by translating MCP tool calls into these same protocol requests. MCP is not part of the core runtime.
 
 ## CLI
 
-The initial local adapter is available through Python:
+The local adapter is available through Python:
 
 ```powershell
 python -m moon --project "D:\AI EDIT VIDEO\8.26" init
 python -m moon --project "D:\AI EDIT VIDEO\8.26" status
+python -m moon --project "D:\AI EDIT VIDEO\8.26" inspect-reference
+python -m moon --project "D:\AI EDIT VIDEO\8.26" inspect-footage
+python -m moon --project "D:\AI EDIT VIDEO\8.26" frames --source "footage\oneshot.mp4" --from 120 --to 130
 python -m moon --project "D:\AI EDIT VIDEO\8.26" begin proposal
 python -m moon --project "D:\AI EDIT VIDEO\8.26" complete proposal proposal.json
 python -m moon --project "D:\AI EDIT VIDEO\8.26" resume
@@ -70,6 +76,12 @@ python -m moon --project "D:\AI EDIT VIDEO\8.26" submit match_decision_seg_007 d
 ```
 
 The CLI prints JSON so coding agents and shell integrations can consume it without scraping human-oriented output.
+
+## Local media inspection
+
+Moon uses `ffprobe` for deterministic metadata inspection only. The normalized inspection contract includes duration, dimensions, orientation, frame rate, codecs, audio/video presence, file size, and path metadata. No semantic decisions are made during probing.
+
+Frame sampling uses `ffmpeg` against the original local source. An agent requests a bounded timestamp window and Moon writes a small set of JPEG samples under `.moon/cache/frames/`. The original video is not copied, uploaded, or physically pre-cut. Sources passed through the protocol must remain inside the Moon project root.
 
 ## Invariants
 
@@ -79,7 +91,8 @@ The CLI prints JSON so coding agents and shell integrations can consume it witho
 4. A checkpoint is persisted before its stage becomes complete.
 5. State and artifacts are plain UTF-8 JSON and must remain inspectable without a database.
 6. Codex or another coding agent is a developer/debugger of Moon; it is not a required runtime component.
+7. Media inspection and frame extraction are deterministic operations; they do not choose shots or score semantic similarity.
 
 ## Next implementation slice
 
-After this foundation is proven locally, add deterministic media inspection and frame sampling behind the same protocol, then bridge existing OpenMontage/reference-replication stages into `PipelineRunner`. Only after the CLI/JSON contract is stable should an MCP adapter be added.
+After media inspection is proven against the real `8.26` project, bridge the existing OpenMontage/reference-replication analyze, footage, match, timeline, render, and QC artifacts into `PipelineRunner`. Only after the CLI/JSON contract is stable should an MCP adapter be added.
