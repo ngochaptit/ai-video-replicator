@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmontage/artifacts/replication_timeline",
+  "title": "Replication Timeline",
+  "description": "Runtime-agnostic Phase 3 timeline derived from the Reference Blueprint and full-coverage matching plan. It preserves reference order and timing while resolving concrete source media ranges for later rendering.",
+  "type": "object",
+  "required": ["version", "reference_duration_seconds", "segments", "coverage", "warnings", "metadata"],
+  "properties": {
+    "version": {"type": "string", "const": "1.0"},
+    "reference_duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+    "segments": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id", "order", "reference_segment_id", "timeline_start", "timeline_end", "target_duration_seconds",
+          "source", "timing_fit", "match", "reference_cues", "quality_risks"
+        ],
+        "properties": {
+          "id": {"type": "string"},
+          "order": {"type": "integer", "minimum": 1},
+          "reference_segment_id": {"type": "string"},
+          "timeline_start": {"type": "number", "minimum": 0},
+          "timeline_end": {"type": "number", "minimum": 0},
+          "target_duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+          "source": {
+            "type": "object",
+            "required": ["path", "footage_segment_id", "in_seconds", "out_seconds", "duration_seconds"],
+            "properties": {
+              "path": {"type": "string"},
+              "footage_segment_id": {"type": "string"},
+              "in_seconds": {"type": "number", "minimum": 0},
+              "out_seconds": {"type": "number", "minimum": 0},
+              "duration_seconds": {"type": "number", "exclusiveMinimum": 0}
+            },
+            "additionalProperties": false
+          },
+          "timing_fit": {
+            "type": "object",
+            "required": ["mode", "speed", "hold_seconds", "extreme_speed"],
+            "properties": {
+              "mode": {"type": "string", "enum": ["speed_fit", "speed_fit_with_hold"]},
+              "speed": {"type": "number", "minimum": 0.1},
+              "hold_seconds": {"type": "number", "minimum": 0},
+              "extreme_speed": {"type": "boolean"}
+            },
+            "additionalProperties": false
+          },
+          "match": {
+            "type": "object",
+            "required": ["class", "overall_score", "rationale", "tradeoffs"],
+            "properties": {
+              "class": {"type": "string", "enum": ["good", "acceptable", "fallback"]},
+              "overall_score": {"type": "number", "minimum": 0, "maximum": 1},
+              "rationale": {"type": "string"},
+              "tradeoffs": {"type": "array", "items": {"type": "string"}}
+            },
+            "additionalProperties": false
+          },
+          "reference_cues": {
+            "type": "object",
+            "required": ["transition_in", "transition_out", "camera", "spatial", "text", "audio"],
+            "properties": {
+              "transition_in": {"type": ["string", "null"]},
+              "transition_out": {"type": ["string", "null"]},
+              "camera": {"type": "object"},
+              "spatial": {"type": "object"},
+              "text": {"type": "object"},
+              "audio": {"type": "object"}
+            },
+            "additionalProperties": false
+          },
+          "quality_risks": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": false
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "required": ["segment_count", "full_coverage", "timeline_contiguous", "fallback_count", "extreme_speed_count", "hold_segment_count"],
+      "properties": {
+        "segment_count": {"type": "integer", "minimum": 1},
+        "full_coverage": {"type": "boolean", "const": true},
+        "timeline_contiguous": {"type": "boolean", "const": true},
+        "fallback_count": {"type": "integer", "minimum": 0},
+        "extreme_speed_count": {"type": "integer", "minimum": 0},
+        "hold_segment_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "metadata": {
+      "type": "object",
+      "required": ["generated_by", "reference_blueprint_path", "reference_matching_path", "render_runtime_locked"],
+      "properties": {
+        "generated_by": {"type": "string"},
+        "reference_blueprint_path": {"type": "string"},
+        "reference_matching_path": {"type": "string"},
+        "render_runtime_locked": {"type": "boolean", "const": false},
+        "notes": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,6 +1,6 @@
 name: reference-replication
-version: "0.2"
-description: Reference replication pipeline through Phase 2: reference blueprint, user-footage profiling, and full-coverage reference-to-footage matching. Rendering begins in a later phase.
+version: "0.3"
+description: Reference replication pipeline through Phase 3: reference blueprint, user-footage profiling, full-coverage matching, and runtime-agnostic timeline construction. Rendering begins in Phase 4.
 category: custom
 stability: beta
 default_checkpoint_policy: guided
@@ -100,13 +100,42 @@ stages:
       - Every fallback has an improvement request
       - No timeline composition or rendering is performed
 
+  - name: timeline
+    skill: pipelines/reference-replication/timeline-director
+    required_artifacts_in:
+      - reference_blueprint
+      - reference_matching
+    produces:
+      - replication_timeline
+    required_tools:
+      - reference_timeline_builder
+    optional_tools: []
+    tools_available:
+      - reference_timeline_builder
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - Timeline order and timestamps preserve the Reference Blueprint exactly
+      - Every reference segment resolves to one concrete matched source range
+      - Fallbacks remain visible while keeping full timeline coverage
+      - Extreme speed or frame-hold requirements are surfaced as fidelity risks
+      - Render runtime remains unlocked until Phase 4
+    success_criteria:
+      - Produces a schema-valid replication_timeline artifact
+      - Timeline starts at zero and ends at the reference duration
+      - No unintended gaps or overlaps exist
+      - full_coverage and timeline_contiguous are true
+      - No render runtime is silently selected
+      - No video rendering is performed
+
 extensions:
   custom_scripts: false
   custom_playbooks: false
   custom_skills: true
   custom_tools: true
 metadata:
-  phase: 2
+  phase: 3
   phase_1_contract: schemas/artifacts/reference_blueprint.schema.json
   footage_contract: schemas/artifacts/footage_profiles.schema.json
-  output_contract: schemas/artifacts/reference_matching.schema.json
+  phase_2_contract: schemas/artifacts/reference_matching.schema.json
+  output_contract: schemas/artifacts/replication_timeline.schema.json
