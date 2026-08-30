@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmontage/artifacts/replication_qc_evidence",
+  "title": "Replication QC Evidence",
+  "description": "Deterministic visual/technical evidence pairing the reference and draft at equivalent timeline timestamps for agent semantic QC.",
+  "type": "object",
+  "required": ["version", "reference_video_path", "draft_video_path", "reference_duration_seconds", "draft_duration_seconds", "duration_delta_seconds", "segments", "metadata"],
+  "properties": {
+    "version": {"type": "string", "const": "1.0"},
+    "reference_video_path": {"type": "string"},
+    "draft_video_path": {"type": "string"},
+    "reference_duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+    "draft_duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+    "duration_delta_seconds": {"type": "number", "minimum": 0},
+    "segments": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["reference_segment_id", "start_seconds", "end_seconds", "sample_timestamps", "reference_frames", "draft_frames"],
+        "properties": {
+          "reference_segment_id": {"type": "string"},
+          "start_seconds": {"type": "number", "minimum": 0},
+          "end_seconds": {"type": "number", "minimum": 0},
+          "sample_timestamps": {"type": "array", "minItems": 1, "items": {"type": "number", "minimum": 0}},
+          "reference_frames": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "draft_frames": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+        },
+        "additionalProperties": false
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "required": ["generated_by", "samples_per_segment", "semantic_review_required", "iteration", "warnings"],
+      "properties": {
+        "generated_by": {"type": "string"},
+        "samples_per_segment": {"type": "integer", "minimum": 1},
+        "semantic_review_required": {"type": "boolean", "const": true},
+        "iteration": {"type": "integer", "minimum": 1},
+        "warnings": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
