@@ -1,0 +1,48 @@
+name: reference-replication
+version: "0.1"
+description: Phase 1 pipeline for converting a reference video into a choreography-first Reference Blueprint. No footage matching or rendering.
+category: custom
+stability: beta
+default_checkpoint_policy: guided
+reference_input:
+  supported: true
+  analysis_depth: deep
+  analysis_tools:
+    - reference_blueprint_builder
+stages:
+  - name: analyze
+    skill: pipelines/reference-replication/analyze-director
+    produces:
+      - reference_blueprint
+    required_tools:
+      - reference_blueprint_builder
+    optional_tools:
+      - frame_sampler
+      - scene_detect
+      - transcriber
+    tools_available:
+      - reference_blueprint_builder
+      - frame_sampler
+      - scene_detect
+      - transcriber
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - Full-duration coverage without unintended gaps or overlaps
+      - Action and interaction boundaries, not hard cuts alone
+      - Camera and spatial relationships needed for later footage matching
+      - Evidence-grounded confidence and explicit uncertainty
+      - Critical versus soft replication constraints
+    success_criteria:
+      - Produces a schema-valid reference_blueprint artifact
+      - Semantic enrichment is complete
+      - Choreography action order is explicit
+      - No footage matching or rendering is performed
+extensions:
+  custom_scripts: false
+  custom_playbooks: false
+  custom_skills: true
+  custom_tools: true
+metadata:
+  phase: 1
+  output_contract: schemas/artifacts/reference_blueprint.schema.json

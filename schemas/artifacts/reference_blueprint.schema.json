@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmontage/artifacts/reference_blueprint",
+  "title": "Reference Blueprint",
+  "description": "Canonical editing-DNA contract for reference replication. Deterministic tools provide timing/evidence; the agent enriches semantic action, choreography, camera, framing, text, and audio meaning.",
+  "type": "object",
+  "required": ["version", "source", "segments", "choreography", "analysis_meta"],
+  "properties": {
+    "version": {"type": "string", "const": "1.0"},
+    "source": {
+      "type": "object",
+      "required": ["path", "duration_seconds"],
+      "properties": {
+        "path": {"type": "string"},
+        "duration_seconds": {"type": "number", "minimum": 0},
+        "resolution": {"type": "string"},
+        "fps": {"type": "number", "minimum": 0},
+        "orientation": {"type": "string", "enum": ["vertical", "horizontal", "square", "unknown"]}
+      },
+      "additionalProperties": false
+    },
+    "segments": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "start_seconds", "end_seconds", "duration_seconds", "boundary_basis", "semantic", "camera", "spatial", "motion", "edit", "text", "audio", "evidence", "confidence"],
+        "properties": {
+          "id": {"type": "string"},
+          "start_seconds": {"type": "number", "minimum": 0},
+          "end_seconds": {"type": "number", "minimum": 0},
+          "duration_seconds": {"type": "number", "minimum": 0},
+          "boundary_basis": {
+            "type": "array",
+            "items": {"type": "string", "enum": ["scene_cut", "action_change", "interaction_change", "motion_change", "audio_cue", "analysis_window", "video_end"]},
+            "minItems": 1
+          },
+          "semantic": {
+            "type": "object",
+            "required": ["actor", "action", "object", "target", "interaction", "description"],
+            "properties": {
+              "actor": {"type": ["string", "null"]},
+              "action": {"type": ["string", "null"]},
+              "object": {"type": ["string", "null"]},
+              "target": {"type": ["string", "null"]},
+              "interaction": {"type": ["string", "null"]},
+              "description": {"type": "string"}
+            },
+            "additionalProperties": false
+          },
+          "camera": {
+            "type": "object",
+            "required": ["pov", "shot_scale", "angle", "movement", "steadiness", "playback_speed"],
+            "properties": {
+              "pov": {"type": ["string", "null"]},
+              "shot_scale": {"type": ["string", "null"]},
+              "angle": {"type": ["string", "null"]},
+              "movement": {"type": ["string", "null"]},
+              "steadiness": {"type": ["string", "null"]},
+              "playback_speed": {"type": ["string", "null"]}
+            },
+            "additionalProperties": false
+          },
+          "spatial": {
+            "type": "object",
+            "required": ["actor_position", "object_position", "entry_direction", "exit_direction", "depth", "framing_notes"],
+            "properties": {
+              "actor_position": {"type": ["string", "null"]},
+              "object_position": {"type": ["string", "null"]},
+              "entry_direction": {"type": ["string", "null"]},
+              "exit_direction": {"type": ["string", "null"]},
+              "depth": {"type": ["string", "null"]},
+              "framing_notes": {"type": "string"}
+            },
+            "additionalProperties": false
+          },
+          "motion": {
+            "type": "object",
+            "required": ["motion_type", "intensity", "flow_variance", "speed_behavior"],
+            "properties": {
+              "motion_type": {"type": ["string", "null"]},
+              "intensity": {"type": ["string", "null"]},
+              "flow_variance": {"type": ["number", "null"], "minimum": 0},
+              "speed_behavior": {"type": ["string", "null"]}
+            },
+            "additionalProperties": false
+          },
+          "edit": {
+            "type": "object",
+            "required": ["transition_in", "transition_out", "segment_role"],
+            "properties": {
+              "transition_in": {"type": ["string", "null"]},
+              "transition_out": {"type": ["string", "null"]},
+              "segment_role": {"type": ["string", "null"]}
+            },
+            "additionalProperties": false
+          },
+          "text": {
+            "type": "object",
+            "required": ["content", "position", "timing_notes"],
+            "properties": {
+              "content": {"type": ["string", "null"]},
+              "position": {"type": ["string", "null"]},
+              "timing_notes": {"type": "string"}
+            },
+            "additionalProperties": false
+          },
+          "audio": {
+            "type": "object",
+            "required": ["speech", "sound_cue", "beat_cue", "energy_notes"],
+            "properties": {
+              "speech": {"type": ["string", "null"]},
+              "sound_cue": {"type": ["string", "null"]},
+              "beat_cue": {"type": ["string", "null"]},
+              "energy_notes": {"type": "string"}
+            },
+            "additionalProperties": false
+          },
+          "evidence": {
+            "type": "object",
+            "required": ["scene_index", "frame_paths", "frame_timestamps"],
+            "properties": {
+              "scene_index": {"type": ["integer", "null"]},
+              "frame_paths": {"type": "array", "items": {"type": "string"}},
+              "frame_timestamps": {"type": "array", "items": {"type": "number", "minimum": 0}}
+            },
+            "additionalProperties": false
+          },
+          "confidence": {
+            "type": "object",
+            "required": ["timing", "semantic", "camera", "overall"],
+            "properties": {
+              "timing": {"type": "number", "minimum": 0, "maximum": 1},
+              "semantic": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+              "camera": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+              "overall": {"type": ["number", "null"], "minimum": 0, "maximum": 1}
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "choreography": {
+      "type": "object",
+      "required": ["summary", "action_order", "critical_constraints", "soft_constraints"],
+      "properties": {
+        "summary": {"type": "string"},
+        "action_order": {"type": "array", "items": {"type": "string"}},
+        "critical_constraints": {"type": "array", "items": {"type": "string"}},
+        "soft_constraints": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    },
+    "analysis_meta": {
+      "type": "object",
+      "required": ["generated_by", "semantic_enrichment_required", "source_analysis_path"],
+      "properties": {
+        "generated_by": {"type": "string"},
+        "semantic_enrichment_required": {"type": "boolean"},
+        "source_analysis_path": {"type": "string"},
+        "notes": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
