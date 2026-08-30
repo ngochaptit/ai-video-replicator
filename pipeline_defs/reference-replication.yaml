@@ -1,5 +1,5 @@
 name: reference-replication
-version: "0.5"
+version: "0.5.1"
 description: Full reference replication workflow from reference analysis through footage matching, exact timeline, draft rendering, GPT semantic QC, revision routing, and QC-gated final delivery.
 category: custom
 stability: beta
@@ -10,6 +10,18 @@ reference_input:
   analysis_tools:
     - reference_blueprint_builder
 stages:
+  - name: proposal
+    skill: pipelines/reference-replication/proposal-director
+    produces: []
+    tools_available: []
+    checkpoint_required: true
+    human_approval_default: true
+    success_criteria:
+      - Reference replication goal and full-coverage policy are acknowledged
+      - Applicable render runtimes are surfaced without silently selecting one
+      - Final render_runtime approval remains deferred to the render stage
+      - GPT/agent remains the semantic and editorial decision-maker
+
   - name: analyze
     skill: pipelines/reference-replication/analyze-director
     produces:

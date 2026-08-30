@@ -13,6 +13,7 @@ def test_reference_replication_pipeline_loads_full_core_workflow() -> None:
 
     assert manifest["reference_input"]["supported"] is True
     assert [stage["name"] for stage in manifest["stages"]] == [
+        "proposal",
         "analyze",
         "footage",
         "match",
@@ -21,7 +22,9 @@ def test_reference_replication_pipeline_loads_full_core_workflow() -> None:
         "qc",
     ]
 
-    analyze, footage, match, timeline, render, qc = manifest["stages"]
+    proposal, analyze, footage, match, timeline, render, qc = manifest["stages"]
+    assert proposal["skill"] == "pipelines/reference-replication/proposal-director"
+    assert proposal["produces"] == []
     assert analyze["produces"] == ["reference_blueprint"]
     assert "reference_blueprint_builder" in analyze["required_tools"]
     assert footage["produces"] == ["footage_profiles"]
@@ -58,6 +61,12 @@ def test_reference_replication_pipeline_loads_full_core_workflow() -> None:
 
 def test_reference_replication_director_skills_exist() -> None:
     skill_dir = ROOT / "skills" / "pipelines" / "reference-replication"
+
+    proposal_text = (skill_dir / "proposal-director.md").read_text(encoding="utf-8")
+    assert "render_runtime" in proposal_text
+    assert "hyperframes" in proposal_text.lower()
+    assert "present both" in proposal_text.lower()
+    assert "full timeline coverage" in proposal_text.lower()
 
     analyze_text = (skill_dir / "analyze-director.md").read_text(encoding="utf-8")
     assert "choreography beats hard-cut detection" in analyze_text.lower()
