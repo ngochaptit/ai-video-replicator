@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmontage/artifacts/reference_matching",
+  "title": "Reference Matching Plan",
+  "description": "Canonical Phase 2 contract mapping every reference segment to user footage. Full coverage is mandatory; weak matches are represented as explicit fallbacks instead of empty timeline slots.",
+  "type": "object",
+  "required": ["version", "reference_blueprint_path", "footage_profiles_path", "matches", "coverage", "improvement_requests", "notes"],
+  "properties": {
+    "version": {"type": "string", "const": "1.0"},
+    "reference_blueprint_path": {"type": "string"},
+    "footage_profiles_path": {"type": "string"},
+    "matches": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["reference_segment_id", "selected", "match_class", "scores", "rationale", "tradeoffs", "alternatives"],
+        "properties": {
+          "reference_segment_id": {"type": "string"},
+          "selected": {
+            "type": "object",
+            "required": ["footage_segment_id", "source_path", "source_in", "source_out", "duration_seconds"],
+            "properties": {
+              "footage_segment_id": {"type": "string"},
+              "source_path": {"type": "string"},
+              "source_in": {"type": "number", "minimum": 0},
+              "source_out": {"type": "number", "minimum": 0},
+              "duration_seconds": {"type": "number", "exclusiveMinimum": 0}
+            },
+            "additionalProperties": false
+          },
+          "match_class": {"type": "string", "enum": ["good", "acceptable", "fallback"]},
+          "scores": {
+            "type": "object",
+            "required": ["action", "interaction", "camera", "spatial", "motion", "duration", "overall"],
+            "properties": {
+              "action": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+              "interaction": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+              "camera": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+              "spatial": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+              "motion": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+              "duration": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+              "overall": {"type": "number", "minimum": 0, "maximum": 1}
+            },
+            "additionalProperties": false
+          },
+          "rationale": {"type": "string", "minLength": 1},
+          "tradeoffs": {"type": "array", "items": {"type": "string"}},
+          "alternatives": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": false
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "required": ["reference_segment_count", "matched_segment_count", "full_coverage", "fallback_count"],
+      "properties": {
+        "reference_segment_count": {"type": "integer", "minimum": 1},
+        "matched_segment_count": {"type": "integer", "minimum": 1},
+        "full_coverage": {"type": "boolean", "const": true},
+        "fallback_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "improvement_requests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["reference_segment_id", "reason", "suggested_footage"],
+        "properties": {
+          "reference_segment_id": {"type": "string"},
+          "reason": {"type": "string"},
+          "suggested_footage": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "notes": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": false
+}
