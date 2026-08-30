@@ -1,6 +1,6 @@
 name: reference-replication
-version: "0.3"
-description: Reference replication pipeline through Phase 3: reference blueprint, user-footage profiling, full-coverage matching, and runtime-agnostic timeline construction. Rendering begins in Phase 4.
+version: "0.4"
+description: Reference replication pipeline through Phase 4: reference blueprint, footage profiling, full-coverage matching, exact timeline construction, explicit runtime planning, and draft rendering. Semantic final QC is Phase 5.
 category: custom
 stability: beta
 default_checkpoint_policy: guided
@@ -128,14 +128,50 @@ stages:
       - No render runtime is silently selected
       - No video rendering is performed
 
+  - name: render
+    skill: pipelines/reference-replication/render-director
+    required_artifacts_in:
+      - reference_blueprint
+      - replication_timeline
+    produces:
+      - replication_render_plan
+      - draft_render
+    required_tools:
+      - reference_render_plan_builder
+      - reference_video_renderer
+      - video_compose
+    optional_tools: []
+    tools_available:
+      - reference_render_plan_builder
+      - reference_video_renderer
+      - video_compose
+    checkpoint_required: true
+    human_approval_default: true
+    review_focus:
+      - Render runtime and composition mode were explicitly approved and logged before execution
+      - Draft preserves full Phase 3 segment coverage and target duration
+      - No runtime is silently substituted when the approved path is unavailable
+      - Final-frame holds are realized exactly when the approved runtime supports them
+      - Reference text cues are retained with explicit warnings where only segment-level timing is known
+      - Unmeasured transition durations are not invented
+    success_criteria:
+      - Produces a schema-valid replication_render_plan artifact
+      - runtime_approved is true
+      - Produces a complete draft_render artifact
+      - Rendered duration stays within technical tolerance of the Phase 3 timeline
+      - Phase 2 fallbacks remain represented rather than dropped
+      - Draft is not declared final before Phase 5 semantic QC
+
 extensions:
   custom_scripts: false
   custom_playbooks: false
   custom_skills: true
   custom_tools: true
 metadata:
-  phase: 3
+  phase: 4
   phase_1_contract: schemas/artifacts/reference_blueprint.schema.json
   footage_contract: schemas/artifacts/footage_profiles.schema.json
   phase_2_contract: schemas/artifacts/reference_matching.schema.json
-  output_contract: schemas/artifacts/replication_timeline.schema.json
+  phase_3_contract: schemas/artifacts/replication_timeline.schema.json
+  output_contract: schemas/artifacts/replication_render_plan.schema.json
+  draft_render_path: renders/draft.mp4
