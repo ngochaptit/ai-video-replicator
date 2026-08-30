@@ -22,6 +22,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init", help="Initialize .moon state in a project")
     sub.add_parser("status", help="Print resumable pipeline status as JSON")
     sub.add_parser("resume", help="Clear transient blocked/running state and resume from the next incomplete stage")
+    sub.add_parser("inspect-reference", help="Probe the configured reference video")
+    sub.add_parser("inspect-footage", help="Probe every video in the configured footage directory")
+
+    frames = sub.add_parser("frames", help="Extract timestamped local frames for an external agent")
+    frames.add_argument("--source", required=True, help="Project-relative source video path")
+    frames.add_argument("--from", dest="start_seconds", required=True, type=float)
+    frames.add_argument("--to", dest="end_seconds", required=True, type=float)
+    frames.add_argument("--count", default=8, type=int)
+    frames.add_argument("--width", default=320, type=int)
 
     begin = sub.add_parser("begin", help="Mark the next stage as running")
     begin.add_argument("stage", nargs="?")
@@ -48,6 +57,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = protocol.handle({"action": "status"})["result"]
     elif args.command == "resume":
         result = protocol.handle({"action": "resume"})["result"]
+    elif args.command == "inspect-reference":
+        result = protocol.handle({"action": "media.inspect.reference"})["result"]
+    elif args.command == "inspect-footage":
+        result = protocol.handle({"action": "media.inspect.footage"})["result"]
+    elif args.command == "frames":
+        result = protocol.handle(
+            {
+                "action": "media.frames",
+                "source": args.source,
+                "start_seconds": args.start_seconds,
+                "end_seconds": args.end_seconds,
+                "count": args.count,
+                "width": args.width,
+            }
+        )["result"]
     elif args.command == "begin":
         result = protocol.handle({"action": "begin", "stage": args.stage})["result"]
     elif args.command == "complete":
