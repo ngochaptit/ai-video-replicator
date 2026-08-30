@@ -18,10 +18,10 @@ The pipeline must preserve full timeline coverage. If source footage is weaker t
 
 `render_runtime` is a user-approved execution decision, not an automatic semantic choice.
 
-At planning time, **Present both** OpenMontage composition runtimes when they are available as a real choice:
+At planning time, **present both** OpenMontage composition runtimes when they are available as a real choice:
 
 - Remotion — useful for React-driven composition and motion graphics.
-- HyperFrames — useful for HTML/CSS/GSAP-oriented motion-design treatments.
+- hyperframes (HyperFrames) — useful for HTML/CSS/GSAP-oriented motion-design treatments.
 
 Also surface FFmpeg when it is available/applicable for reference replication. For footage-led exact-cut reconstruction, FFmpeg is normally the recommended deterministic runtime, but recommendation is not approval.
 
