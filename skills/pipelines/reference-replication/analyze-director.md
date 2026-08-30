@@ -34,6 +34,10 @@ reference_blueprint_builder.execute({
 The returned `reference_blueprint.json` is a **scaffold**, not the finished artifact.
 Its semantic fields are intentionally blank.
 
+When enrichment is ready, run the same tool with `semantic_enrichment_path` pointing
+to the UTF-8 enrichment JSON. The tool replaces scaffold windows with validated
+action segments, range-checks evidence, and writes the final blueprint as UTF-8.
+
 ## Core rule: choreography beats hard-cut detection
 
 A detected scene is not automatically one semantic segment.
@@ -49,6 +53,12 @@ Example: a 5-second continuous POV shot can contain:
 If a window contains multiple meaningful actions/interactions, refine it into
 multiple semantic segments. Preserve measured time coverage and use additional
 `frame_sampler` timestamps when evidence is insufficient.
+
+The fixed analysis windows are sampling scaffolds only. They are not acceptable as
+final semantic boundaries merely because they occur every two seconds. Every final
+internal boundary must be selected from a measured frame timestamp or measured scene
+boundary and labeled with its grounded basis (`action_change`, `interaction_change`,
+`scene_cut`, `motion_change`, or `audio_cue`).
 
 Do not split merely because motion exists. Split when the **editorial/action role**
 changes in a way that matters for later footage matching.
@@ -99,7 +109,16 @@ Keep deterministic `motion_type` and `flow_variance` when present. Add:
 - intensity
 - speed behavior
 
-Do not overwrite measured values with subjective guesses.
+Do not overwrite measured values with subjective guesses. Negative sentinels such as
+`flow_variance = -1` mean the measurement is unavailable and MUST become `null`; they
+are not valid motion measurements.
+
+### Evidence range invariant
+
+Every `evidence.frame_timestamps` value MUST be inside that segment's inclusive
+`[start_seconds, end_seconds]` interval. If no sampled frame is inside the interval,
+sample another measured timestamp. Never attach the nearest keyframe from outside the
+segment and never retain out-of-range evidence during semantic merge.
 
 ### Edit
 
@@ -163,5 +182,9 @@ The stage passes only when:
 5. critical vs soft constraints are separated,
 6. `semantic_enrichment_required` is set to `false`,
 7. the result validates against `schemas/artifacts/reference_blueprint.schema.json`.
+
+The final merge must read UTF-8 (accepting an optional BOM) and write UTF-8 with
+Unicode preserved. Verify Vietnamese or other non-ASCII captions round-trip exactly;
+replacement characters or mojibake fail the stage.
 
 Stop after `reference_blueprint.json`. Footage matching and rendering belong to later phases.

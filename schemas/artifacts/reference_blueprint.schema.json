@@ -80,7 +80,7 @@
             "properties": {
               "motion_type": {"type": ["string", "null"]},
               "intensity": {"type": ["string", "null"]},
-              "flow_variance": {"type": ["number", "null"]},
+              "flow_variance": {"type": ["number", "null"], "minimum": 0},
               "speed_behavior": {"type": ["string", "null"]}
             },
             "additionalProperties": false
