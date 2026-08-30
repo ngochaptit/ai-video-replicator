@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+import jsonschema
 import pytest
 
 from tools.analysis.reference_match_validator import ReferenceMatchValidator
+
+
+ROOT = Path(__file__).resolve().parents[2]
+SCHEMA_PATH = ROOT / "schemas" / "artifacts" / "reference_matching.schema.json"
 
 
 def test_full_coverage_plan_accepts_fallback_and_resolves_source_ranges() -> None:
@@ -17,6 +25,9 @@ def test_full_coverage_plan_accepts_fallback_and_resolves_source_ranges() -> Non
     }
     assert plan["matches"][0]["selected"]["source_path"] == "footage/a.mp4"
     assert plan["matches"][1]["match_class"] == "fallback"
+
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    jsonschema.validate(instance=plan, schema=schema)
 
 
 def test_missing_reference_match_is_rejected() -> None:
