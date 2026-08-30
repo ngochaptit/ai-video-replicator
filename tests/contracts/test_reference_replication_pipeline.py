@@ -8,13 +8,19 @@ from lib.pipeline_loader import load_pipeline
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_reference_replication_pipeline_loads_through_phase_3_without_rendering() -> None:
+def test_reference_replication_pipeline_loads_through_phase_4_with_explicit_render_stage() -> None:
     manifest = load_pipeline("reference-replication")
 
     assert manifest["reference_input"]["supported"] is True
-    assert [stage["name"] for stage in manifest["stages"]] == ["analyze", "footage", "match", "timeline"]
+    assert [stage["name"] for stage in manifest["stages"]] == [
+        "analyze",
+        "footage",
+        "match",
+        "timeline",
+        "render",
+    ]
 
-    analyze, footage, match, timeline = manifest["stages"]
+    analyze, footage, match, timeline, render = manifest["stages"]
     assert analyze["produces"] == ["reference_blueprint"]
     assert "reference_blueprint_builder" in analyze["required_tools"]
 
@@ -29,11 +35,23 @@ def test_reference_replication_pipeline_loads_through_phase_3_without_rendering(
     assert timeline["produces"] == ["replication_timeline"]
     assert timeline["required_tools"] == ["reference_timeline_builder"]
 
-    all_tools = [tool for stage in manifest["stages"] for tool in stage.get("tools_available", [])]
-    assert "video_compose" not in all_tools
-    assert "clip_search" not in all_tools
-    assert manifest["metadata"]["phase"] == 3
-    assert manifest["metadata"]["output_contract"] == "schemas/artifacts/replication_timeline.schema.json"
+    assert render["required_artifacts_in"] == ["reference_blueprint", "replication_timeline"]
+    assert render["produces"] == ["replication_render_plan", "draft_render"]
+    assert "reference_render_plan_builder" in render["required_tools"]
+    assert "reference_video_renderer" in render["required_tools"]
+    assert "video_compose" in render["required_tools"]
+
+    pre_render_tools = [
+        tool
+        for stage in manifest["stages"][:-1]
+        for tool in stage.get("tools_available", [])
+    ]
+    assert "video_compose" not in pre_render_tools
+    assert "clip_search" not in [
+        tool for stage in manifest["stages"] for tool in stage.get("tools_available", [])
+    ]
+    assert manifest["metadata"]["phase"] == 4
+    assert manifest["metadata"]["output_contract"] == "schemas/artifacts/replication_render_plan.schema.json"
 
 
 def test_reference_replication_director_skills_exist() -> None:
@@ -57,8 +75,14 @@ def test_reference_replication_director_skills_exist() -> None:
     assert "do not render in this stage" in timeline_text.lower()
     assert "render_runtime_locked" in timeline_text
 
+    render_text = (skill_dir / "render-director.md").read_text(encoding="utf-8")
+    assert "do not silently choose or switch runtimes" in render_text.lower()
+    assert "recommend ffmpeg" in render_text.lower()
+    assert "runtime_approved=true" in render_text
 
-def test_phase_2_and_phase_3_artifact_contracts_exist() -> None:
+
+def test_phase_2_through_phase_4_artifact_contracts_exist() -> None:
     assert (ROOT / "schemas" / "artifacts" / "footage_profiles.schema.json").is_file()
     assert (ROOT / "schemas" / "artifacts" / "reference_matching.schema.json").is_file()
     assert (ROOT / "schemas" / "artifacts" / "replication_timeline.schema.json").is_file()
+    assert (ROOT / "schemas" / "artifacts" / "replication_render_plan.schema.json").is_file()
