@@ -418,13 +418,19 @@ class ReferenceVideoRenderer(BaseTool):
         return float(output)
 
     def _write_ass(self, path: Path, *, overlays: list[dict[str, Any]], width: int, height: int) -> None:
-        font_size = max(28, int(height * 0.04))
+        # Reference captions are commonly authored for narrow vertical video.
+        # Keep the type proportional to frame height without forcing a 28 px
+        # floor that is too large for 576 px-wide outputs.
+        font_size = max(24, int(height * 0.024))
         lines = [
             "[Script Info]",
             "ScriptType: v4.00+",
             f"PlayResX: {width}",
             f"PlayResY: {height}",
-            "WrapStyle: 2",
+            # Smart word wrapping is required for long reference captions.
+            # WrapStyle 2 keeps a dialogue line unwrapped and can clip both
+            # sides of narrow vertical renders.
+            "WrapStyle: 0",
             "ScaledBorderAndShadow: yes",
             "",
             "[V4+ Styles]",
@@ -448,7 +454,7 @@ class ReferenceVideoRenderer(BaseTool):
         text = str(position or "").lower()
         if not text:
             return None
-        vertical = 8 if "top" in text else 2 if "bottom" in text else 5
+        vertical = 8 if ("top" in text or "upper" in text) else 2 if "bottom" in text else 5
         if "left" in text:
             return {8: 7, 5: 4, 2: 1}[vertical]
         if "right" in text:
