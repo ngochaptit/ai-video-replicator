@@ -43,23 +43,14 @@ proposal -> analyze -> footage -> match -> timeline -> render -> qc
 
 ## Agent-neutral protocol
 
-The protocol surface remains vendor-neutral:
+The protocol surface remains vendor-neutral. In addition to state, artifact, and media actions, Phase 4 adds:
 
 ```json
-{"action":"status"}
-{"action":"resume"}
-{"action":"begin","stage":"match"}
-{"action":"complete","stage":"match","checkpoint":{...}}
-{"action":"artifact.write","name":"match_decision_seg_007","payload":{...}}
-{"action":"artifact.read","name":"match_decision_seg_007"}
-{"action":"artifact.discover"}
-{"action":"artifact.import","stage":"analyze"}
-{"action":"stage.complete_from_artifacts","stage":"analyze"}
-{"action":"stage.bootstrap_legacy"}
-{"action":"media.inspect.reference"}
-{"action":"media.inspect.footage"}
-{"action":"media.frames","source":"footage/oneshot.mp4","start_seconds":120,"end_seconds":130,"count":8,"width":320}
+{"action":"stage.plan"}
+{"action":"stage.run"}
 ```
+
+`stage.plan` tells an agent whether the next stage is deterministic, agent-owned, or hybrid. `stage.run` executes only deterministic work and returns `awaiting_agent` when semantic/editorial input is required.
 
 An MCP adapter can be added later by translating MCP tool calls into these same protocol requests. MCP is not part of the core runtime.
 
@@ -68,62 +59,60 @@ An MCP adapter can be added later by translating MCP tool calls into these same 
 The local adapter is available through Python:
 
 ```powershell
-python -m moon --project "D:\AI EDIT VIDEO\8.26" init
 python -m moon --project "D:\AI EDIT VIDEO\8.26" status
+python -m moon --project "D:\AI EDIT VIDEO\8.26" stage-plan
+python -m moon --project "D:\AI EDIT VIDEO\8.26" run-stage
 python -m moon --project "D:\AI EDIT VIDEO\8.26" inspect-reference
 python -m moon --project "D:\AI EDIT VIDEO\8.26" inspect-footage
-python -m moon --project "D:\AI EDIT VIDEO\8.26" discover-artifacts
 python -m moon --project "D:\AI EDIT VIDEO\8.26" bootstrap-legacy
-python -m moon --project "D:\AI EDIT VIDEO\8.26" import-artifacts --stage analyze
-python -m moon --project "D:\AI EDIT VIDEO\8.26" complete-from-artifacts --stage analyze
 python -m moon --project "D:\AI EDIT VIDEO\8.26" frames --source "footage\oneshot.mp4" --from 120 --to 130
-python -m moon --project "D:\AI EDIT VIDEO\8.26" begin proposal
-python -m moon --project "D:\AI EDIT VIDEO\8.26" complete proposal proposal.json
-python -m moon --project "D:\AI EDIT VIDEO\8.26" resume
-python -m moon --project "D:\AI EDIT VIDEO\8.26" submit match_decision_seg_007 decision.json
+python -m moon --project "D:\AI EDIT VIDEO\8.26" submit footage_semantic_enrichment footage_semantic_enrichment.json
+python -m moon --project "D:\AI EDIT VIDEO\8.26" submit match_proposal match_proposal.json
+python -m moon --project "D:\AI EDIT VIDEO\8.26" submit render_plan render_plan.json
 ```
 
 The CLI prints JSON so coding agents and shell integrations can consume it without scraping human-oriented output.
 
 ## Local media inspection
 
-Moon uses `ffprobe` for deterministic metadata inspection only. The normalized inspection contract includes duration, dimensions, orientation, frame rate, codecs, audio/video presence, file size, and path metadata. No semantic decisions are made during probing.
-
-Frame sampling uses `ffmpeg` against the original local source. An agent requests a bounded timestamp window and Moon writes a small set of JPEG samples under `.moon/cache/frames/`. The original video is not copied, uploaded, or physically pre-cut. Sources passed through the protocol must remain inside the Moon project root.
+Moon uses `ffprobe` for deterministic metadata inspection only. Frame sampling uses `ffmpeg` against the original local source. The original video is not copied, uploaded, or physically pre-cut.
 
 ## Existing artifact bridge
 
-Phase 3 bridges already-produced reference-replication JSON into Moon without rerunning semantic work. Moon discovers canonical artifacts in the project root, `analysis/`, `output/`, or `artifacts/`, imports the JSON into `.moon/artifacts/`, then checkpoints the matching runtime stage.
+Phase 3 bridges already-produced reference-replication JSON into Moon without rerunning semantic work. `bootstrap-legacy` may infer only proposal from a complete canonical analyze pair; no later gaps are inferred.
 
-The initial canonical mapping is:
+For the current `8.26` legacy project, the known analyze artifacts migrate proposal + analyze and resume at footage.
 
-```text
-proposal -> proposal_packet
-analyze  -> reference_blueprint + semantic_enrichment
-footage  -> footage_profiles
-match    -> match_decisions
-timeline -> timeline
-render   -> draft_render
-qc       -> qc_report + decision_log
-```
+## Stage execution adapters
 
-A stage still cannot be skipped. `complete-from-artifacts` only succeeds for the current resumable stage and only when all canonical artifacts for that stage exist. This preserves the existing Phase 1 artifacts while making them durable resume inputs for Moon.
-
-### Legacy bootstrap
-
-Older real runs may have valid downstream artifacts but no `proposal_packet.json`. `bootstrap-legacy` exists only for a pristine Moon state still at `proposal`. It advances through the longest contiguous sequence of stages proven by canonical artifacts.
-
-There is exactly one inference rule: if both canonical analyze artifacts (`reference_blueprint` and `semantic_enrichment`) exist, Moon may infer that the legacy run necessarily crossed the proposal gate. The resulting proposal checkpoint is marked `source: legacy_downstream_evidence` and records the exact analyze artifact paths used as evidence. Moon does not fabricate a proposal packet.
-
-No other missing stage is inferred. Partial analyze evidence is insufficient, a missing footage artifact stops migration at `footage`, and a later match/timeline/render artifact cannot jump over that gap. Bootstrap also refuses to rewrite a Moon project that has already advanced beyond a pristine proposal state.
-
-For the current `8.26` legacy project, the expected migration from its known analyze artifacts is:
+Phase 4 wraps the existing reference-replication tools instead of reimplementing them.
 
 ```text
-proposal (inferred from complete analyze evidence)
-analyze  (imported + checkpointed)
--> resume at footage
+footage
+  Moon -> footage_profile_builder (measured scaffold)
+       -> external agent semantic enrichment
+       -> footage_profile_builder (validated canonical profiles)
+
+match
+  Moon -> reference_candidate_ranker
+       -> external agent final selection/fallback decision
+       -> reference_match_validator
+
+timeline
+  Moon -> reference_timeline_builder
+
+render
+  external agent/user -> approved render_plan
+  Moon -> reference_video_renderer
+
+qc
+  external agent -> qc_report + decision_log
+  Moon -> persistence/checkpoint only
 ```
+
+Moon writes `*_agent_task` artifacts whenever it needs semantic input. These tasks describe the required output artifact and evidence location. `run-stage` can then be called again after the agent submits that artifact. The stage stays incomplete until deterministic validation succeeds.
+
+The execution adapter never chooses a footage match, never invents timestamps, never silently chooses or switches a rendering runtime, and never performs semantic QC.
 
 ## Invariants
 
@@ -136,7 +125,8 @@ analyze  (imported + checkpointed)
 7. Media inspection and frame extraction are deterministic operations; they do not choose shots or score semantic similarity.
 8. Existing reference-replication artifacts are reused only when their expected canonical stage contract is complete.
 9. Legacy migration may infer only proposal from a complete canonical analyze pair; no other stage gaps are inferred.
+10. Stage adapters may execute deterministic existing tools, but must stop and emit an explicit agent task at every semantic/editorial boundary.
 
 ## Next implementation slice
 
-After the artifact bridge is proven against the real `8.26` project, connect stage execution adapters to the existing reference-replication tools so Moon can invoke deterministic stage work through `PipelineRunner` instead of only importing prior artifacts. Keep semantic decisions external and add MCP only after the CLI/JSON contract remains stable under a real resumed E2E run.
+Prove Phase 4 against the real `8.26` footage stage, including one agent handoff and resume. After the CLI/JSON contract remains stable under that run, add a thin MCP or other agent connector without changing Moon Core.
