@@ -9,6 +9,7 @@ from typing import Sequence
 from moon.agent_bridge import AgentBridgeService, parse_bridge_request
 from moon.connector import AgentConnectorService, parse_connector_request
 from moon.core.project import MoonProject
+from moon.mcp_adapter import MoonMCPServer, serve_stdio
 from moon.protocol import MoonProtocol
 from moon.runner.pipeline import PipelineRunner
 
@@ -38,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("agent-bridge", help="Read one agent bridge JSON request from stdin and write one JSON response")
     sub.add_parser("connector-manifest", help="Print the stable agent connector tool manifest")
     sub.add_parser("connector-call", help="Read one connector tool request from stdin and write one JSON response")
+    sub.add_parser("mcp-stdio", help="Serve Moon connector tools as a local MCP stdio server")
     sub.add_parser("inspect-reference")
     sub.add_parser("inspect-footage")
     sub.add_parser("discover-artifacts")
@@ -68,6 +70,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     runner = _runner(args.project, create=args.command == "init")
     protocol = MoonProtocol(runner)
 
+    if args.command == "mcp-stdio":
+        serve_stdio(MoonMCPServer(AgentConnectorService(runner)))
+        return 0
     if args.command == "init":
         result = runner.status()
     elif args.command == "status":
