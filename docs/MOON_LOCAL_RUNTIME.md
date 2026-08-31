@@ -9,7 +9,7 @@ Moon Local deliberately does not introduce a web app, cloud database, Drive-back
 ```text
 GPT / Gemini / Claude / Codex / other agent
                   |
-        CLI / stdin JSON / protocol
+       connector tools / JSON stdin
                   |
               Moon Local
                   |
@@ -39,18 +39,7 @@ A completed stage writes a durable checkpoint before state advances. If an agent
 
 ## Agent-neutral protocol
 
-Core actions include:
-
-```json
-{"action":"status"}
-{"action":"next"}
-{"action":"stage.plan"}
-{"action":"stage.run"}
-{"action":"handoff.package"}
-{"action":"handoff.submit","stage":"footage","payload":{}}
-```
-
-`next` is the preferred orchestration action. It runs deterministic work continuously until the pipeline completes, blocks, or reaches the next semantic boundary. At a semantic boundary it returns the full handoff package instead of pretending Moon can make the decision itself.
+Core actions include `status`, `next`, `stage.plan`, `stage.run`, `handoff.package`, and `handoff.submit`. `next` is the preferred orchestration action: it runs deterministic work continuously until complete, blocked, or the next semantic boundary.
 
 ## CLI
 
@@ -58,66 +47,89 @@ Core actions include:
 python -m moon --project "D:\AI EDIT VIDEO\8.26" status
 python -m moon --project "D:\AI EDIT VIDEO\8.26" next
 python -m moon --project "D:\AI EDIT VIDEO\8.26" handoff
-python -m moon --project "D:\AI EDIT VIDEO\8.26" inspect-reference
-python -m moon --project "D:\AI EDIT VIDEO\8.26" inspect-footage
-python -m moon --project "D:\AI EDIT VIDEO\8.26" bootstrap-legacy
-python -m moon --project "D:\AI EDIT VIDEO\8.26" frames --source "footage\oneshot.mp4" --from 120 --to 130
+python -m moon --project "D:\AI EDIT VIDEO\8.26" connector-manifest
 ```
 
 The CLI prints JSON so coding agents and shell integrations do not need to scrape human-oriented output.
 
 ## Agent handoff contract
 
-At a semantic boundary Moon packages:
-
-- current stage and resumable pipeline state
-- deterministic input artifacts with SHA-256 hashes
-- local evidence paths such as briefs, scenes, and sampled frames
-- output contract and validation rules
-- file and fileless submission commands
-- a deterministic handoff ID
-
-Moon rejects stale-stage responses and validates required semantic structure before persistence.
+At a semantic boundary Moon packages current state, deterministic input artifacts with hashes, local evidence paths, output validation rules, submission commands, and a deterministic handoff ID. Moon rejects stale-stage responses and validates required semantic structure before persistence.
 
 ## Fileless agent bridge
 
-Phase 6 removes the requirement to create a temporary `response.json` file. External agents that can execute a local process can submit JSON over stdin.
-
-PowerShell example:
-
-```powershell
-$decision = @'
-{"clips":[{"path":"footage/oneshot.mp4","segments":[{"source_in":1.0,"source_out":2.0}]}]}
-'@
-$decision | python -m moon --project "D:\AI EDIT VIDEO\8.26" submit-handoff-stdin footage
-python -m moon --project "D:\AI EDIT VIDEO\8.26" next
-```
-
-For a generic agent connector, Moon also exposes one stdin/stdout bridge entrypoint:
+External agents that can execute a local process can submit JSON over stdin without creating `response.json`.
 
 ```powershell
 '{"action":"next"}' | python -m moon --project "D:\AI EDIT VIDEO\8.26" agent-bridge
 ```
 
-A semantic submission can be accepted and automatically advanced in one bridge request:
+The bridge transports decisions only; it never generates them.
+
+## Phase 7 agent connector tools
+
+Phase 7 exposes a small, stable tool vocabulary that a Codex/Claude/Gemini-style local agent adapter can map directly without knowing Moon internals:
+
+```text
+moon.status
+moon.next
+moon.handoff
+moon.evidence.list
+moon.evidence.read_json
+moon.frames.sample
+moon.submit
+```
+
+Discover the tool contract:
+
+```powershell
+python -m moon --project "D:\AI EDIT VIDEO\8.26" connector-manifest
+```
+
+Call one tool over stdin/stdout JSON:
+
+```powershell
+'{"tool":"moon.evidence.list","arguments":{}}' |
+  python -m moon --project "D:\AI EDIT VIDEO\8.26" connector-call
+```
+
+Read JSON evidence without giving the connector arbitrary filesystem access:
+
+```json
+{"tool":"moon.evidence.read_json","arguments":{"path":"analysis/footage/source_analysis/clip_001/video_analysis_brief.json"}}
+```
+
+Sample frames from original local media:
 
 ```json
 {
-  "action": "submit",
-  "stage": "footage",
-  "payload": {
-    "clips": [
-      {
-        "path": "footage/oneshot.mp4",
-        "segments": [{"source_in": 1.0, "source_out": 2.0}]
-      }
-    ]
-  },
-  "auto_next": true
+  "tool":"moon.frames.sample",
+  "arguments":{
+    "source":"footage/oneshot.mp4",
+    "start_seconds":120,
+    "end_seconds":130,
+    "count":8,
+    "width":320
+  }
 }
 ```
 
-This bridge does not call an LLM. It only gives any external agent a stable local transport for reading the next task and returning decisions without temporary files.
+Submit an external semantic decision and advance to the next boundary:
+
+```json
+{
+  "tool":"moon.submit",
+  "arguments":{
+    "stage":"footage",
+    "payload":{"clips":[]},
+    "auto_next":true
+  }
+}
+```
+
+The sample payload above is structurally incomplete on purpose; real submissions must satisfy the current handoff contract. Evidence JSON reads are restricted to the project root. Image evidence is listed as local paths for vision-capable local agents, while frame extraction remains deterministic.
+
+This connector is the stable local tool layer. MCP, Apps SDK, shell adapters, or vendor-specific wrappers should translate their tool calls into this surface rather than move semantic logic into Moon Core.
 
 ## Local media inspection
 
@@ -165,4 +177,4 @@ Moon never chooses a footage match, invents timestamps, silently switches render
 7. Media inspection and frame extraction are deterministic and do not choose shots.
 8. Legacy artifacts are reused only when their canonical stage contract is complete.
 9. Stage adapters stop at every semantic/editorial boundary.
-10. Agent bridge transports decisions; it never generates them.
+10. Agent bridges/connectors transport decisions; they never generate them.
