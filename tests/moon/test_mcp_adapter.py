@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 
@@ -28,9 +29,10 @@ def test_tools_list_maps_connector_surface(tmp_path):
     tools = {tool["name"]: tool for tool in response["result"]["tools"]}
     assert set(tools) == {
         "moon.status", "moon.next", "moon.handoff", "moon.evidence.list",
-        "moon.evidence.read_json", "moon.frames.sample", "moon.submit",
+        "moon.evidence.read_json", "moon.evidence.read_image", "moon.frames.sample", "moon.submit",
     }
     assert tools["moon.submit"]["inputSchema"]["required"] == ["stage", "payload"]
+    assert tools["moon.evidence.read_image"]["inputSchema"]["required"] == ["path"]
 
 
 def test_tools_call_delegates_to_connector(tmp_path):
@@ -43,6 +45,23 @@ def test_tools_call_delegates_to_connector(tmp_path):
     assert response["result"]["structuredContent"]["next_stage"] == "proposal"
     text = json.loads(response["result"]["content"][0]["text"])
     assert text["next_stage"] == "proposal"
+
+
+def test_read_image_returns_native_mcp_image_content(tmp_path):
+    server = _server(tmp_path)
+    image = tmp_path / "analysis" / "frame.jpg"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"fake-jpeg-bytes")
+    response = server.handle({
+        "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+        "params": {"name": "moon.evidence.read_image", "arguments": {"path": "analysis/frame.jpg"}},
+    })
+    result = response["result"]
+    assert result["isError"] is False
+    assert result["content"][1]["type"] == "image"
+    assert result["content"][1]["mimeType"] == "image/jpeg"
+    assert base64.b64decode(result["content"][1]["data"]) == b"fake-jpeg-bytes"
+    assert "data_base64" not in result["structuredContent"]
 
 
 def test_tool_failure_is_mcp_tool_error(tmp_path):

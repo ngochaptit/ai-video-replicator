@@ -12,7 +12,7 @@ from moon.runner.pipeline import PipelineRunner
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "moon-local"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 
 _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "moon.status": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -32,6 +32,12 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "additionalProperties": False,
     },
     "moon.evidence.read_json": {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+        "additionalProperties": False,
+    },
+    "moon.evidence.read_image": {
         "type": "object",
         "properties": {"path": {"type": "string"}},
         "required": ["path"],
@@ -67,6 +73,7 @@ _TOOL_DESCRIPTIONS = {
     "moon.handoff": "Get the current semantic task, evidence references, and validated output contract.",
     "moon.evidence.list": "List typed evidence files for the current semantic stage.",
     "moon.evidence.read_json": "Read JSON evidence inside the local project root.",
+    "moon.evidence.read_image": "Read local image evidence and return it as MCP image content for a vision-capable agent.",
     "moon.frames.sample": "Deterministically sample local video frames with FFmpeg; does not choose shots.",
     "moon.submit": "Submit an external-agent semantic decision through Moon validation and optionally advance.",
 }
@@ -124,6 +131,16 @@ class MoonMCPServer:
                 return self._result(request_id, {
                     "content": [{"type": "text", "text": json.dumps({"error": str(exc)}, ensure_ascii=False)}],
                     "isError": True,
+                })
+            if name == "moon.evidence.read_image":
+                metadata = {key: value for key, value in data.items() if key != "data_base64"}
+                return self._result(request_id, {
+                    "content": [
+                        {"type": "text", "text": json.dumps(metadata, ensure_ascii=False)},
+                        {"type": "image", "data": data["data_base64"], "mimeType": data["mime_type"]},
+                    ],
+                    "structuredContent": metadata,
+                    "isError": False,
                 })
             return self._result(request_id, {
                 "content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],

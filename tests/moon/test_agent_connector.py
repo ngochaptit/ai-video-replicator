@@ -1,4 +1,5 @@
 from pathlib import Path
+import base64
 
 import pytest
 
@@ -37,7 +38,10 @@ def test_manifest_exposes_stable_agent_tools(tmp_path: Path):
     manifest = service.manifest()
     names = {item["name"] for item in manifest["tools"]}
     assert manifest["transport"] == "stdin_stdout_json"
-    assert {"moon.status", "moon.next", "moon.handoff", "moon.evidence.list", "moon.evidence.read_json", "moon.frames.sample", "moon.submit"} <= names
+    assert {
+        "moon.status", "moon.next", "moon.handoff", "moon.evidence.list",
+        "moon.evidence.read_json", "moon.evidence.read_image", "moon.frames.sample", "moon.submit",
+    } <= names
     assert manifest["semantic_owner"] == "external_agent"
 
 
@@ -62,6 +66,18 @@ def test_read_json_is_restricted_to_project_root(tmp_path: Path):
     outside.write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError):
         service.call({"tool": "moon.evidence.read_json", "arguments": {"path": str(outside)}})
+
+
+def test_read_image_returns_base64_and_mime_type(tmp_path: Path):
+    runner = runner_at(tmp_path)
+    evidence = prepare_footage_boundary(runner, tmp_path)
+    service = AgentConnectorService(runner)
+    result = service.call({"tool": "moon.evidence.read_image", "arguments": {"path": str(evidence / "frame_0000.jpg")}})
+    assert result["mime_type"] == "image/jpeg"
+    assert result["size_bytes"] == len(b"not-a-real-image")
+    assert base64.b64decode(result["data_base64"]) == b"not-a-real-image"
+    with pytest.raises(ValueError):
+        service.call({"tool": "moon.evidence.read_image", "arguments": {"path": str(evidence / "brief.json")}})
 
 
 def test_submit_uses_existing_handoff_validation(tmp_path: Path):
