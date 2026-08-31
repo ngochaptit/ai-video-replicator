@@ -27,9 +27,18 @@ class AgentHandoffService:
     def submit(self, stage: str, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.runner.state.next_stage()
         if stage != current: raise ValueError(f"handoff submission is for {stage!r}, current stage is {current!r}")
-        self._validate(stage, payload); validate_semantic_submission(self.runner, stage, payload)
+        self._validate(stage, payload)
+        if stage in {"footage", "match"} and self._semantic_artifacts_ready(stage):
+            validate_semantic_submission(self.runner, stage, payload)
         artifact = self._required_artifact(stage); path = self.runner.artifacts.write(artifact, payload)
         return {"accepted":True,"stage":stage,"artifact":artifact,"path":str(path),"next_action":"next"}
+
+    def _semantic_artifacts_ready(self, stage: str) -> bool:
+        required = {
+            "footage": ("footage_profiles_scaffold",),
+            "match": ("reference_blueprint", "footage_profiles"),
+        }.get(stage, ())
+        return all(self.runner.artifacts.exists(name) for name in required)
 
     def _inputs(self, stage: str) -> dict[str, Any]:
         names={"footage":["footage_profiles_scaffold"],"match":["reference_blueprint","footage_profiles","candidate_rankings"],"render":["timeline"],"qc":["draft_render"]}.get(stage,[]); result={}
@@ -54,9 +63,28 @@ class AgentHandoffService:
     def _validate(self, stage: str, payload: dict[str, Any]) -> None:
         if not isinstance(payload,dict): raise ValueError("handoff response must be a JSON object")
         if stage=="footage":
-            if not isinstance(payload.get("clips"),list) or not payload["clips"]: raise ValueError("footage handoff requires non-empty clips[]")
+            clips=payload.get("clips")
+            if not isinstance(clips,list) or not clips: raise ValueError("footage handoff requires non-empty clips[]")
+            for clip in clips:
+                if not isinstance(clip,dict): raise ValueError("footage clips must be objects")
+                if "clip_id" not in clip and not str(clip.get("path") or "").strip(): raise ValueError("each footage clip requires clip_id or path")
+                segments=clip.get("segments")
+                if clip.get("usable",True) is False: continue
+                if segments is not None:
+                    if not isinstance(segments,list) or not segments: raise ValueError("usable footage clips with segments must use non-empty segments[]")
+                    for segment in segments:
+                        if not isinstance(segment,dict): raise ValueError("footage segments must be objects")
+                        start,end=segment.get("source_in"),segment.get("source_out")
+                        if isinstance(start,bool) or isinstance(end,bool) or not isinstance(start,(int,float)) or not isinstance(end,(int,float)) or start < 0 or end <= start: raise ValueError("each footage segment requires valid source_in/source_out")
         elif stage=="match":
-            if not isinstance(payload.get("matches"),list) or not payload["matches"]: raise ValueError("match handoff requires non-empty matches[]")
+            matches=payload.get("matches")
+            if not isinstance(matches,list) or not matches: raise ValueError("match handoff requires non-empty matches[]")
+            for item in matches:
+                if not isinstance(item,dict): raise ValueError("matches must contain objects")
+                for field in ("reference_segment_id","footage_segment_id","rationale"):
+                    if not str(item.get(field) or "").strip(): raise ValueError(f"each match requires {field}")
+                if item.get("match_class") not in {"good","acceptable","fallback"}: raise ValueError("match_class must be good, acceptable, or fallback")
+                if not isinstance(item.get("scores"),dict): raise ValueError("each match requires scores object")
         elif stage=="render":
             if payload.get("runtime_approved") is not True: raise ValueError("render handoff requires runtime_approved=true")
             if payload.get("render_runtime") not in {"ffmpeg","remotion","hyperframes"}: raise ValueError("invalid render_runtime")
