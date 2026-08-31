@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Sequence
 
+from moon.agent_bridge import AgentBridgeService, parse_bridge_request
 from moon.core.project import MoonProject
 from moon.protocol import MoonProtocol
 from moon.runner.pipeline import PipelineRunner
@@ -21,13 +23,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("init")
     sub.add_parser("status")
     sub.add_parser("resume")
+    next_cmd = sub.add_parser("next", help="Run until completion, blockage, or the next semantic agent boundary")
+    next_cmd.add_argument("--max-steps", default=20, type=int)
     sub.add_parser("stage-plan")
     sub.add_parser("run-stage")
     handoff = sub.add_parser("handoff", help="Build the current external-agent task package")
     handoff.add_argument("--stage")
-    submit_handoff = sub.add_parser("submit-handoff", help="Validate and store an external-agent response")
+    submit_handoff = sub.add_parser("submit-handoff", help="Validate and store an external-agent response from a JSON file")
     submit_handoff.add_argument("stage")
     submit_handoff.add_argument("json_file", type=Path)
+    submit_stdin = sub.add_parser("submit-handoff-stdin", help="Validate and store an external-agent response read from stdin")
+    submit_stdin.add_argument("stage")
+    sub.add_parser("agent-bridge", help="Read one agent bridge JSON request from stdin and write one JSON response")
     sub.add_parser("inspect-reference")
     sub.add_parser("inspect-footage")
     sub.add_parser("discover-artifacts")
@@ -57,26 +64,70 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     runner = _runner(args.project, create=args.command == "init")
     protocol = MoonProtocol(runner)
-    if args.command == "init": result = runner.status()
-    elif args.command == "status": result = protocol.handle({"action": "status"})["result"]
-    elif args.command == "resume": result = protocol.handle({"action": "resume"})["result"]
-    elif args.command == "stage-plan": result = protocol.handle({"action": "stage.plan"})["result"]
-    elif args.command == "run-stage": result = protocol.handle({"action": "stage.run"})["result"]
-    elif args.command == "handoff": result = protocol.handle({"action": "handoff.package", "stage": args.stage})["result"]
+
+    if args.command == "init":
+        result = runner.status()
+    elif args.command == "status":
+        result = protocol.handle({"action": "status"})["result"]
+    elif args.command == "resume":
+        result = protocol.handle({"action": "resume"})["result"]
+    elif args.command == "next":
+        result = protocol.handle({"action": "next", "max_steps": args.max_steps})["result"]
+    elif args.command == "stage-plan":
+        result = protocol.handle({"action": "stage.plan"})["result"]
+    elif args.command == "run-stage":
+        result = protocol.handle({"action": "stage.run"})["result"]
+    elif args.command == "handoff":
+        result = protocol.handle({"action": "handoff.package", "stage": args.stage})["result"]
     elif args.command == "submit-handoff":
         payload = json.loads(args.json_file.read_text(encoding="utf-8"))
         result = protocol.handle({"action": "handoff.submit", "stage": args.stage, "payload": payload})["result"]
-    elif args.command == "inspect-reference": result = protocol.handle({"action": "media.inspect.reference"})["result"]
-    elif args.command == "inspect-footage": result = protocol.handle({"action": "media.inspect.footage"})["result"]
-    elif args.command == "discover-artifacts": result = protocol.handle({"action": "artifact.discover"})["result"]
-    elif args.command == "bootstrap-legacy": result = protocol.handle({"action": "stage.bootstrap_legacy"})["result"]
-    elif args.command == "import-artifacts": result = protocol.handle({"action": "artifact.import", "stage": args.stage})["result"]
-    elif args.command == "complete-from-artifacts": result = protocol.handle({"action": "stage.complete_from_artifacts", "stage": args.stage})["result"]
-    elif args.command == "frames": result = protocol.handle({"action": "media.frames", "source": args.source, "start_seconds": args.start_seconds, "end_seconds": args.end_seconds, "count": args.count, "width": args.width})["result"]
-    elif args.command == "begin": result = protocol.handle({"action": "begin", "stage": args.stage})["result"]
-    elif args.command == "complete": result = protocol.handle({"action": "complete", "stage": args.stage, "checkpoint": json.loads(args.checkpoint.read_text(encoding="utf-8"))})["result"]
-    elif args.command == "submit": result = protocol.handle({"action": "artifact.write", "name": args.name, "payload": json.loads(args.json_file.read_text(encoding="utf-8"))})["result"]
-    else: raise AssertionError(args.command)
+    elif args.command == "submit-handoff-stdin":
+        payload = json.loads(sys.stdin.read())
+        if not isinstance(payload, dict):
+            raise ValueError("submit-handoff-stdin requires one JSON object on stdin")
+        result = protocol.handle({"action": "handoff.submit", "stage": args.stage, "payload": payload})["result"]
+    elif args.command == "agent-bridge":
+        request = parse_bridge_request(sys.stdin.read())
+        result = AgentBridgeService(runner).request(request)
+    elif args.command == "inspect-reference":
+        result = protocol.handle({"action": "media.inspect.reference"})["result"]
+    elif args.command == "inspect-footage":
+        result = protocol.handle({"action": "media.inspect.footage"})["result"]
+    elif args.command == "discover-artifacts":
+        result = protocol.handle({"action": "artifact.discover"})["result"]
+    elif args.command == "bootstrap-legacy":
+        result = protocol.handle({"action": "stage.bootstrap_legacy"})["result"]
+    elif args.command == "import-artifacts":
+        result = protocol.handle({"action": "artifact.import", "stage": args.stage})["result"]
+    elif args.command == "complete-from-artifacts":
+        result = protocol.handle({"action": "stage.complete_from_artifacts", "stage": args.stage})["result"]
+    elif args.command == "frames":
+        result = protocol.handle({
+            "action": "media.frames",
+            "source": args.source,
+            "start_seconds": args.start_seconds,
+            "end_seconds": args.end_seconds,
+            "count": args.count,
+            "width": args.width,
+        })["result"]
+    elif args.command == "begin":
+        result = protocol.handle({"action": "begin", "stage": args.stage})["result"]
+    elif args.command == "complete":
+        result = protocol.handle({
+            "action": "complete",
+            "stage": args.stage,
+            "checkpoint": json.loads(args.checkpoint.read_text(encoding="utf-8")),
+        })["result"]
+    elif args.command == "submit":
+        result = protocol.handle({
+            "action": "artifact.write",
+            "name": args.name,
+            "payload": json.loads(args.json_file.read_text(encoding="utf-8")),
+        })["result"]
+    else:  # pragma: no cover
+        raise AssertionError(args.command)
+
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
