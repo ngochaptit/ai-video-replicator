@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Sequence
 
 from moon.agent_bridge import AgentBridgeService, parse_bridge_request
+from moon.connector import AgentConnectorService, parse_connector_request
 from moon.core.project import MoonProject
 from moon.protocol import MoonProtocol
 from moon.runner.pipeline import PipelineRunner
@@ -35,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     submit_stdin = sub.add_parser("submit-handoff-stdin", help="Validate and store an external-agent response read from stdin")
     submit_stdin.add_argument("stage")
     sub.add_parser("agent-bridge", help="Read one agent bridge JSON request from stdin and write one JSON response")
+    sub.add_parser("connector-manifest", help="Print the stable agent connector tool manifest")
+    sub.add_parser("connector-call", help="Read one connector tool request from stdin and write one JSON response")
     sub.add_parser("inspect-reference")
     sub.add_parser("inspect-footage")
     sub.add_parser("discover-artifacts")
@@ -90,6 +93,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "agent-bridge":
         request = parse_bridge_request(sys.stdin.read())
         result = AgentBridgeService(runner).request(request)
+    elif args.command == "connector-manifest":
+        result = AgentConnectorService(runner).manifest()
+    elif args.command == "connector-call":
+        request = parse_connector_request(sys.stdin.read())
+        result = AgentConnectorService(runner).call(request)
     elif args.command == "inspect-reference":
         result = protocol.handle({"action": "media.inspect.reference"})["result"]
     elif args.command == "inspect-footage":
