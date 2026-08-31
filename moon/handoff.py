@@ -8,7 +8,7 @@ from typing import Any
 from moon.runner.pipeline import PipelineRunner
 
 
-HANDOFF_VERSION = "1.0"
+HANDOFF_VERSION = "1.1"
 
 
 class AgentHandoffService:
@@ -28,18 +28,22 @@ class AgentHandoffService:
         if not self.runner.artifacts.exists(task_name):
             raise FileNotFoundError(f"run-stage first; missing handoff task artifact {task_name!r}")
         task = self.runner.artifacts.read(task_name)
+        project = self.runner.project.root
         package = {
             "version": HANDOFF_VERSION,
             "stage": stage,
             "decision_owner": "external_agent",
-            "project_root": str(self.runner.project.root),
+            "project_root": str(project),
             "pipeline": self.runner.status(),
             "task": task,
             "inputs": self._inputs(stage),
             "output_contract": self._output_contract(stage),
             "submission": {
-                "command": f'python -m moon --project "{self.runner.project.root}" submit-handoff {stage} <response.json>',
-                "then": f'python -m moon --project "{self.runner.project.root}" run-stage',
+                "preferred": "stdin",
+                "stdin_command": f'python -m moon --project "{project}" submit-handoff-stdin {stage}',
+                "file_command": f'python -m moon --project "{project}" submit-handoff {stage} <response.json>',
+                "bridge_command": f'python -m moon --project "{project}" agent-bridge',
+                "then": f'python -m moon --project "{project}" next',
             },
         }
         package["handoff_id"] = self._handoff_id(package)
@@ -58,7 +62,7 @@ class AgentHandoffService:
             "stage": stage,
             "artifact": artifact_name,
             "path": str(path),
-            "next_action": "run-stage",
+            "next_action": "next",
         }
 
     def _inputs(self, stage: str) -> dict[str, Any]:
@@ -122,7 +126,7 @@ class AgentHandoffService:
             },
         }
         if stage not in contracts:
-            raise ValueError(f"stage {stage!r} does not expose a Phase 5 handoff contract")
+            raise ValueError(f"stage {stage!r} does not expose an agent handoff contract")
         return contracts[stage]
 
     def _validate(self, stage: str, payload: dict[str, Any]) -> None:
@@ -143,7 +147,14 @@ class AgentHandoffService:
                         raise ValueError("footage segments must be objects")
                     start = segment.get("source_in")
                     end = segment.get("source_out")
-                    if isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, (int, float)) or not isinstance(end, (int, float)) or start < 0 or end <= start:
+                    if (
+                        isinstance(start, bool)
+                        or isinstance(end, bool)
+                        or not isinstance(start, (int, float))
+                        or not isinstance(end, (int, float))
+                        or start < 0
+                        or end <= start
+                    ):
                         raise ValueError("each footage segment requires valid source_in/source_out")
         elif stage == "match":
             matches = payload.get("matches")
@@ -168,7 +179,7 @@ class AgentHandoffService:
             if not isinstance(payload.get("qc_report"), dict) or not isinstance(payload.get("decision_log"), dict):
                 raise ValueError("qc handoff requires qc_report and decision_log objects")
         else:
-            raise ValueError(f"stage {stage!r} does not accept a Phase 5 handoff submission")
+            raise ValueError(f"stage {stage!r} does not accept an agent handoff submission")
 
     def _required_artifact(self, stage: str) -> str:
         if stage == "qc":

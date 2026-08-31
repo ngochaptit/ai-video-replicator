@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from moon.agent_bridge import AgentBridgeService
 from moon.bridge import (
     bootstrap_legacy_state,
     complete_from_imported_artifacts,
@@ -28,6 +29,11 @@ class MoonProtocol:
             return {"ok": True, "result": self.runner.status()}
         if action == "resume":
             return {"ok": True, "result": self.runner.resume()}
+        if action == "next":
+            max_steps = request.get("max_steps", 20)
+            if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+                raise ValueError("next.max_steps must be an integer")
+            return {"ok": True, "result": AgentBridgeService(self.runner).next(max_steps=max_steps)}
         if action == "stage.plan":
             return {"ok": True, "result": StageExecutionService(self.runner).plan()}
         if action == "stage.run":

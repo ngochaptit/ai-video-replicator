@@ -4,25 +4,21 @@ Moon is a local, resumable, deterministic video-editing runtime. External agents
 
 ## Scope
 
-Moon Local v0.1 deliberately does not introduce a web app, cloud database, Drive-backed state, account system, local LLM/VLM, or agent-specific business logic.
-
-The runtime boundary is:
+Moon Local deliberately does not introduce a web app, cloud database, Drive-backed state, account system, local LLM/VLM, or agent-specific business logic.
 
 ```text
 GPT / Gemini / Claude / Codex / other agent
                   |
-             JSON protocol
+        CLI / stdin JSON / protocol
                   |
               Moon Local
                   |
         local project + FFmpeg
 ```
 
-Adapters are intentionally thin. The core must not know which model or vendor is making a semantic decision.
+Adapters are intentionally thin. Moon Core does not know which model or vendor makes a semantic decision.
 
 ## Persistent project contract
-
-Initializing a project creates only local state under `.moon/`:
 
 ```text
 .moon/
@@ -33,45 +29,95 @@ Initializing a project creates only local state under `.moon/`:
   cache/
 ```
 
-`state.json` records pipeline progress. Each completed stage writes a durable checkpoint before the stage is marked complete. This is the resume boundary: if an agent loses quota or a process exits during `analyze`, a new agent can inspect status and continue from `analyze` without repeating `proposal`.
-
-The v0.1 stage order mirrors the current reference-replication flow:
+Stage order:
 
 ```text
 proposal -> analyze -> footage -> match -> timeline -> render -> qc
 ```
 
+A completed stage writes a durable checkpoint before state advances. If an agent loses quota or exits, another agent can resume from the next incomplete stage.
+
 ## Agent-neutral protocol
 
-The protocol surface remains vendor-neutral. In addition to state, artifact, and media actions, Phase 4 adds:
+Core actions include:
 
 ```json
+{"action":"status"}
+{"action":"next"}
 {"action":"stage.plan"}
 {"action":"stage.run"}
+{"action":"handoff.package"}
+{"action":"handoff.submit","stage":"footage","payload":{}}
 ```
 
-`stage.plan` tells an agent whether the next stage is deterministic, agent-owned, or hybrid. `stage.run` executes only deterministic work and returns `awaiting_agent` when semantic/editorial input is required.
-
-An MCP adapter can be added later by translating MCP tool calls into these same protocol requests. MCP is not part of the core runtime.
+`next` is the preferred orchestration action. It runs deterministic work continuously until the pipeline completes, blocks, or reaches the next semantic boundary. At a semantic boundary it returns the full handoff package instead of pretending Moon can make the decision itself.
 
 ## CLI
 
-The local adapter is available through Python:
-
 ```powershell
 python -m moon --project "D:\AI EDIT VIDEO\8.26" status
-python -m moon --project "D:\AI EDIT VIDEO\8.26" stage-plan
-python -m moon --project "D:\AI EDIT VIDEO\8.26" run-stage
+python -m moon --project "D:\AI EDIT VIDEO\8.26" next
+python -m moon --project "D:\AI EDIT VIDEO\8.26" handoff
 python -m moon --project "D:\AI EDIT VIDEO\8.26" inspect-reference
 python -m moon --project "D:\AI EDIT VIDEO\8.26" inspect-footage
 python -m moon --project "D:\AI EDIT VIDEO\8.26" bootstrap-legacy
 python -m moon --project "D:\AI EDIT VIDEO\8.26" frames --source "footage\oneshot.mp4" --from 120 --to 130
-python -m moon --project "D:\AI EDIT VIDEO\8.26" submit footage_semantic_enrichment footage_semantic_enrichment.json
-python -m moon --project "D:\AI EDIT VIDEO\8.26" submit match_proposal match_proposal.json
-python -m moon --project "D:\AI EDIT VIDEO\8.26" submit render_plan render_plan.json
 ```
 
-The CLI prints JSON so coding agents and shell integrations can consume it without scraping human-oriented output.
+The CLI prints JSON so coding agents and shell integrations do not need to scrape human-oriented output.
+
+## Agent handoff contract
+
+At a semantic boundary Moon packages:
+
+- current stage and resumable pipeline state
+- deterministic input artifacts with SHA-256 hashes
+- local evidence paths such as briefs, scenes, and sampled frames
+- output contract and validation rules
+- file and fileless submission commands
+- a deterministic handoff ID
+
+Moon rejects stale-stage responses and validates required semantic structure before persistence.
+
+## Fileless agent bridge
+
+Phase 6 removes the requirement to create a temporary `response.json` file. External agents that can execute a local process can submit JSON over stdin.
+
+PowerShell example:
+
+```powershell
+$decision = @'
+{"clips":[{"path":"footage/oneshot.mp4","segments":[{"source_in":1.0,"source_out":2.0}]}]}
+'@
+$decision | python -m moon --project "D:\AI EDIT VIDEO\8.26" submit-handoff-stdin footage
+python -m moon --project "D:\AI EDIT VIDEO\8.26" next
+```
+
+For a generic agent connector, Moon also exposes one stdin/stdout bridge entrypoint:
+
+```powershell
+'{"action":"next"}' | python -m moon --project "D:\AI EDIT VIDEO\8.26" agent-bridge
+```
+
+A semantic submission can be accepted and automatically advanced in one bridge request:
+
+```json
+{
+  "action": "submit",
+  "stage": "footage",
+  "payload": {
+    "clips": [
+      {
+        "path": "footage/oneshot.mp4",
+        "segments": [{"source_in": 1.0, "source_out": 2.0}]
+      }
+    ]
+  },
+  "auto_next": true
+}
+```
+
+This bridge does not call an LLM. It only gives any external agent a stable local transport for reading the next task and returning decisions without temporary files.
 
 ## Local media inspection
 
@@ -79,13 +125,9 @@ Moon uses `ffprobe` for deterministic metadata inspection only. Frame sampling u
 
 ## Existing artifact bridge
 
-Phase 3 bridges already-produced reference-replication JSON into Moon without rerunning semantic work. `bootstrap-legacy` may infer only proposal from a complete canonical analyze pair; no later gaps are inferred.
-
-For the current `8.26` legacy project, the known analyze artifacts migrate proposal + analyze and resume at footage.
+Legacy reference-replication JSON can be imported without rerunning semantic work. `bootstrap-legacy` may infer only proposal from a complete canonical analyze pair; no later gaps are inferred.
 
 ## Stage execution adapters
-
-Phase 4 wraps the existing reference-replication tools instead of reimplementing them.
 
 ```text
 footage
@@ -110,23 +152,17 @@ qc
   Moon -> persistence/checkpoint only
 ```
 
-Moon writes `*_agent_task` artifacts whenever it needs semantic input. These tasks describe the required output artifact and evidence location. `run-stage` can then be called again after the agent submits that artifact. The stage stays incomplete until deterministic validation succeeds.
-
-The execution adapter never chooses a footage match, never invents timestamps, never silently chooses or switches a rendering runtime, and never performs semantic QC.
+Moon never chooses a footage match, invents timestamps, silently switches rendering runtime, or performs semantic QC.
 
 ## Invariants
 
 1. Semantic decisions belong to the external agent, not Moon Local.
 2. Local media stays local unless an adapter explicitly exposes sampled frames or metadata.
-3. A stage cannot be skipped. The next incomplete stage is the only resumable stage.
+3. A stage cannot be skipped; only the next incomplete stage is resumable.
 4. A checkpoint is persisted before its stage becomes complete.
-5. State and artifacts are plain UTF-8 JSON and must remain inspectable without a database.
-6. Codex or another coding agent is a developer/debugger of Moon; it is not a required runtime component.
-7. Media inspection and frame extraction are deterministic operations; they do not choose shots or score semantic similarity.
-8. Existing reference-replication artifacts are reused only when their expected canonical stage contract is complete.
-9. Legacy migration may infer only proposal from a complete canonical analyze pair; no other stage gaps are inferred.
-10. Stage adapters may execute deterministic existing tools, but must stop and emit an explicit agent task at every semantic/editorial boundary.
-
-## Next implementation slice
-
-Prove Phase 4 against the real `8.26` footage stage, including one agent handoff and resume. After the CLI/JSON contract remains stable under that run, add a thin MCP or other agent connector without changing Moon Core.
+5. State and artifacts remain inspectable UTF-8 JSON without a database.
+6. No specific agent vendor is required by Moon Core.
+7. Media inspection and frame extraction are deterministic and do not choose shots.
+8. Legacy artifacts are reused only when their canonical stage contract is complete.
+9. Stage adapters stop at every semantic/editorial boundary.
+10. Agent bridge transports decisions; it never generates them.
