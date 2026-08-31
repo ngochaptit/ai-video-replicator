@@ -9,7 +9,7 @@ Moon Local deliberately does not introduce a web app, cloud database, Drive-back
 ```text
 GPT / Gemini / Claude / Codex / other agent
                   |
-       connector tools / JSON stdin
+     MCP / connector tools / JSON stdin
                   |
               Moon Local
                   |
@@ -20,28 +20,13 @@ Adapters are intentionally thin. Moon Core does not know which model or vendor m
 
 ## Persistent project contract
 
-```text
-.moon/
-  project.json
-  state.json
-  checkpoints/
-  artifacts/
-  cache/
-```
-
-Stage order:
-
-```text
-proposal -> analyze -> footage -> match -> timeline -> render -> qc
-```
-
-A completed stage writes a durable checkpoint before state advances. If an agent loses quota or exits, another agent can resume from the next incomplete stage.
+`.moon/` contains project/state JSON, checkpoints, artifacts, and cache. Stage order is `proposal -> analyze -> footage -> match -> timeline -> render -> qc`. A completed stage writes a durable checkpoint before state advances.
 
 ## Agent-neutral protocol
 
-Core actions include `status`, `next`, `stage.plan`, `stage.run`, `handoff.package`, and `handoff.submit`. `next` is the preferred orchestration action: it runs deterministic work continuously until complete, blocked, or the next semantic boundary.
+Core actions include `status`, `next`, `stage.plan`, `stage.run`, `handoff.package`, and `handoff.submit`. `next` runs deterministic work continuously until complete, blocked, or the next semantic boundary.
 
-## CLI
+## CLI and handoff
 
 ```powershell
 python -m moon --project "D:\AI EDIT VIDEO\8.26" status
@@ -50,25 +35,11 @@ python -m moon --project "D:\AI EDIT VIDEO\8.26" handoff
 python -m moon --project "D:\AI EDIT VIDEO\8.26" connector-manifest
 ```
 
-The CLI prints JSON so coding agents and shell integrations do not need to scrape human-oriented output.
-
-## Agent handoff contract
-
 At a semantic boundary Moon packages current state, deterministic input artifacts with hashes, local evidence paths, output validation rules, submission commands, and a deterministic handoff ID. Moon rejects stale-stage responses and validates required semantic structure before persistence.
-
-## Fileless agent bridge
-
-External agents that can execute a local process can submit JSON over stdin without creating `response.json`.
-
-```powershell
-'{"action":"next"}' | python -m moon --project "D:\AI EDIT VIDEO\8.26" agent-bridge
-```
-
-The bridge transports decisions only; it never generates them.
 
 ## Phase 7 agent connector tools
 
-Phase 7 exposes a small, stable tool vocabulary that a Codex/Claude/Gemini-style local agent adapter can map directly without knowing Moon internals:
+The stable tool vocabulary is:
 
 ```text
 moon.status
@@ -80,56 +51,36 @@ moon.frames.sample
 moon.submit
 ```
 
-Discover the tool contract:
+`connector-manifest` discovers the contract and `connector-call` invokes one tool over stdin/stdout JSON. Evidence JSON reads are project-root confined. Frame extraction uses the existing deterministic FFmpeg path. Semantic submissions reuse the handoff validator.
+
+## Phase 8 MCP stdio adapter
+
+Phase 8 maps the Phase 7 connector surface to a thin local MCP server. It does not contain semantic logic and does not call a model.
+
+Start the server for one project:
 
 ```powershell
-python -m moon --project "D:\AI EDIT VIDEO\8.26" connector-manifest
+python -m moon --project "D:\AI EDIT VIDEO\8.26" mcp-stdio
 ```
 
-Call one tool over stdin/stdout JSON:
+An MCP-capable local host can launch that command as a stdio server. The adapter implements the MCP initialization handshake, `ping`, `tools/list`, and `tools/call`. Tool calls are delegated directly to `AgentConnectorService`; tool failures are returned as MCP tool errors rather than mutating Moon semantics.
 
-```powershell
-'{"tool":"moon.evidence.list","arguments":{}}' |
-  python -m moon --project "D:\AI EDIT VIDEO\8.26" connector-call
-```
-
-Read JSON evidence without giving the connector arbitrary filesystem access:
-
-```json
-{"tool":"moon.evidence.read_json","arguments":{"path":"analysis/footage/source_analysis/clip_001/video_analysis_brief.json"}}
-```
-
-Sample frames from original local media:
+Conceptual MCP host configuration:
 
 ```json
 {
-  "tool":"moon.frames.sample",
-  "arguments":{
-    "source":"footage/oneshot.mp4",
-    "start_seconds":120,
-    "end_seconds":130,
-    "count":8,
-    "width":320
-  }
+  "command": "python",
+  "args": [
+    "-m", "moon",
+    "--project", "D:\\AI EDIT VIDEO\\8.26",
+    "mcp-stdio"
+  ]
 }
 ```
 
-Submit an external semantic decision and advance to the next boundary:
+The adapter advertises JSON Schema for every Moon tool, including required fields for evidence reads, frame sampling, and semantic submission. Local media remains local: MCP only exposes paths/JSON and deterministic frame samples through the same connector contract.
 
-```json
-{
-  "tool":"moon.submit",
-  "arguments":{
-    "stage":"footage",
-    "payload":{"clips":[]},
-    "auto_next":true
-  }
-}
-```
-
-The sample payload above is structurally incomplete on purpose; real submissions must satisfy the current handoff contract. Evidence JSON reads are restricted to the project root. Image evidence is listed as local paths for vision-capable local agents, while frame extraction remains deterministic.
-
-This connector is the stable local tool layer. MCP, Apps SDK, shell adapters, or vendor-specific wrappers should translate their tool calls into this surface rather than move semantic logic into Moon Core.
+Important: this is a local stdio MCP server for MCP hosts that support launching local servers. It does not imply that every ChatGPT plan/product can connect directly to localhost; product-specific remote/tunnel/app adapters remain separate thin wrappers.
 
 ## Local media inspection
 
@@ -142,26 +93,11 @@ Legacy reference-replication JSON can be imported without rerunning semantic wor
 ## Stage execution adapters
 
 ```text
-footage
-  Moon -> footage_profile_builder (measured scaffold)
-       -> external agent semantic enrichment
-       -> footage_profile_builder (validated canonical profiles)
-
-match
-  Moon -> reference_candidate_ranker
-       -> external agent final selection/fallback decision
-       -> reference_match_validator
-
-timeline
-  Moon -> reference_timeline_builder
-
-render
-  external agent/user -> approved render_plan
-  Moon -> reference_video_renderer
-
-qc
-  external agent -> qc_report + decision_log
-  Moon -> persistence/checkpoint only
+footage: Moon measured scaffold -> external semantic enrichment -> validated profiles
+match: deterministic pre-rank -> external final selection/fallback -> validation
+timeline: deterministic timeline builder
+render: external approved render plan -> deterministic renderer
+qc: external qc_report + decision_log -> persistence/checkpoint
 ```
 
 Moon never chooses a footage match, invents timestamps, silently switches rendering runtime, or performs semantic QC.
@@ -177,4 +113,4 @@ Moon never chooses a footage match, invents timestamps, silently switches render
 7. Media inspection and frame extraction are deterministic and do not choose shots.
 8. Legacy artifacts are reused only when their canonical stage contract is complete.
 9. Stage adapters stop at every semantic/editorial boundary.
-10. Agent bridges/connectors transport decisions; they never generate them.
+10. Agent bridges/connectors/MCP transport decisions; they never generate them.
