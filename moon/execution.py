@@ -46,8 +46,9 @@ class StageExecutionService:
         self.runner.begin("qc")
         if self.runner.artifacts.exists("qc_bundle"):
             bundle=self.runner.artifacts.read("qc_bundle");self.runner.artifacts.write("qc_report",bundle["qc_report"]);self.runner.artifacts.write("decision_log",bundle["decision_log"])
-        if not self.runner.artifacts.exists("qc_report") or not self.runner.artifacts.exists("decision_log"):
-            task={"stage":"qc","revision":self.runner.state.revision,"decision_owner":"external_agent","required_output_artifact":"qc_bundle","instruction":"Review the draft semantically. Set qc_report.decision to pass or revise and include actionable decision_log."};self.runner.artifacts.write("qc_agent_task",task);return {"status":"awaiting_agent","stage":"qc","task":task,"pipeline":self.runner.status()}
+        missing=[name for name in ("qc_report","decision_log") if not self.runner.artifacts.exists(name)]
+        if missing:
+            task={"stage":"qc","revision":self.runner.state.revision,"decision_owner":"external_agent","required_output_artifact":"qc_bundle","required_output_artifacts":missing,"instruction":"Review the draft semantically. Set qc_report.decision to pass or revise and include actionable decision_log."};self.runner.artifacts.write("qc_agent_task",task);return {"status":"awaiting_agent","stage":"qc","task":task,"pipeline":self.runner.status()}
         report=self.runner.artifacts.read("qc_report");decision=report.get("decision",report.get("verdict","pass"))
         if decision in {"revise","revision","fail"}:
             if self.runner.state.revision>=2:return {"status":"blocked","stage":"qc","error":"QC requested revision but revision limit (2) is reached","pipeline":self.runner.status()}
