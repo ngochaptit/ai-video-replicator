@@ -13,7 +13,7 @@ class AgentBridgeService:
         for _ in range(max_steps):
             stage=self.runner.state.next_stage()
             if stage is None:return {"status":"complete","history":history,"pipeline":self.runner.status()}
-            result=execution.run();status=result.get("status");history.append({"stage":stage,"status":status,"revision":self.runner.state.revision})
+            result=execution.run();status=result.get("status");history.append({"stage":stage,"status":status})
             if status in {"completed","revision_requested"}:continue
             if status=="awaiting_agent":return {"status":"awaiting_agent","stage":self.runner.state.next_stage(),"handoff":AgentHandoffService(self.runner).package(self.runner.state.next_stage()),"history":history,"pipeline":self.runner.status()}
             if status=="blocked":return {"status":"blocked","stage":stage,"result":result,"history":history,"pipeline":self.runner.status()}
