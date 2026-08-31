@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,13 @@ from moon.media.inspection import resolve_project_source
 from moon.runner.pipeline import PipelineRunner
 
 
-CONNECTOR_VERSION = "1.0"
+CONNECTOR_VERSION = "1.1"
+_IMAGE_MIME_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
 
 
 class AgentConnectorService:
@@ -37,6 +44,7 @@ class AgentConnectorService:
                 {"name": "moon.handoff", "input": {"stage": "string?"}},
                 {"name": "moon.evidence.list", "input": {"stage": "string?"}},
                 {"name": "moon.evidence.read_json", "input": {"path": "project-relative string"}},
+                {"name": "moon.evidence.read_image", "input": {"path": "project-relative image path"}},
                 {
                     "name": "moon.frames.sample",
                     "input": {
@@ -55,6 +63,7 @@ class AgentConnectorService:
             "invariants": [
                 "Moon does not generate semantic/editorial decisions.",
                 "Evidence reads are restricted to the project root.",
+                "Image evidence is returned as base64 bytes with an explicit MIME type.",
                 "Frame sampling is deterministic and reads original local media.",
                 "Semantic submissions are validated before persistence.",
             ],
@@ -87,6 +96,11 @@ class AgentConnectorService:
             if not isinstance(path, str):
                 raise ValueError("moon.evidence.read_json requires string path")
             return self._read_json(path)
+        if tool == "moon.evidence.read_image":
+            path = args.get("path")
+            if not isinstance(path, str):
+                raise ValueError("moon.evidence.read_image requires string path")
+            return self._read_image(path)
         if tool == "moon.frames.sample":
             return self._sample_frames(args)
         if tool == "moon.submit":
@@ -140,6 +154,22 @@ class AgentConnectorService:
         data = json.loads(path.read_text(encoding="utf-8"))
         return {"path": str(path), "data": data}
 
+    def _read_image(self, raw_path: str) -> dict[str, Any]:
+        path = self._project_path(raw_path)
+        suffix = path.suffix.lower()
+        mime_type = _IMAGE_MIME_TYPES.get(suffix)
+        if mime_type is None:
+            raise ValueError("moon.evidence.read_image only reads jpg, jpeg, png, or webp evidence")
+        if not path.is_file():
+            raise FileNotFoundError(str(path))
+        raw = path.read_bytes()
+        return {
+            "path": str(path),
+            "mime_type": mime_type,
+            "size_bytes": len(raw),
+            "data_base64": base64.b64encode(raw).decode("ascii"),
+        }
+
     def _sample_frames(self, args: dict[str, Any]) -> dict[str, Any]:
         source = args.get("source")
         if not isinstance(source, str):
@@ -183,7 +213,7 @@ class AgentConnectorService:
         suffix = path.suffix.lower()
         if suffix == ".json":
             return "json"
-        if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+        if suffix in _IMAGE_MIME_TYPES:
             return "image"
         if suffix in {".mp4", ".mov", ".mkv", ".webm"}:
             return "video"
