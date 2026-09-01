@@ -154,3 +154,44 @@ def test_qc_waits_for_external_agent_artifacts(tmp_path) -> None:
     assert result["status"] == "awaiting_agent"
     assert set(result["task"]["required_output_artifacts"]) == {"qc_report", "decision_log"}
     assert runner.state.next_stage() == "qc"
+
+
+def test_render_builds_canonical_plan_before_invoking_renderer(tmp_path, monkeypatch) -> None:
+    runner = _runner_at_footage(tmp_path)
+    runner.complete("footage", {})
+    runner.complete("match", {})
+    runner.complete("timeline", {})
+    runner.artifacts.write("timeline", {"coverage": {"full_coverage": True, "timeline_contiguous": True}, "segments": []})
+    runner.artifacts.write("render_plan", {"runtime_approved": True, "render_runtime": "ffmpeg"})
+    service = StageExecutionService(runner)
+    calls = []
+
+    def execute(name, inputs):
+        calls.append((name, inputs))
+        if name == "reference_render_plan_builder":
+            return {
+                "success": True,
+                "data": {
+                    "runtime_approved": True,
+                    "render_runtime": "ffmpeg",
+                    "edit_decisions": {"cuts": [{"id": "cut_001"}]},
+                    "asset_manifest": {"assets": []},
+                },
+                "artifacts": [],
+                "error": None,
+            }
+        plan = runner.artifacts.read("replication_render_plan")
+        assert plan["edit_decisions"]["cuts"] == [{"id": "cut_001"}]
+        return {"success": True, "data": {"output": inputs["output_path"]}, "artifacts": [], "error": None}
+
+    monkeypatch.setattr(service, "_execute_tool", execute)
+
+    result = service.run()
+
+    assert result["status"] == "completed"
+    assert [name for name, _ in calls] == ["reference_render_plan_builder", "reference_video_renderer"]
+    builder_inputs = calls[0][1]
+    assert builder_inputs["render_runtime"] == "ffmpeg"
+    assert builder_inputs["renderer_family"] == "documentary-montage"
+    assert builder_inputs["composition_mode"] == "templated"
+    assert runner.artifacts.exists("replication_render_plan")
