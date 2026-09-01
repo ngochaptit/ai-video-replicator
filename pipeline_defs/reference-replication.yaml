@@ -147,10 +147,12 @@ stages:
       - replication_render_plan
       - draft_render
     produces:
+      - replication_quality_report
       - replication_qc_evidence
       - replication_qc
       - final_render
     required_tools:
+      - replication_quality_evaluator
       - replication_qc_evidence_builder
       - reference_qc_validator
       - reference_finalizer
@@ -160,6 +162,7 @@ stages:
       - reference_render_plan_builder
       - reference_video_renderer
     tools_available:
+      - replication_quality_evaluator
       - replication_qc_evidence_builder
       - reference_qc_validator
       - reference_finalizer
@@ -170,12 +173,17 @@ stages:
     checkpoint_required: true
     human_approval_default: false
     review_focus:
+      - Deterministic render integrity and replication quality remain separate
+      - Quality pass cannot contradict fallback, speed, reuse, or chronology hard limits
       - GPT compares every reference segment against paired draft evidence
       - FidelityScore and QualityScore remain separate
       - Fixable defects route back to match, timeline, or render before finalization
       - Missing source footage becomes a concrete improvement request, not a timeline hole
       - No local LLM, VLM, or CLIP dependency performs semantic QC
     success_criteria:
+      - Produces a schema-valid replication_quality_report artifact
+      - render_integrity is pass before finalization
+      - A failed deterministic quality gate is represented as revise or footage_limited, never unconditional pass
       - Produces schema-valid replication_qc_evidence and replication_qc artifacts
       - QC status is pass or publishable footage_limited
       - No fixable revision_actions remain
@@ -197,6 +205,7 @@ metadata:
   phase_3_contract: schemas/artifacts/replication_timeline.schema.json
   phase_4_contract: schemas/artifacts/replication_render_plan.schema.json
   qc_evidence_contract: schemas/artifacts/replication_qc_evidence.schema.json
+  quality_report_contract: schemas/artifacts/replication_quality_report.schema.json
   output_contract: schemas/artifacts/replication_qc.schema.json
   draft_render_path: renders/draft.mp4
   final_render_path: renders/final.mp4

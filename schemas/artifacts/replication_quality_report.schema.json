@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmontage/artifacts/replication_quality_report",
+  "title": "Replication Quality Report",
+  "description": "Deterministic render-integrity and replication-quality metrics used as evidence for external-agent QC.",
+  "type": "object",
+  "required": [
+    "version", "revision", "decision_count", "fallback_count", "fallback_ratio",
+    "unique_source_count", "unique_source_segment_count", "reuse_ratio", "max_reuse_count",
+    "dominant_source_share", "overlap_reuse_count", "speed", "chronology", "decisions",
+    "render_integrity", "replication_quality", "quality_flags", "quality_gate", "metadata"
+  ],
+  "properties": {
+    "version": {"type": "string", "const": "1.0"},
+    "revision": {"type": "integer", "minimum": 0},
+    "decision_count": {"type": "integer", "minimum": 1},
+    "fallback_count": {"type": "integer", "minimum": 0},
+    "fallback_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+    "unique_source_count": {"type": "integer", "minimum": 1},
+    "unique_source_segment_count": {"type": "integer", "minimum": 1},
+    "reuse_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+    "max_reuse_count": {"type": "integer", "minimum": 1},
+    "dominant_source_share": {"type": "number", "minimum": 0, "maximum": 1},
+    "overlap_reuse_count": {"type": "integer", "minimum": 0},
+    "speed": {
+      "type": "object",
+      "required": ["canonical_definition", "min", "max", "mean", "normal_count", "warning_count", "severe_count", "invalid_count", "timeline_consistency_error_count"],
+      "properties": {
+        "canonical_definition": {"type": "string", "const": "source_duration_seconds / target_duration_seconds"},
+        "min": {"type": "number", "exclusiveMinimum": 0},
+        "max": {"type": "number", "exclusiveMinimum": 0},
+        "mean": {"type": "number", "exclusiveMinimum": 0},
+        "normal_count": {"type": "integer", "minimum": 0},
+        "warning_count": {"type": "integer", "minimum": 0},
+        "severe_count": {"type": "integer", "minimum": 0},
+        "invalid_count": {"type": "integer", "minimum": 0},
+        "timeline_consistency_error_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "chronology": {
+      "type": "object",
+      "required": ["backward_jump_count", "large_backward_jump_count", "source_direction_changes", "chronology_consistency_score"],
+      "properties": {
+        "backward_jump_count": {"type": "integer", "minimum": 0},
+        "large_backward_jump_count": {"type": "integer", "minimum": 0},
+        "source_direction_changes": {"type": "integer", "minimum": 0},
+        "chronology_consistency_score": {"type": "number", "minimum": 0, "maximum": 1}
+      },
+      "additionalProperties": false
+    },
+    "decisions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["reference_segment_id", "footage_segment_id", "source_path", "source_in_seconds", "source_out_seconds", "source_duration_seconds", "target_duration_seconds", "effective_speed_factor", "speed_severity", "match_class", "timeline_speed_consistent"],
+        "properties": {
+          "reference_segment_id": {"type": "string"},
+          "footage_segment_id": {"type": "string"},
+          "source_path": {"type": "string"},
+          "source_in_seconds": {"type": "number", "minimum": 0},
+          "source_out_seconds": {"type": "number", "exclusiveMinimum": 0},
+          "source_duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+          "target_duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+          "effective_speed_factor": {"type": "number", "exclusiveMinimum": 0},
+          "speed_severity": {"type": "string", "enum": ["normal", "warning", "severe", "invalid"]},
+          "match_class": {"type": "string", "enum": ["good", "acceptable", "fallback"]},
+          "timeline_speed_consistent": {"type": "boolean"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "render_integrity": {
+      "type": "object",
+      "required": ["status", "timeline_full_coverage", "timeline_contiguous", "draft_exists", "duration_delta_seconds", "duration_tolerance_seconds", "flags"],
+      "properties": {
+        "status": {"type": "string", "enum": ["pass", "fail"]},
+        "timeline_full_coverage": {"type": "boolean"},
+        "timeline_contiguous": {"type": "boolean"},
+        "draft_exists": {"type": "boolean"},
+        "duration_delta_seconds": {"type": ["number", "null"], "minimum": 0},
+        "duration_tolerance_seconds": {"type": "number", "minimum": 0},
+        "flags": {"type": "array", "items": {"type": "object", "required": ["code", "message"], "properties": {"code": {"type": "string"}, "message": {"type": "string"}}, "additionalProperties": false}}
+      },
+      "additionalProperties": false
+    },
+    "replication_quality": {
+      "type": "object",
+      "required": ["status", "source_limited", "fixable_by_render_revision", "recommended_route"],
+      "properties": {
+        "status": {"type": "string", "enum": ["pass", "warning", "fail"]},
+        "source_limited": {"type": "boolean"},
+        "fixable_by_render_revision": {"type": "boolean", "const": false},
+        "recommended_route": {"type": "string", "enum": ["none", "review", "match_or_timeline", "footage"]}
+      },
+      "additionalProperties": false
+    },
+    "quality_flags": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "severity", "message", "value"],
+        "properties": {"code": {"type": "string"}, "severity": {"type": "string", "enum": ["warning", "fail"]}, "message": {"type": "string"}, "value": {"type": ["number", "integer"]}},
+        "additionalProperties": false
+      }
+    },
+    "quality_gate": {"type": "string", "enum": ["pass", "warning", "fail"]},
+    "metadata": {
+      "type": "object",
+      "required": ["generated_by", "thresholds", "notes"],
+      "properties": {"generated_by": {"type": "string", "const": "replication_quality_evaluator"}, "thresholds": {"type": "object"}, "notes": {"type": "array", "items": {"type": "string"}}},
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

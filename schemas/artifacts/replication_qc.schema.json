@@ -85,6 +85,44 @@
       },
       "additionalProperties": false
     },
+    "render_integrity": {
+      "type": "object",
+      "description": "Optional deterministic render-integrity result from replication_quality_report.",
+      "required": ["status"],
+      "properties": {
+        "status": {"type": "string", "enum": ["pass", "fail"]},
+        "timeline_full_coverage": {"type": "boolean"},
+        "timeline_contiguous": {"type": "boolean"},
+        "draft_exists": {"type": "boolean"},
+        "duration_delta_seconds": {"type": ["number", "null"], "minimum": 0},
+        "duration_tolerance_seconds": {"type": "number", "minimum": 0},
+        "flags": {"type": "array", "items": {"type": "object"}}
+      },
+      "additionalProperties": false
+    },
+    "replication_quality": {
+      "type": "object",
+      "description": "Optional deterministic quality summary; semantic scores remain external-agent owned.",
+      "required": ["quality_gate", "status", "source_limited", "fixable_by_render_revision", "recommended_route", "fallback_count", "fallback_ratio", "unique_source_segment_count", "reuse_ratio", "max_reuse_count", "dominant_source_share", "overlap_reuse_count", "speed", "chronology", "quality_flags"],
+      "properties": {
+        "quality_gate": {"type": "string", "enum": ["pass", "warning", "fail"]},
+        "status": {"type": "string", "enum": ["pass", "warning", "fail"]},
+        "source_limited": {"type": "boolean"},
+        "fixable_by_render_revision": {"type": "boolean"},
+        "recommended_route": {"type": "string"},
+        "fallback_count": {"type": "integer", "minimum": 0},
+        "fallback_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+        "unique_source_segment_count": {"type": "integer", "minimum": 1},
+        "reuse_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+        "max_reuse_count": {"type": "integer", "minimum": 1},
+        "dominant_source_share": {"type": "number", "minimum": 0, "maximum": 1},
+        "overlap_reuse_count": {"type": "integer", "minimum": 0},
+        "speed": {"type": "object"},
+        "chronology": {"type": "object"},
+        "quality_flags": {"type": "array", "items": {"type": "object"}}
+      },
+      "additionalProperties": false
+    },
     "metadata": {
       "type": "object",
       "required": ["generated_by", "semantic_review_completed", "source_evidence_path", "thresholds", "notes"],
@@ -92,6 +130,7 @@
         "generated_by": {"type": "string"},
         "semantic_review_completed": {"type": "boolean", "const": true},
         "source_evidence_path": {"type": "string"},
+        "deterministic_quality_report_path": {"type": "string"},
         "thresholds": {
           "type": "object",
           "required": ["fidelity_pass", "quality_pass"],

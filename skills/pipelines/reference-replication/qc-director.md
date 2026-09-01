@@ -16,10 +16,12 @@ The product rule remains:
 - `replication_timeline`
 - `replication_render_plan`
 - latest `draft_render`
+- deterministic `replication_quality_report`
 
 ## Required tools
 
 - `replication_qc_evidence_builder`
+- `replication_quality_evaluator`
 - `reference_qc_validator`
 - `reference_finalizer`
 
@@ -31,6 +33,17 @@ Revision loop may reuse earlier tools:
 - `reference_video_renderer`
 
 No local LLM/VLM/CLIP dependency is permitted. The agent's cloud multimodal capability performs semantic comparison.
+
+## 0. Read deterministic quality evidence
+
+Before semantic review, run or read `replication_quality_evaluator`. It reports two independent outcomes:
+
+- `render_integrity`: timeline coverage, draft existence, and duration tolerance.
+- `quality_gate`: deterministic fallback, speed, source reuse, and chronology constraints.
+
+These metrics constrain the review but do not replace it. The evaluator cannot judge whether two actions look alike. A semantic `pass` must not contradict `quality_gate=fail`. If render integrity passes but the failed quality gate is source-limited, use `footage_limited` instead of rerendering the same timeline.
+
+Canonical speed means `source_duration_seconds / target_duration_seconds`. Do not reinterpret that factor in the semantic review.
 
 ## Two scores — never collapse them
 
@@ -153,6 +166,7 @@ Use when:
 - QualityScore >= target,
 - no high-severity unresolved defect,
 - no rerender remains.
+- deterministic `quality_gate` is not `fail`.
 
 Then finalize.
 
@@ -184,6 +198,8 @@ This status is **publishable**. It must include concrete `improvement_requests`,
 - movement direction/framing requirement.
 
 Do not leave timeline holes and do not refuse to produce the final video.
+
+When the deterministic report marks `source_limited=true`, a render-only revision is not actionable. Request better footage and finalize as `footage_limited` if standalone render integrity/quality passes.
 
 ## 6. Automatic revision budget
 
@@ -245,6 +261,7 @@ A `footage_limited` final is still a successful complete render; it simply gives
 ## Outputs
 
 - `replication_qc_evidence`
+- `replication_quality_report`
 - `replication_qc`
 - `final_render`
 

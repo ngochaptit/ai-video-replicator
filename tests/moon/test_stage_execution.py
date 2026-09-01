@@ -147,13 +147,76 @@ def test_qc_waits_for_external_agent_artifacts(tmp_path) -> None:
     runner.complete("match", {})
     runner.complete("timeline", {})
     runner.complete("render", {})
+    runner.artifacts.write("replication_quality_report", _quality_report())
     service = StageExecutionService(runner)
 
     result = service.run()
 
     assert result["status"] == "awaiting_agent"
     assert set(result["task"]["required_output_artifacts"]) == {"qc_report", "decision_log"}
+    assert result["task"]["quality_gate"] == "pass"
     assert runner.state.next_stage() == "qc"
+
+
+def test_qc_handoff_builds_and_persists_deterministic_quality_report(tmp_path, monkeypatch) -> None:
+    runner = _runner_at_footage(tmp_path)
+    runner.complete("footage", {}); runner.complete("match", {}); runner.complete("timeline", {}); runner.complete("render", {})
+    runner.artifacts.write("timeline", {"segments": [{"id": "timeline_001"}]})
+    runner.artifacts.write("draft_render", {"output": str(tmp_path / "draft.mp4")})
+    service = StageExecutionService(runner)
+    calls = []
+
+    def execute(name, inputs):
+        calls.append((name, inputs))
+        assert name == "replication_quality_evaluator"
+        return {"success": True, "data": _quality_report(), "artifacts": [], "error": None}
+
+    monkeypatch.setattr(service, "_execute_tool", execute)
+
+    result = service.run()
+
+    assert result["status"] == "awaiting_agent"
+    assert runner.artifacts.exists("replication_quality_report")
+    assert calls[0][1]["revision"] == 0
+
+
+def test_source_limited_qc_finalizes_without_consuming_revision(tmp_path) -> None:
+    runner = _runner_at_footage(tmp_path)
+    runner.complete("footage", {}); runner.complete("match", {}); runner.complete("timeline", {}); runner.complete("render", {})
+    draft = tmp_path / "output" / "draft_r0.mp4"; draft.parent.mkdir(parents=True); draft.write_bytes(b"draft")
+    quality = _quality_report(gate="fail", source_limited=True)
+    runner.artifacts.write("replication_quality_report", quality)
+    runner.artifacts.write("draft_render", {"output": str(draft), "revision": 0})
+    runner.artifacts.write("qc_bundle", {"qc_report": {"decision": "footage_limited"}, "decision_log": {"items": []}})
+
+    result = StageExecutionService(runner).run()
+
+    assert result["status"] == "completed"
+    assert result["quality_gate"] == "fail"
+    assert runner.state.revision == 0
+    assert runner.status()["done"] is True
+    assert (tmp_path / "output" / "final.mp4").read_bytes() == b"draft"
+    assert runner.artifacts.read("qc_report")["replication_quality"]["quality_gate"] == "fail"
+
+
+def _quality_report(*, gate: str = "pass", source_limited: bool = False) -> dict:
+    return {
+        "revision": 0,
+        "decision_count": 1,
+        "fallback_count": 1 if source_limited else 0,
+        "fallback_ratio": 1.0 if source_limited else 0.0,
+        "unique_source_segment_count": 1,
+        "reuse_ratio": 0.0,
+        "max_reuse_count": 1,
+        "dominant_source_share": 1.0,
+        "overlap_reuse_count": 0,
+        "speed": {"min": 1.0, "max": 1.0, "mean": 1.0, "normal_count": 1, "warning_count": 0, "severe_count": 0, "invalid_count": 0, "timeline_consistency_error_count": 0},
+        "chronology": {"backward_jump_count": 0, "large_backward_jump_count": 0, "source_direction_changes": 0, "chronology_consistency_score": 1.0},
+        "render_integrity": {"status": "pass"},
+        "replication_quality": {"status": gate, "source_limited": source_limited, "fixable_by_render_revision": False, "recommended_route": "footage" if source_limited else "none"},
+        "quality_flags": [],
+        "quality_gate": gate,
+    }
 
 
 def test_render_builds_canonical_plan_before_invoking_renderer(tmp_path, monkeypatch) -> None:
