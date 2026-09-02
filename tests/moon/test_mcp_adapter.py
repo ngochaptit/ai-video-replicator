@@ -29,7 +29,8 @@ def test_tools_list_maps_connector_surface(tmp_path):
     tools = {tool["name"]: tool for tool in response["result"]["tools"]}
     assert set(tools) == {
         "moon.status", "moon.next", "moon.handoff", "moon.evidence.list",
-        "moon.evidence.read_json", "moon.evidence.read_image", "moon.frames.sample", "moon.submit",
+        "moon.evidence.read_json", "moon.evidence.read_image", "moon.evidence.clear_sampled",
+        "moon.frames.sample", "moon.submit",
     }
     assert tools["moon.submit"]["inputSchema"]["required"] == ["stage", "payload"]
     assert tools["moon.evidence.read_image"]["inputSchema"]["required"] == ["path"]

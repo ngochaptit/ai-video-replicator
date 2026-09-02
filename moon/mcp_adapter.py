@@ -43,6 +43,11 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "required": ["path"],
         "additionalProperties": False,
     },
+    "moon.evidence.clear_sampled": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
     "moon.frames.sample": {
         "type": "object",
         "properties": {
@@ -74,6 +79,7 @@ _TOOL_DESCRIPTIONS = {
     "moon.evidence.list": "List typed evidence files for the current semantic stage.",
     "moon.evidence.read_json": "Read JSON evidence inside the local project root.",
     "moon.evidence.read_image": "Read local image evidence and return it as MCP image content for a vision-capable agent.",
+    "moon.evidence.clear_sampled": "Clear registered sampled-frame evidence for the current stage without deleting deterministic analysis.",
     "moon.frames.sample": "Deterministically sample local video frames with FFmpeg; does not choose shots.",
     "moon.submit": "Submit an external-agent semantic decision through Moon validation and optionally advance.",
 }

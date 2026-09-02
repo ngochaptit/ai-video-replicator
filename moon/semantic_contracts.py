@@ -1,16 +1,19 @@
 from __future__ import annotations
 from typing import Any
+from moon.evidence import SampledFrameEvidenceStore
 from moon.runner.pipeline import PipelineRunner
 SCORE_KEYS=("action","interaction","camera","spatial","motion","duration","overall")
 
 def validate_semantic_submission(runner:PipelineRunner,stage:str,payload:dict[str,Any])->None:
     if stage=="footage" and runner.artifacts.exists("footage_profiles_scaffold"):
         scaffold=runner.artifacts.read("footage_profiles_scaffold")
-        if scaffold.get("clips"): _validate_footage(scaffold,payload)
+        if scaffold.get("clips"):
+            sampled=SampledFrameEvidenceStore(runner.project,runner.state.revision).active("footage")
+            _validate_footage(scaffold,payload,sampled.get("groups") or [])
     elif stage=="match" and runner.artifacts.exists("reference_blueprint") and runner.artifacts.exists("footage_profiles"):
         _validate_match(runner.artifacts.read("reference_blueprint"),runner.artifacts.read("footage_profiles"),payload)
 
-def _validate_footage(scaffold:dict[str,Any],payload:dict[str,Any])->None:
+def _validate_footage(scaffold:dict[str,Any],payload:dict[str,Any],sampled_groups:list[dict[str,Any]]|None=None)->None:
     expected={str(c["clip_id"]):c for c in scaffold.get("clips") or []}; clips=payload.get("clips")
     if not isinstance(clips,list) or not clips: raise ValueError("footage enrichment requires non-empty clips[]")
     actual={str(c.get("clip_id") or ""):c for c in clips if isinstance(c,dict)}
@@ -25,6 +28,10 @@ def _validate_footage(scaffold:dict[str,Any],payload:dict[str,Any])->None:
         for item in measured_clip.get("segments") or []:
             ev=item.get("evidence") or {}; evidence.extend(float(x) for x in ev.get("frame_timestamps") or [])
             if "scene_cut" in (item.get("boundary_basis") or []): measured.add(float(item["source_in"]))
+        for group in sampled_groups or []:
+            source=group.get("source") or {}; group_clip_id=str(source.get("clip_id") or "")
+            if group_clip_id==clip_id:
+                evidence.extend(float(frame["timestamp_seconds"]) for frame in group.get("frames") or [])
         measured.update(evidence); previous=-1.0
         for index,segment in enumerate(segments,1):
             if not isinstance(segment,dict): raise ValueError(f"{clip_id} segment {index} must be object")

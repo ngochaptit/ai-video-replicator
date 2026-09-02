@@ -45,9 +45,13 @@ class MoonProject:
     def cache_dir(self) -> Path:
         return self.moon_dir / "cache"
 
+    @property
+    def evidence_dir(self) -> Path:
+        return self.moon_dir / "evidence"
+
     def ensure_layout(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        for directory in (self.checkpoints_dir, self.artifacts_dir, self.cache_dir):
+        for directory in (self.checkpoints_dir, self.artifacts_dir, self.cache_dir, self.evidence_dir):
             directory.mkdir(parents=True, exist_ok=True)
         if not self.project_path.exists():
             self._write_json(
