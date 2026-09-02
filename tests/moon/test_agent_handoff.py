@@ -65,3 +65,35 @@ def test_qc_bundle_is_single_portable_submission(tmp_path: Path):
     result = AgentHandoffService(runner).submit("qc", payload)
     assert result["artifact"] == "qc_bundle"
     assert runner.artifacts.read("qc_bundle") == payload
+
+
+def test_qc_rejects_pass_that_contradicts_deterministic_quality_failure(tmp_path: Path):
+    runner = runner_at(tmp_path)
+    runner.complete("footage", {}); runner.complete("match", {}); runner.complete("timeline", {}); runner.complete("render", {})
+    runner.artifacts.write("replication_quality_report", _quality_report(gate="fail", source_limited=False))
+
+    with pytest.raises(ValueError, match="contradicts deterministic replication quality failure"):
+        AgentHandoffService(runner).submit("qc", {"qc_report": {"decision": "pass"}, "decision_log": {}})
+
+
+def test_source_limited_quality_uses_footage_limited_without_render_revision(tmp_path: Path):
+    runner = runner_at(tmp_path)
+    runner.complete("footage", {}); runner.complete("match", {}); runner.complete("timeline", {}); runner.complete("render", {})
+    runner.artifacts.write("replication_quality_report", _quality_report(gate="fail", source_limited=True))
+    service = AgentHandoffService(runner)
+
+    with pytest.raises(ValueError, match="cannot be fixed by Moon's render-only revision"):
+        service.submit("qc", {"qc_report": {"decision": "revise"}, "decision_log": {}})
+
+    accepted = service.submit("qc", {"qc_report": {"decision": "footage_limited"}, "decision_log": {}})
+    assert accepted["accepted"] is True
+    assert runner.state.revision == 0
+
+
+def _quality_report(*, gate: str, source_limited: bool) -> dict:
+    return {
+        "revision": 0,
+        "quality_gate": gate,
+        "render_integrity": {"status": "pass"},
+        "replication_quality": {"source_limited": source_limited},
+    }

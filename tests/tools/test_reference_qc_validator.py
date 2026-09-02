@@ -119,6 +119,37 @@ def test_large_duration_drift_forces_revise() -> None:
         )
 
 
+def test_semantic_pass_cannot_override_deterministic_quality_failure() -> None:
+    with pytest.raises(ValueError, match="contradicts deterministic replication quality failure"):
+        ReferenceQCValidator().build_qc(
+            _blueprint(),
+            _evidence(),
+            _review(status="pass", fidelity=0.92, quality=0.91),
+            deterministic_quality_report=_quality_report(gate="fail", source_limited=False),
+        )
+
+
+def test_source_limited_deterministic_failure_is_preserved_in_canonical_qc() -> None:
+    review = _review(status="footage_limited", fidelity=0.62, quality=0.86)
+    review["improvement_requests"] = [{"reference_segment_id": "seg_002", "reason": "Missing action.", "suggested_footage": "Add the matching POV action."}]
+    review["final_decision"] = {"publishable": True, "requires_rerender": False, "reason": "Source-limited but technically valid."}
+
+    qc = ReferenceQCValidator().build_qc(
+        _blueprint(),
+        _evidence(),
+        review,
+        deterministic_quality_report=_quality_report(gate="fail", source_limited=True),
+        deterministic_quality_report_path="replication_quality_report.json",
+    )
+
+    assert qc["status"] == "footage_limited"
+    assert qc["render_integrity"]["status"] == "pass"
+    assert qc["replication_quality"]["quality_gate"] == "fail"
+    assert qc["metadata"]["deterministic_quality_report_path"] == "replication_quality_report.json"
+    schema = json.loads((ROOT / "schemas" / "artifacts" / "replication_qc.schema.json").read_text(encoding="utf-8"))
+    jsonschema.validate(instance=qc, schema=schema)
+
+
 def _blueprint() -> dict:
     return {
         "version": "1.0",
@@ -175,4 +206,22 @@ def _review(*, status: str, fidelity: float, quality: float) -> dict:
             "reason": "Meets fidelity and quality gates." if status == "pass" else "Review requires follow-up.",
         },
         "notes": [],
+    }
+
+
+def _quality_report(*, gate: str, source_limited: bool) -> dict:
+    return {
+        "quality_gate": gate,
+        "fallback_count": 2 if source_limited else 0,
+        "fallback_ratio": 1.0 if source_limited else 0.0,
+        "unique_source_segment_count": 1,
+        "reuse_ratio": 0.5,
+        "max_reuse_count": 2,
+        "dominant_source_share": 1.0,
+        "overlap_reuse_count": 1,
+        "speed": {"min": 1.0, "max": 1.0, "mean": 1.0},
+        "chronology": {"backward_jump_count": 0, "large_backward_jump_count": 0, "source_direction_changes": 0, "chronology_consistency_score": 1.0},
+        "render_integrity": {"status": "pass", "timeline_full_coverage": True, "timeline_contiguous": True, "draft_exists": True, "duration_delta_seconds": 0.04, "duration_tolerance_seconds": 0.15, "flags": []},
+        "replication_quality": {"status": gate, "source_limited": source_limited, "fixable_by_render_revision": False, "recommended_route": "footage" if source_limited else "match_or_timeline"},
+        "quality_flags": [],
     }

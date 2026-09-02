@@ -41,7 +41,7 @@ class AgentHandoffService:
         return all(self.runner.artifacts.exists(name) for name in required)
 
     def _inputs(self, stage: str) -> dict[str, Any]:
-        names={"footage":["footage_profiles_scaffold"],"match":["reference_blueprint","footage_profiles","candidate_rankings"],"render":["timeline"],"qc":["draft_render"]}.get(stage,[]); result={}
+        names={"footage":["footage_profiles_scaffold"],"match":["reference_blueprint","footage_profiles","candidate_rankings"],"render":["timeline"],"qc":["draft_render","timeline","match_decisions","replication_quality_report"]}.get(stage,[]); result={}
         for name in names:
             if self.runner.artifacts.exists(name):
                 path=self.runner.artifacts.path_for(name); result[name]={"path":str(path),"sha256":self._sha256(path)}
@@ -56,7 +56,7 @@ class AgentHandoffService:
             "footage":{"artifact":"footage_semantic_enrichment","required":["clips"],"rules":["clips must exactly cover measured clip_id values from footage_profiles_scaffold","unusable clips may set usable=false and omit segments","usable clips require measured non-overlapping segments","each segment requires source_in, source_out, boundary_basis and in-range frame evidence","semantic/camera/spatial/motion/quality/confidence fields may be supplied by the external vision agent"]},
             "match":{"artifact":"match_proposal","required":["matches"],"rules":["exactly one match per reference blueprint segment","footage_segment_id must exist in enriched footage profiles","scores require action, interaction, camera, spatial, motion, duration, overall in [0,1] (non-overall may be null)","fallback requires an improvement_request for that reference segment","rationale must be non-empty"]},
             "render":{"artifact":"render_plan","required":["runtime_approved","render_runtime"],"rules":["runtime_approved must be true","render_runtime must be ffmpeg, remotion, or hyperframes"]},
-            "qc":{"artifact":"qc_bundle","required":["qc_report","decision_log"],"rules":["qc_report and decision_log must be objects","qc_report.decision may be pass or revise; revise triggers bounded render revision in Moon v1"]}}
+            "qc":{"artifact":"qc_bundle","required":["qc_report","decision_log"],"rules":["qc_report and decision_log must be objects","qc_report.decision may be pass, revise, or footage_limited","pass cannot contradict deterministic replication_quality_report quality_gate=fail","render integrity failure requires revise","source-limited quality failure must not trigger a render-only revision loop"]}}
         if stage not in contracts: raise ValueError(f"stage {stage!r} does not expose an agent handoff contract")
         return {"type":"object",**contracts[stage]}
 
@@ -90,8 +90,13 @@ class AgentHandoffService:
             if payload.get("render_runtime") not in {"ffmpeg","remotion","hyperframes"}: raise ValueError("invalid render_runtime")
         elif stage=="qc":
             if not isinstance(payload.get("qc_report"),dict) or not isinstance(payload.get("decision_log"),dict): raise ValueError("qc handoff requires qc_report and decision_log objects")
-            decision=payload["qc_report"].get("decision")
-            if decision is not None and decision not in {"pass","revise"}: raise ValueError("qc_report.decision must be pass or revise")
+            decision=payload["qc_report"].get("decision",payload["qc_report"].get("verdict"))
+            if decision not in {"pass","revise","footage_limited"}: raise ValueError("qc_report.decision must be pass, revise, or footage_limited")
+            if self.runner.artifacts.exists("replication_quality_report"):
+                quality=self.runner.artifacts.read("replication_quality_report");integrity=str((quality.get("render_integrity") or {}).get("status") or "fail");gate=str(quality.get("quality_gate") or "fail");source_limited=bool((quality.get("replication_quality") or {}).get("source_limited"))
+                if integrity!="pass" and decision!="revise":raise ValueError("render integrity failure requires qc_report.decision=revise")
+                if gate=="fail" and decision=="pass":raise ValueError("qc_report.decision=pass contradicts deterministic replication quality failure")
+                if source_limited and decision=="revise":raise ValueError("source-limited quality failure cannot be fixed by Moon's render-only revision; use footage_limited or provide better footage")
         else: raise ValueError(f"stage {stage!r} does not accept an agent handoff submission")
 
     def _required_artifact(self, stage: str) -> str: return "qc_bundle" if stage=="qc" else str(self._output_contract(stage)["artifact"])

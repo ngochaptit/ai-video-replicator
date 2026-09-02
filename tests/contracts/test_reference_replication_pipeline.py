@@ -43,8 +43,9 @@ def test_reference_replication_pipeline_loads_full_core_workflow() -> None:
         "replication_render_plan",
         "draft_render",
     ]
-    assert qc["produces"] == ["replication_qc_evidence", "replication_qc", "final_render"]
+    assert qc["produces"] == ["replication_quality_report", "replication_qc_evidence", "replication_qc", "final_render"]
     assert qc["required_tools"] == [
+        "replication_quality_evaluator",
         "replication_qc_evidence_builder",
         "reference_qc_validator",
         "reference_finalizer",
@@ -102,4 +103,5 @@ def test_phase_2_through_phase_5_artifact_contracts_exist() -> None:
     assert (ROOT / "schemas" / "artifacts" / "replication_timeline.schema.json").is_file()
     assert (ROOT / "schemas" / "artifacts" / "replication_render_plan.schema.json").is_file()
     assert (ROOT / "schemas" / "artifacts" / "replication_qc_evidence.schema.json").is_file()
+    assert (ROOT / "schemas" / "artifacts" / "replication_quality_report.schema.json").is_file()
     assert (ROOT / "schemas" / "artifacts" / "replication_qc.schema.json").is_file()

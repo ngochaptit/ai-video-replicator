@@ -75,6 +75,7 @@ class ReferenceQCValidator(BaseTool):
             "reference_blueprint_path": {"type": "string"},
             "qc_evidence_path": {"type": "string"},
             "semantic_review_path": {"type": "string"},
+            "replication_quality_report_path": {"type": "string"},
             "output_path": {"type": "string"},
             "fidelity_pass": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.85},
             "quality_pass": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.80},
@@ -109,11 +110,15 @@ class ReferenceQCValidator(BaseTool):
             blueprint = self._read_json(blueprint_path)
             evidence = self._read_json(evidence_path)
             review = self._read_json(review_path)
+            quality_report_path = inputs.get("replication_quality_report_path")
+            quality_report = self._read_json(Path(quality_report_path)) if quality_report_path else None
             qc = self.build_qc(
                 blueprint,
                 evidence,
                 review,
                 source_evidence_path=str(evidence_path),
+                deterministic_quality_report=quality_report,
+                deterministic_quality_report_path=str(quality_report_path or ""),
                 fidelity_pass=float(inputs.get("fidelity_pass", 0.85)),
                 quality_pass=float(inputs.get("quality_pass", 0.80)),
                 duration_tolerance_seconds=float(inputs.get("duration_tolerance_seconds", 0.15)),
@@ -133,6 +138,8 @@ class ReferenceQCValidator(BaseTool):
         review: dict[str, Any],
         *,
         source_evidence_path: str = "qc_evidence.json",
+        deterministic_quality_report: dict[str, Any] | None = None,
+        deterministic_quality_report_path: str = "",
         fidelity_pass: float = 0.85,
         quality_pass: float = 0.80,
         duration_tolerance_seconds: float = 0.15,
@@ -168,6 +175,17 @@ class ReferenceQCValidator(BaseTool):
         fidelity = scores["fidelity_score"]
         quality = scores["quality_score"]
         has_high_issue = any(item["severity"] == "high" for item in segment_reviews)
+
+        if deterministic_quality_report is not None:
+            render_integrity = str((deterministic_quality_report.get("render_integrity") or {}).get("status") or "fail")
+            quality_gate = str(deterministic_quality_report.get("quality_gate") or "fail")
+            source_limited = bool((deterministic_quality_report.get("replication_quality") or {}).get("source_limited"))
+            if render_integrity != "pass" and status != "revise":
+                raise ValueError("deterministic render integrity failure requires status=revise")
+            if quality_gate == "fail" and status == "pass":
+                raise ValueError("pass contradicts deterministic replication quality failure")
+            if source_limited and status == "revise":
+                raise ValueError("source-limited quality failure cannot be fixed by a render-only revision")
 
         if duration_delta > duration_tolerance_seconds and status != "revise":
             raise ValueError(
@@ -214,7 +232,7 @@ class ReferenceQCValidator(BaseTool):
                 "Final is technically publishable but reference fidelity is below target because available footage is the limiting factor."
             )
 
-        return {
+        output = {
             "version": "1.0",
             "iteration": iteration,
             "status": status,
@@ -228,6 +246,7 @@ class ReferenceQCValidator(BaseTool):
                 "generated_by": self.name,
                 "semantic_review_completed": True,
                 "source_evidence_path": source_evidence_path,
+                "deterministic_quality_report_path": deterministic_quality_report_path,
                 "thresholds": {
                     "fidelity_pass": round(fidelity_pass, 6),
                     "quality_pass": round(quality_pass, 6),
@@ -235,6 +254,23 @@ class ReferenceQCValidator(BaseTool):
                 "notes": list(dict.fromkeys(notes)),
             },
         }
+        if deterministic_quality_report is not None:
+            output["render_integrity"] = dict(deterministic_quality_report["render_integrity"])
+            output["replication_quality"] = {
+                "quality_gate": deterministic_quality_report["quality_gate"],
+                "fallback_count": deterministic_quality_report["fallback_count"],
+                "fallback_ratio": deterministic_quality_report["fallback_ratio"],
+                "unique_source_segment_count": deterministic_quality_report["unique_source_segment_count"],
+                "reuse_ratio": deterministic_quality_report["reuse_ratio"],
+                "max_reuse_count": deterministic_quality_report["max_reuse_count"],
+                "dominant_source_share": deterministic_quality_report["dominant_source_share"],
+                "overlap_reuse_count": deterministic_quality_report["overlap_reuse_count"],
+                "speed": dict(deterministic_quality_report["speed"]),
+                "chronology": dict(deterministic_quality_report["chronology"]),
+                "quality_flags": list(deterministic_quality_report["quality_flags"]),
+                **dict(deterministic_quality_report["replication_quality"]),
+            }
+        return output
 
     def _validate_scores(self, raw: dict[str, Any]) -> dict[str, Any]:
         scores: dict[str, Any] = {}
