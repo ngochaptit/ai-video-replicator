@@ -1,0 +1,9 @@
+[project]
+name = "moon-local"
+version = "0.2.5"
+description = "Local Moon MCP stdio server for Claude Desktop"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv]
+package = false
