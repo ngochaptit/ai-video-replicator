@@ -2,9 +2,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from moon.hosts.base import canonical_mcp_launch
+
 def local_mcp_config(project:str|Path)->dict[str,Any]:
-    root=str(Path(project).resolve())
-    return {"transport":"stdio","command":"python","args":["-m","moon","--project",root,"mcp-stdio"],"tools_prefix":"moon.","semantic_owner":"external_agent"}
+    command = canonical_mcp_launch(project)
+    return {"transport":"stdio","command":command[0],"args":list(command[1:]),"tools_prefix":"moon.","semantic_owner":"external_agent"}
 
 def remote_tunnel_descriptor(project:str|Path)->dict[str,Any]:
     """Describe, but do not provision, a secure remote/tunnel wrapper.

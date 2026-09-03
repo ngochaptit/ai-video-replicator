@@ -7,7 +7,6 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 
-DEFAULT_PROJECT_ROOT = r"D:\AI EDIT VIDEO\8.26"
 PROJECT_ROOT_ENV = "MOON_PROJECT_ROOT"
 
 
@@ -15,7 +14,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Launch the bundled Moon MCP stdio server")
     parser.add_argument(
         "--project",
-        help=f"Moon project root (overrides {PROJECT_ROOT_ENV} and the development default)",
+        help=f"Moon project root (overrides {PROJECT_ROOT_ENV})",
     )
     return parser
 
@@ -26,7 +25,9 @@ def resolve_project_root(
     environ: Mapping[str, str] | None = None,
 ) -> Path:
     environment = os.environ if environ is None else environ
-    selected = project or environment.get(PROJECT_ROOT_ENV) or DEFAULT_PROJECT_ROOT
+    selected = project or environment.get(PROJECT_ROOT_ENV)
+    if not selected:
+        raise ValueError(f"Moon project root is required via --project or {PROJECT_ROOT_ENV}")
     root = Path(selected).expanduser().resolve()
     if not root.exists():
         raise FileNotFoundError(f"Moon project root does not exist: {root}")
@@ -44,7 +45,7 @@ def resolve_moon_source_root(launcher_file: str | Path = __file__) -> Path:
 
 
 def moon_arguments(project_root: Path) -> list[str]:
-    return ["--project", str(project_root), "mcp-stdio"]
+    return ["mcp", "--project", str(project_root)]
 
 
 def main(argv: Sequence[str] | None = None) -> int:

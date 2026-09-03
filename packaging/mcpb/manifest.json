@@ -45,8 +45,7 @@
       "type": "directory",
       "title": "Moon project root",
       "description": "Choose an initialized local Moon project directory.",
-      "required": true,
-      "default": "D:\\AI EDIT VIDEO\\8.26"
+      "required": true
     }
   },
   "tools": [

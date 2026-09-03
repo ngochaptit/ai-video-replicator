@@ -5,6 +5,7 @@ setup(
     version="0.1.0",
     description="AI-Orchestrated Video Production Platform",
     packages=find_packages(),
+    entry_points={"console_scripts": ["moon=moon.cli:main"]},
     python_requires=">=3.10",
     install_requires=[
         "pyyaml>=6.0",
