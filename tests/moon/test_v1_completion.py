@@ -26,5 +26,5 @@ def test_workspace_registry_and_presets(tmp_path):
 
 def test_transport_descriptors_never_claim_public_endpoint(tmp_path):
     local=local_mcp_config(tmp_path);remote=remote_tunnel_descriptor(tmp_path)
-    assert local["transport"]=="stdio" and local["args"][-1]=="mcp-stdio"
+    assert local["transport"]=="stdio" and local["args"][-3:]==["mcp","--project",str(tmp_path.resolve())]
     assert remote["remote"]["provisioned"] is False and remote["remote"]["requires_authentication"] is True

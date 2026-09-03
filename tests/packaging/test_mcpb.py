@@ -45,7 +45,7 @@ def test_manifest_is_valid_mcpb_v04_uv():
         "${user_config.project_root}",
     ]
     assert "${__dirname}" not in json.dumps(manifest["server"]["mcp_config"])
-    assert manifest["user_config"]["project_root"]["default"] == r"D:\AI EDIT VIDEO\8.26"
+    assert "default" not in manifest["user_config"]["project_root"]
     assert {tool["name"] for tool in manifest["tools"]} == {
         "moon.status",
         "moon.next",
@@ -74,6 +74,8 @@ def test_launcher_resolves_argument_then_environment_and_validates(tmp_path):
     ) == environment_project.resolve()
     with pytest.raises(FileNotFoundError, match="does not exist"):
         launcher.resolve_project_root(str(tmp_path / "missing"), environ={})
+    with pytest.raises(ValueError, match="project root is required"):
+        launcher.resolve_project_root(environ={})
 
 
 def test_packaged_launcher_starts_existing_mcp_server_outside_cwd(tmp_path):
