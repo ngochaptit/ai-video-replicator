@@ -33,7 +33,16 @@ The resulting `footage_profiles.json` is an evidence scaffold. Fixed analysis wi
 
 ## Semantic review
 
-Inspect each analyzed clip's evidence frames. Use `frame_sampler` when the existing evidence is insufficient to locate an action or interaction boundary.
+Inspect each analyzed clip's evidence frames. Moon v1.2 seeds long footage with deterministic adaptive coverage (target spacing about 4 seconds, bounded per clip) before the handoff. These samples are **measured evidence**, not semantic decisions.
+
+Use a coarse-to-fine review:
+
+1. Scan the seeded coverage across the full clip.
+2. Whenever an action/interaction appears to change between coarse samples, call `moon.frames.sample` (or `frame_sampler` outside Moon) on that narrower window at denser timestamps.
+3. Use those persisted sampled timestamps as the final measured `source_in` / `source_out` boundaries.
+4. Do not collapse a long continuous take into a few analyzer keyframe spans merely because hard scene cuts are absent.
+
+The Moon execution adapter automatically bridges registered `moon.frames.sample` evidence into the builder's `evidence_catalog` on the enrichment pass, so agent-selected sampled boundaries remain valid when canonical `footage_profiles.json` is built.
 
 For every clip decide:
 
