@@ -1,7 +1,9 @@
 from __future__ import annotations
+import json
 import shutil
 from pathlib import Path
 from typing import Any
+from moon.footage_evidence import FootageEvidencePlanner
 from moon.runner.pipeline import PipelineRunner
 
 class StageExecutionService:
@@ -16,11 +18,13 @@ class StageExecutionService:
         fn={"footage":self._run_footage,"match":self._run_match,"timeline":self._run_timeline,"render":self._run_render,"qc":self._run_qc}.get(stage);return fn() if fn else {"status":"awaiting_agent","stage":stage,"required_agent_artifact":self.plan()["required_agent_artifact"],"pipeline":self.runner.status()}
     def _run_footage(self)->dict[str,Any]:
         self.runner.begin("footage");out=self.runner.project.root/"analysis"/"footage";inputs={"footage_dir":str(self.runner.project.root/"footage"),"analysis_depth":"deep","max_keyframes_per_file":30,"max_analysis_window_seconds":2.0,"output_dir":str(out)};enrichment=None
-        if self.runner.artifacts.exists("footage_semantic_enrichment"):enrichment=self._materialize_artifact("footage_semantic_enrichment");inputs["semantic_enrichment_path"]=str(enrichment)
+        if self.runner.artifacts.exists("footage_semantic_enrichment"):
+            enrichment=self._materialize_footage_enrichment();inputs["semantic_enrichment_path"]=str(enrichment)
         result=self._execute_tool("footage_profile_builder",inputs)
         if not result["success"]:self.runner.fail("footage",result["error"]);return {"status":"blocked","stage":"footage",**result}
         if not enrichment:
-            self.runner.artifacts.write("footage_profiles_scaffold",result["data"]);task={"stage":"footage","decision_owner":"external_agent","required_output_artifact":"footage_semantic_enrichment","evidence_root":str(out),"instruction":"Inspect measured evidence; submit exact clip_id coverage and measured semantic action segments."};self.runner.artifacts.write("footage_agent_task",task);return {"status":"awaiting_agent","stage":"footage","task":task,"pipeline":self.runner.status()}
+            scaffold=result["data"];self.runner.artifacts.write("footage_profiles_scaffold",scaffold);planner=FootageEvidencePlanner(self.runner.project,self.runner.state.revision);sampling=planner.seed(scaffold);catalog=planner.evidence_catalog(scaffold);self.runner.artifacts.write("footage_evidence_catalog",{"version":"1.0","entries":catalog,"coverage":sampling["coverage"],"policy":sampling["policy"]})
+            task={"stage":"footage","decision_owner":"external_agent","required_output_artifact":"footage_semantic_enrichment","evidence_root":str(out),"sampling":sampling,"instruction":"Inspect the adaptive sampled evidence, not analyzer keyframes alone. Treat fixed windows/keyframes as scaffolding only. Use moon.frames.sample to refine any window where an action or interaction boundary is ambiguous, then submit measured semantic action segments. Long clips must be reviewed coarse-to-fine before final segmentation."};self.runner.artifacts.write("footage_agent_task",task);return {"status":"awaiting_agent","stage":"footage","task":task,"pipeline":self.runner.status()}
         self.runner.artifacts.write("footage_profiles",result["data"]);return {"status":"completed","stage":"footage","pipeline":self.runner.complete("footage",{"source":"stage_execution_adapter","tool":"footage_profile_builder"})}
     def _run_match(self)->dict[str,Any]:
         self.runner.begin("match");bp=self._require_artifact("reference_blueprint");profiles=self._require_artifact("footage_profiles");rankings=self.runner.project.cache_dir/"candidate_rankings.json";rank=self._execute_tool("reference_candidate_ranker",{"reference_blueprint_path":str(bp),"footage_profiles_path":str(profiles),"top_k":10,"output_path":str(rankings)})
@@ -80,6 +84,9 @@ class StageExecutionService:
         timeline=self._require_artifact("timeline");draft=self._require_artifact("draft_render");out=self.runner.project.root/"analysis"/f"replication_quality_report_r{self.runner.state.revision}.json";result=self._execute_tool("replication_quality_evaluator",{"replication_timeline_path":str(timeline),"draft_render_path":str(draft),"output_path":str(out),"revision":self.runner.state.revision})
         if result["success"]:self.runner.artifacts.write("replication_quality_report",result["data"])
         return result
+    def _materialize_footage_enrichment(self)->Path:
+        source=self._require_artifact("footage_semantic_enrichment");payload=json.loads(source.read_text(encoding="utf-8"));scaffold=self.runner.artifacts.read("footage_profiles_scaffold") if self.runner.artifacts.exists("footage_profiles_scaffold") else {"clips":[]}
+        planner=FootageEvidencePlanner(self.runner.project,self.runner.state.revision);catalog=planner.evidence_catalog(scaffold);existing=payload.get("evidence_catalog") or [];merged={(str(item.get("clip_id") or ""),str(item.get("path") or ""),round(float(item.get("timestamp",0.0)),6)):item for item in [*existing,*catalog] if isinstance(item,dict) and item.get("path")};payload["evidence_catalog"]=sorted(merged.values(),key=lambda item:(str(item.get("clip_id") or ""),float(item.get("timestamp",0.0)),str(item.get("path") or "")));self.runner.artifacts.write("footage_evidence_catalog",{"version":"1.0","entries":payload["evidence_catalog"],"coverage":planner.coverage_summary(scaffold),"policy":"adaptive_uniform_seed_v1"});target=self.runner.project.cache_dir/"stage-inputs"/"footage_semantic_enrichment_with_sampled_evidence.json";target.parent.mkdir(parents=True,exist_ok=True);target.write_text(json.dumps(payload,ensure_ascii=False,indent=2)+"\n",encoding="utf-8");return target
     def _require_artifact(self,name:str)->Path:
         if not self.runner.artifacts.exists(name):raise FileNotFoundError(f"Moon stage requires artifact {name!r}")
         return self.runner.artifacts.path_for(name)
