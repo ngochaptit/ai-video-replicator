@@ -119,3 +119,11 @@ Moon never chooses a footage match, invents timestamps, silently switches render
 8. Legacy artifacts are reused only when their canonical stage contract is complete.
 9. Stage adapters stop at every semantic/editorial boundary.
 10. Agent bridges/connectors/MCP transport decisions; they never generate them.
+
+## Adaptive footage evidence (Moon v1.2 quality track)
+
+The `footage` stage now seeds deterministic full-clip frame coverage before asking an external vision agent for semantic segmentation. The default target is roughly one measured frame every 4 seconds, bounded to 120 initial frames per clip and chunked into FFmpeg sampling groups of at most 24 frames.
+
+This is evidence generation only; Moon still does not decide what an action means or where a semantic action starts. The external agent scans coarse coverage, requests denser `moon.frames.sample` windows around suspected action/interaction changes, and submits measured action segments. Registered sampled frames are automatically merged into the `footage_profile_builder` evidence catalog on the enrichment pass, so those refined timestamps can become canonical segment boundaries.
+
+The quality goal is to avoid the failure mode where a long single-take clip with few hard scene cuts is reduced to a handful of 60–90 second semantic segments, which later forces extreme speed-up and source reuse during matching/rendering.
