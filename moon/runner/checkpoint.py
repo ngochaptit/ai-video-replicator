@@ -25,3 +25,10 @@ class CheckpointStore:
 
     def exists(self, stage: str) -> bool:
         return self.path_for(stage).exists()
+
+    def delete(self, stage: str) -> bool:
+        path = self.path_for(stage)
+        if not path.exists():
+            return False
+        path.unlink()
+        return True
