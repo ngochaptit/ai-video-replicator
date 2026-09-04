@@ -199,6 +199,36 @@ def test_source_limited_qc_finalizes_without_consuming_revision(tmp_path) -> Non
     assert runner.artifacts.read("qc_report")["replication_quality"]["quality_gate"] == "fail"
 
 
+def test_qc_routes_fixable_chronology_failure_back_to_match(tmp_path) -> None:
+    runner = _runner_at_footage(tmp_path)
+    runner.complete("footage", {}); runner.complete("match", {}); runner.complete("timeline", {}); runner.complete("render", {})
+    for name in ("reference_blueprint", "footage_profiles", "footage_semantic_enrichment"):
+        runner.artifacts.write(name, {"name": name})
+    runner.artifacts.write("render_plan", {"runtime_approved": True, "render_runtime": "ffmpeg"})
+    quality = _quality_report(gate="fail")
+    quality["replication_quality"]["recommended_route"] = "match_or_timeline"
+    runner.artifacts.write("replication_quality_report", quality)
+    runner.artifacts.write(
+        "qc_bundle",
+        {
+            "qc_report": {"decision": "revise", "revision_actions": []},
+            "decision_log": {"items": []},
+        },
+    )
+
+    result = StageExecutionService(runner).run()
+
+    assert result["status"] == "revision_requested"
+    assert result["revision_stage"] == "match"
+    assert result["pipeline"]["next_stage"] == "match"
+    assert runner.state.revision == 1
+    assert runner.artifacts.exists("reference_blueprint")
+    assert runner.artifacts.exists("footage_profiles")
+    assert runner.artifacts.exists("footage_semantic_enrichment")
+    assert runner.artifacts.exists("render_plan")
+    assert not runner.artifacts.exists("replication_quality_report")
+
+
 def _quality_report(*, gate: str = "pass", source_limited: bool = False) -> dict:
     return {
         "revision": 0,

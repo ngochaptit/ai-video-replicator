@@ -28,3 +28,10 @@ class ArtifactStore:
 
     def exists(self, name: str) -> bool:
         return self.path_for(name).exists()
+
+    def delete(self, name: str) -> bool:
+        path = self.path_for(name)
+        if not path.exists():
+            return False
+        path.unlink()
+        return True

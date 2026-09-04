@@ -1,5 +1,5 @@
 name: reference-replication
-version: "0.5.1"
+version: "0.5.2"
 description: Full reference replication workflow from reference analysis through footage matching, exact timeline, draft rendering, GPT semantic QC, revision routing, and QC-gated final delivery.
 category: custom
 stability: beta

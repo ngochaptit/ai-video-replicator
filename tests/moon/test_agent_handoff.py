@@ -82,7 +82,7 @@ def test_source_limited_quality_uses_footage_limited_without_render_revision(tmp
     runner.artifacts.write("replication_quality_report", _quality_report(gate="fail", source_limited=True))
     service = AgentHandoffService(runner)
 
-    with pytest.raises(ValueError, match="cannot be fixed by Moon's render-only revision"):
+    with pytest.raises(ValueError, match="cannot be fixed by a Moon engine revision"):
         service.submit("qc", {"qc_report": {"decision": "revise"}, "decision_log": {}})
 
     accepted = service.submit("qc", {"qc_report": {"decision": "footage_limited"}, "decision_log": {}})

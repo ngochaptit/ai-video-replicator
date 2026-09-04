@@ -20,6 +20,23 @@ def test_revision_reset_keeps_upstream_and_increments(tmp_path):
     status=r.request_revision(from_stage="render",reason="qc")
     assert status["revision"]==1 and status["next_stage"]=="render" and "timeline" in status["completed"] and "render" not in status["completed"]
 
+def test_match_revision_invalidates_downstream_but_keeps_evidence_and_runtime_approval(tmp_path):
+    r=runner(tmp_path);r.complete("footage",{});r.complete("match",{});r.complete("timeline",{});r.complete("render",{})
+    preserved=("reference_blueprint","footage_profiles","footage_semantic_enrichment","render_plan","decision_log")
+    invalidated=("candidate_rankings","match_proposal","match_decisions","timeline","replication_render_plan","draft_render","qc_bundle","qc_report","replication_quality_report")
+    for name in preserved+invalidated:r.artifacts.write(name,{"name":name})
+    r.checkpoints.write("qc",{"name":"qc"})
+
+    status=r.request_revision(from_stage="match",reason="chronology",max_revisions=2)
+
+    assert status["revision"]==1 and status["next_stage"]=="match"
+    assert status["completed"]==["proposal","analyze","footage"]
+    assert all(r.artifacts.exists(name) for name in preserved)
+    assert all(not r.artifacts.exists(name) for name in invalidated)
+    assert r.checkpoints.exists("footage")
+    assert all(not r.checkpoints.exists(stage) for stage in ("match","timeline","render","qc"))
+    assert r.state.metadata["last_revision"]["from_stage"]=="match"
+
 def test_workspace_registry_and_presets(tmp_path):
     ws=MoonWorkspace(tmp_path);item=ws.register("8.26",tmp_path/"8.26")
     assert item["preset"]=="reference-replication" and ws.resolve("8.26")["settings"]["max_revisions"]==2

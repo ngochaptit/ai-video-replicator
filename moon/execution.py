@@ -66,12 +66,10 @@ class StageExecutionService:
             task={"stage":"qc","revision":self.runner.state.revision,"decision_owner":"external_agent","required_output_artifact":"qc_bundle","required_output_artifacts":missing,"quality_gate":quality["quality_gate"],"render_integrity":quality["render_integrity"]["status"],"instruction":"Review the draft semantically using the deterministic replication_quality_report. Use pass only when it does not contradict the quality gate, revise only for an actionable engine-side change, or footage_limited when render integrity passes but current source footage cannot meet replication quality."};self.runner.artifacts.write("qc_agent_task",task);return {"status":"awaiting_agent","stage":"qc","task":task,"pipeline":self.runner.status()}
         report=self.runner.artifacts.read("qc_report");decision=report.get("decision",report.get("verdict","pass"))
         if decision in {"revise","revision","fail"}:
-            if quality["replication_quality"]["source_limited"]:return {"status":"blocked","stage":"qc","error":"QC requested a render revision for a source-limited quality failure; use footage_limited or provide better footage instead of rerendering the same timeline","pipeline":self.runner.status()}
+            if quality["replication_quality"]["source_limited"]:return {"status":"blocked","stage":"qc","error":"QC requested an engine revision for a source-limited quality failure; use footage_limited or provide better footage instead of rerunning unchanged source evidence","pipeline":self.runner.status()}
             if self.runner.state.revision>=2:return {"status":"blocked","stage":"qc","error":"QC requested revision but revision limit (2) is reached","pipeline":self.runner.status()}
-            for name in ("render_plan","qc_bundle","qc_report","replication_quality_report"):
-                path=self.runner.artifacts.path_for(name)
-                if path.exists():path.unlink()
-            return {"status":"revision_requested","stage":"qc","pipeline":self.runner.request_revision(from_stage="render",reason="external_agent_qc",max_revisions=2)}
+            revision_stage=self._revision_stage(quality,report)
+            return {"status":"revision_requested","stage":"qc","revision_stage":revision_stage,"pipeline":self.runner.request_revision(from_stage=revision_stage,reason="external_agent_qc",max_revisions=2)}
         if quality["render_integrity"]["status"]!="pass":return {"status":"blocked","stage":"qc","error":"QC cannot finalize because deterministic render integrity failed","pipeline":self.runner.status()}
         if quality["quality_gate"]=="fail" and decision in {"pass","approved","accept"}:return {"status":"blocked","stage":"qc","error":"QC pass contradicts deterministic replication quality failure","pipeline":self.runner.status()}
         if decision not in {"pass","approved","accept","footage_limited"}:return {"status":"blocked","stage":"qc","error":f"unknown QC decision: {decision!r}"}
@@ -84,6 +82,18 @@ class StageExecutionService:
         timeline=self._require_artifact("timeline");draft=self._require_artifact("draft_render");out=self.runner.project.root/"analysis"/f"replication_quality_report_r{self.runner.state.revision}.json";result=self._execute_tool("replication_quality_evaluator",{"replication_timeline_path":str(timeline),"draft_render_path":str(draft),"output_path":str(out),"revision":self.runner.state.revision})
         if result["success"]:self.runner.artifacts.write("replication_quality_report",result["data"])
         return result
+    def _revision_stage(self,quality:dict[str,Any],report:dict[str,Any])->str:
+        route_map={"match_or_timeline":"match","match":"match","timeline":"timeline","render":"render"}
+        routes=[]
+        recommended=str((quality.get("replication_quality") or {}).get("recommended_route") or "").strip().lower()
+        if recommended in route_map:routes.append(route_map[recommended])
+        for action in report.get("revision_actions") or []:
+            if isinstance(action,dict):
+                route=str(action.get("route") or "").strip().lower()
+                if route in route_map:routes.append(route_map[route])
+        if not routes:return "render"
+        order={stage:index for index,stage in enumerate(self.runner.state.stages)}
+        return min(routes,key=lambda stage:order[stage])
     def _materialize_footage_enrichment(self)->Path:
         source=self._require_artifact("footage_semantic_enrichment");payload=json.loads(source.read_text(encoding="utf-8"));scaffold=self.runner.artifacts.read("footage_profiles_scaffold") if self.runner.artifacts.exists("footage_profiles_scaffold") else {"clips":[]}
         planner=FootageEvidencePlanner(self.runner.project,self.runner.state.revision);catalog=planner.evidence_catalog(scaffold);existing=payload.get("evidence_catalog") or [];merged={(str(item.get("clip_id") or ""),str(item.get("path") or ""),round(float(item.get("timestamp",0.0)),6)):item for item in [*existing,*catalog] if isinstance(item,dict) and item.get("path")};payload["evidence_catalog"]=sorted(merged.values(),key=lambda item:(str(item.get("clip_id") or ""),float(item.get("timestamp",0.0)),str(item.get("path") or "")));self.runner.artifacts.write("footage_evidence_catalog",{"version":"1.0","entries":payload["evidence_catalog"],"coverage":planner.coverage_summary(scaffold),"policy":"adaptive_uniform_seed_v1"});target=self.runner.project.cache_dir/"stage-inputs"/"footage_semantic_enrichment_with_sampled_evidence.json";target.parent.mkdir(parents=True,exist_ok=True);target.write_text(json.dumps(payload,ensure_ascii=False,indent=2)+"\n",encoding="utf-8");return target

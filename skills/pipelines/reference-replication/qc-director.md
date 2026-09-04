@@ -138,6 +138,13 @@ Use the earliest stage that can actually fix the defect:
 
 Do not route a footage absence to render tricks just to raise the fidelity score.
 
+When the deterministic quality report sets `source_limited=false` and
+`recommended_route=match_or_timeline`, rewind to `match`. Preserve the approved
+runtime decision and all proposal/analyze/footage evidence, but invalidate match,
+timeline, generated render-plan/draft, and QC outputs before rebuilding. This
+ensures chronology defects are corrected at their source without repeating footage
+sampling or asking for the same runtime approval again.
+
 ## 4. Validate the review
 
 Run `reference_qc_validator`.
