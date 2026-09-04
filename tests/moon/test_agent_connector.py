@@ -40,7 +40,8 @@ def test_manifest_exposes_stable_agent_tools(tmp_path: Path):
     assert manifest["transport"] == "stdin_stdout_json"
     assert {
         "moon.status", "moon.next", "moon.handoff", "moon.evidence.list",
-        "moon.evidence.read_json", "moon.evidence.read_image", "moon.frames.sample", "moon.submit",
+        "moon.evidence.read_json", "moon.evidence.read_image", "moon.evidence.clear_sampled",
+        "moon.frames.sample", "moon.submit",
     } <= names
     assert manifest["semantic_owner"] == "external_agent"
 

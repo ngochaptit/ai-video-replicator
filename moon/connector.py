@@ -6,13 +6,14 @@ from pathlib import Path
 from typing import Any
 
 from moon.agent_bridge import AgentBridgeService
+from moon.evidence import SampledFrameEvidenceStore
 from moon.handoff import AgentHandoffService
 from moon.media.frames import sample_frames
 from moon.media.inspection import resolve_project_source
 from moon.runner.pipeline import PipelineRunner
 
 
-CONNECTOR_VERSION = "1.1"
+CONNECTOR_VERSION = "1.2"
 _IMAGE_MIME_TYPES = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -45,6 +46,7 @@ class AgentConnectorService:
                 {"name": "moon.evidence.list", "input": {"stage": "string?"}},
                 {"name": "moon.evidence.read_json", "input": {"path": "project-relative string"}},
                 {"name": "moon.evidence.read_image", "input": {"path": "project-relative image path"}},
+                {"name": "moon.evidence.clear_sampled", "input": {}},
                 {
                     "name": "moon.frames.sample",
                     "input": {
@@ -65,6 +67,7 @@ class AgentConnectorService:
                 "Evidence reads are restricted to the project root.",
                 "Image evidence is returned as base64 bytes with an explicit MIME type.",
                 "Frame sampling is deterministic and reads original local media.",
+                "Sampled frame provenance is append-only and scoped to the active stage and revision.",
                 "Semantic submissions are validated before persistence.",
             ],
         }
@@ -101,6 +104,9 @@ class AgentConnectorService:
             if not isinstance(path, str):
                 raise ValueError("moon.evidence.read_image requires string path")
             return self._read_image(path)
+        if tool == "moon.evidence.clear_sampled":
+            stage = self._active_evidence_stage()
+            return self._sampled_store().clear(stage)
         if tool == "moon.frames.sample":
             return self._sample_frames(args)
         if tool == "moon.submit":
@@ -132,18 +138,42 @@ class AgentConnectorService:
         handoff = AgentHandoffService(self.runner).package(stage)
         evidence = handoff.get("inputs", {}).get("evidence", {})
         files = evidence.get("files", []) if isinstance(evidence, dict) else []
+        sampled = self._sampled_store().exported(stage)
+        sampled_by_path: dict[Path, dict[str, Any]] = {}
+        for group in sampled["groups"]:
+            for frame in group.get("frames") or []:
+                sampled_by_path[Path(str(frame["absolute_path"])).resolve()] = {
+                    "evidence_type": "sampled_frame",
+                    "stage": stage,
+                    "pipeline_revision": sampled["pipeline_revision"],
+                    "sampling_group_id": group["group_id"],
+                    "timestamp_seconds": frame["timestamp_seconds"],
+                    "source": group["source"],
+                    "request": group["request"],
+                }
+        registry_path = Path(sampled["registry_path"]).resolve()
         normalized = []
         root = self.runner.project.root.resolve()
         for raw in files:
             path = Path(raw).resolve()
             self._assert_inside_project(path)
-            normalized.append({
+            item = {
                 "path": str(path.relative_to(root)),
                 "absolute_path": str(path),
                 "suffix": path.suffix.lower(),
                 "kind": self._kind(path),
-            })
-        return {"stage": stage, "files": normalized}
+            }
+            if path == registry_path:
+                item.update({"kind": "sampled_frame_registry", "evidence_type": "sampled_frame_registry"})
+            elif path in sampled_by_path:
+                item.update({"kind": "sampled_frame", **sampled_by_path[path]})
+            normalized.append(item)
+        return {
+            "stage": stage,
+            "files": normalized,
+            "sampled_frame_groups": sampled["groups"],
+            "sampled_frame_count": sampled["frame_count"],
+        }
 
     def _read_json(self, raw_path: str) -> dict[str, Any]:
         path = self._project_path(raw_path)
@@ -183,8 +213,24 @@ class AgentConnectorService:
         if isinstance(width, bool) or not isinstance(width, int):
             raise ValueError("moon.frames.sample width must be an integer")
         source_path = resolve_project_source(self.runner.project, source)
-        cache = self.runner.project.cache_dir / "connector-frames" / self._safe_name(Path(source).stem, start, end)
-        return sample_frames(
+        stage = self._active_evidence_stage()
+        store = self._sampled_store()
+        group_id = store.group_id(
+            stage,
+            source_path,
+            start_seconds=start,
+            end_seconds=end,
+            count=count,
+            width=width,
+        )
+        cache = (
+            self.runner.project.cache_dir
+            / "connector-frames"
+            / stage
+            / f"revision_{self.runner.state.revision:03d}"
+            / group_id
+        )
+        result = sample_frames(
             source_path,
             cache,
             start_seconds=start,
@@ -192,6 +238,45 @@ class AgentConnectorService:
             count=count,
             width=width,
         )
+        registered = store.register(
+            stage,
+            result,
+            group_id=group_id,
+            clip_id=self._clip_id_for_source(source_path),
+        )
+        return {
+            **result,
+            "stage": stage,
+            "pipeline_revision": self.runner.state.revision,
+            "sampling_group_id": group_id,
+            "evidence_registry_path": str(store.registry_path(stage)),
+            "evidence_registered": True,
+            "provenance": registered,
+        }
+
+    def _active_evidence_stage(self) -> str:
+        stage = self.runner.state.next_stage()
+        if stage is None:
+            raise ValueError("sampled evidence requires an active Moon stage")
+        if not self.runner.artifacts.exists(f"{stage}_agent_task"):
+            raise ValueError(f"sampled evidence requires an active semantic handoff for stage {stage!r}")
+        return stage
+
+    def _sampled_store(self) -> SampledFrameEvidenceStore:
+        return SampledFrameEvidenceStore(self.runner.project, self.runner.state.revision)
+
+    def _clip_id_for_source(self, source: Path) -> str | None:
+        for artifact_name in ("footage_profiles_scaffold", "footage_profiles"):
+            if not self.runner.artifacts.exists(artifact_name):
+                continue
+            for clip in self.runner.artifacts.read(artifact_name).get("clips") or []:
+                if not isinstance(clip, dict) or not clip.get("path"):
+                    continue
+                raw = Path(str(clip["path"]))
+                candidate = raw if raw.is_absolute() else self.runner.project.root / raw
+                if candidate.resolve() == source.resolve():
+                    return str(clip.get("clip_id") or "") or None
+        return None
 
     def _project_path(self, raw_path: str) -> Path:
         candidate = Path(raw_path)
@@ -224,12 +309,6 @@ class AgentConnectorService:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"moon.frames.sample requires numeric {field}")
         return float(value)
-
-    @staticmethod
-    def _safe_name(stem: str, start: float, end: float) -> str:
-        safe = "".join(character if character.isalnum() or character in "-_" else "_" for character in stem)
-        return f"{safe}_{start:.3f}_{end:.3f}"
-
 
 def parse_connector_request(raw: str) -> dict[str, Any]:
     if not raw.strip():

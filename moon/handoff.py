@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from moon.runner.pipeline import PipelineRunner
+from moon.evidence import SampledFrameEvidenceStore
 from moon.semantic_contracts import validate_semantic_submission
 
 HANDOFF_VERSION = "2.0"
@@ -46,8 +47,16 @@ class AgentHandoffService:
             if self.runner.artifacts.exists(name):
                 path=self.runner.artifacts.path_for(name); result[name]={"path":str(path),"sha256":self._sha256(path)}
         task=self.runner.artifacts.read(f"{stage}_agent_task"); evidence_root=task.get("evidence_root")
+        sampled_store=SampledFrameEvidenceStore(self.runner.project,self.runner.state.revision); sampled=sampled_store.exported(stage)
+        files=[]
         if evidence_root:
-            root=Path(evidence_root); files=[str(p) for p in sorted(root.rglob("*")) if p.is_file()][:500] if root.is_dir() else []; result["evidence"]={"root":str(root),"files":files}
+            root=Path(evidence_root); files=[str(p) for p in sorted(root.rglob("*")) if p.is_file()][:500] if root.is_dir() else []
+        else: root=self.runner.project.evidence_dir
+        if sampled["groups"]:
+            files.append(sampled["registry_path"])
+            files.extend(str(frame["absolute_path"]) for group in sampled["groups"] for frame in group.get("frames") or [])
+        if evidence_root or sampled["groups"]:
+            result["evidence"]={"root":str(root),"sampled_root":str(self.runner.project.evidence_dir),"files":list(dict.fromkeys(files)),"sampled_frames":sampled}
         return result
 
     @staticmethod

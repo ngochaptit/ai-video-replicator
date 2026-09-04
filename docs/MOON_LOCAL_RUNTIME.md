@@ -1,4 +1,4 @@
-# Moon Local Runtime v0.1
+# Moon Local Runtime v1.1.1
 
 Moon is a local, resumable, deterministic video-editing runtime. External agents provide semantic decisions; Moon owns local media access, state, validation, checkpoints, artifacts, and rendering orchestration.
 
@@ -7,13 +7,11 @@ Moon is a local, resumable, deterministic video-editing runtime. External agents
 Moon Local deliberately does not introduce a web app, cloud database, Drive-backed state, account system, local LLM/VLM, or agent-specific business logic.
 
 ```text
-GPT / Gemini / Claude / Codex / other agent
-                  |
-     MCP / connector tools / JSON stdin
-                  |
-              Moon Local
-                  |
-        local project + FFmpeg
+Antigravity / Claude Desktop / Codex / generic MCP client
+                         |
+               one Moon MCP gateway
+                         |
+       state + evidence + pipeline + local media I/O
 ```
 
 Adapters are intentionally thin. Moon Core does not know which model or vendor makes a semantic decision.
@@ -33,6 +31,9 @@ python -m moon --project "D:\AI EDIT VIDEO\8.26" status
 python -m moon --project "D:\AI EDIT VIDEO\8.26" next
 python -m moon --project "D:\AI EDIT VIDEO\8.26" handoff
 python -m moon --project "D:\AI EDIT VIDEO\8.26" connector-manifest
+python -m moon mcp --project "D:\AI EDIT VIDEO\8.26"
+python -m moon setup --project "D:\AI EDIT VIDEO\8.26"
+python -m moon doctor --project "D:\AI EDIT VIDEO\8.26"
 ```
 
 At a semantic boundary Moon packages current state, deterministic input artifacts with hashes, local evidence paths, output validation rules, submission commands, and a deterministic handoff ID. Moon rejects stale-stage responses and validates required semantic structure before persistence.
@@ -57,11 +58,13 @@ moon.submit
 
 Phase 8 maps the Phase 7 connector surface to a thin local MCP server. It does not contain semantic logic and does not call a model.
 
-Start the server for one project:
+Start the canonical host-neutral server for one project:
 
 ```powershell
-python -m moon --project "D:\AI EDIT VIDEO\8.26" mcp-stdio
+python -m moon mcp --project "D:\AI EDIT VIDEO\8.26"
 ```
+
+The older `python -m moon --project <path> mcp-stdio` form remains compatible.
 
 An MCP-capable local host can launch that command as a stdio server. The adapter implements the MCP initialization handshake, `ping`, `tools/list`, and `tools/call`. Tool calls are delegated directly to `AgentConnectorService`; tool failures are returned as MCP tool errors rather than mutating Moon semantics.
 
@@ -72,13 +75,15 @@ Conceptual MCP host configuration:
   "command": "python",
   "args": [
     "-m", "moon",
-    "--project", "D:\\AI EDIT VIDEO\\8.26",
-    "mcp-stdio"
+    "mcp", "--project", "D:\\AI EDIT VIDEO\\8.26"
   ]
 }
 ```
 
 The adapter advertises JSON Schema for every Moon tool, including required fields for evidence reads, frame sampling, and semantic submission. Local media remains local: MCP only exposes paths/JSON and deterministic frame samples through the same connector contract.
+
+Host detection, setup, and diagnostics are documented in
+[`docs/moon-hosts.md`](moon-hosts.md). Host profiles contain no editing logic.
 
 Important: this is a local stdio MCP server for MCP hosts that support launching local servers. It does not imply that every ChatGPT plan/product can connect directly to localhost; product-specific remote/tunnel/app adapters remain separate thin wrappers.
 

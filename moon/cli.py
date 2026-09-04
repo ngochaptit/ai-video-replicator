@@ -20,7 +20,7 @@ def _runner(project_root: str, *, create: bool = False) -> PipelineRunner:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="moon", description="Moon Local deterministic video-editing runtime")
-    parser.add_argument("--project", default=".", help="Project root (default: current directory)")
+    parser.add_argument("--project", help="Project root (default: current directory)")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init")
     sub.add_parser("status")
@@ -39,7 +39,21 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("agent-bridge", help="Read one agent bridge JSON request from stdin and write one JSON response")
     sub.add_parser("connector-manifest", help="Print the stable agent connector tool manifest")
     sub.add_parser("connector-call", help="Read one connector tool request from stdin and write one JSON response")
-    sub.add_parser("mcp-stdio", help="Serve Moon connector tools as a local MCP stdio server")
+    mcp = sub.add_parser("mcp", help="Serve the canonical host-neutral Moon MCP stdio server")
+    mcp.add_argument("--project", dest="command_project", help="Moon project root")
+    legacy_mcp = sub.add_parser("mcp-stdio", help="Compatibility alias for 'moon mcp'")
+    legacy_mcp.add_argument("--project", dest="command_project", help="Moon project root")
+    setup = sub.add_parser("setup", help="Generate or safely install Moon host configuration")
+    setup.add_argument("--project", dest="command_project", help="Moon project root")
+    setup.add_argument("--host", help="antigravity, claude, codex, or generic")
+    setup.add_argument("--write", action="store_true", help="Apply supported merge-safe host configuration")
+    setup.add_argument("--output", type=Path, help="Atomically write one generated config artifact")
+    setup.add_argument("--config-path", type=Path, help="Override the host config path")
+    setup.add_argument("--scope", choices=("global", "workspace"), default="global")
+    setup.add_argument("--json", action="store_true", dest="output_json")
+    doctor = sub.add_parser("doctor", help="Run read-only Moon runtime, project, and host diagnostics")
+    doctor.add_argument("--project", dest="command_project", help="Moon project root")
+    doctor.add_argument("--json", action="store_true", dest="output_json")
     sub.add_parser("inspect-reference")
     sub.add_parser("inspect-footage")
     sub.add_parser("discover-artifacts")
@@ -67,10 +81,34 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    runner = _runner(args.project, create=args.command == "init")
+    command_project = getattr(args, "command_project", None)
+    selected_project = command_project or args.project
+
+    if args.command == "setup":
+        from moon.setup import format_setup_report, setup_integrations
+
+        result = setup_integrations(
+            selected_project,
+            host=args.host,
+            write=args.write,
+            output=args.output,
+            config_path=args.config_path,
+            scope=args.scope,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2) if args.output_json else format_setup_report(result))
+        return 0
+    if args.command == "doctor":
+        from moon.doctor import format_doctor_report, run_doctor
+
+        result = run_doctor(selected_project)
+        print(json.dumps(result, ensure_ascii=False, indent=2) if args.output_json else format_doctor_report(result))
+        return int(result["exit_code"])
+
+    project_root = selected_project or "."
+    runner = _runner(project_root, create=args.command == "init")
     protocol = MoonProtocol(runner)
 
-    if args.command == "mcp-stdio":
+    if args.command in {"mcp", "mcp-stdio"}:
         serve_stdio(MoonMCPServer(AgentConnectorService(runner)))
         return 0
     if args.command == "init":

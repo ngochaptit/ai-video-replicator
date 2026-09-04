@@ -1,0 +1,89 @@
+{
+  "manifest_version": "0.4",
+  "name": "moon-local",
+  "display_name": "Moon Local",
+  "version": "0.2.5",
+  "description": "Run the local Moon video-replication workflow through Claude Desktop.",
+  "long_description": "A local-only Claude Desktop extension for the existing Moon MCP stdio server. The selected Moon project stays on this computer.",
+  "author": {
+    "name": "OpenMontage"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/calesthio/OpenMontage.git"
+  },
+  "license": "AGPL-3.0-only",
+  "keywords": [
+    "moon",
+    "video",
+    "local",
+    "stdio"
+  ],
+  "compatibility": {
+    "platforms": [
+      "win32"
+    ],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  },
+  "server": {
+    "type": "uv",
+    "entry_point": "launcher.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": [
+        "run",
+        "launcher.py",
+        "--project",
+        "${user_config.project_root}"
+      ]
+    }
+  },
+  "user_config": {
+    "project_root": {
+      "type": "directory",
+      "title": "Moon project root",
+      "description": "Choose an initialized local Moon project directory.",
+      "required": true
+    }
+  },
+  "tools": [
+    {
+      "name": "moon.status",
+      "description": "Read resumable Moon pipeline state."
+    },
+    {
+      "name": "moon.next",
+      "description": "Run deterministic work until the next semantic boundary."
+    },
+    {
+      "name": "moon.handoff",
+      "description": "Get the current semantic task and output contract."
+    },
+    {
+      "name": "moon.evidence.list",
+      "description": "List evidence files for the current semantic stage."
+    },
+    {
+      "name": "moon.evidence.read_json",
+      "description": "Read JSON evidence inside the selected project."
+    },
+    {
+      "name": "moon.evidence.read_image",
+      "description": "Read image evidence inside the selected project."
+    },
+    {
+      "name": "moon.evidence.clear_sampled",
+      "description": "Clear sampled-frame evidence for the active stage without deleting deterministic analysis."
+    },
+    {
+      "name": "moon.frames.sample",
+      "description": "Deterministically sample local video frames with FFmpeg."
+    },
+    {
+      "name": "moon.submit",
+      "description": "Validate and submit an external semantic decision."
+    }
+  ]
+}

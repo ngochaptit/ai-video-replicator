@@ -21,6 +21,22 @@ def test_initialize_advertises_tools(tmp_path):
     assert response["result"]["protocolVersion"] == MCP_PROTOCOL_VERSION
     assert response["result"]["capabilities"] == {"tools": {}}
     assert response["result"]["serverInfo"]["name"] == "moon-local"
+    assert response["result"]["serverInfo"]["version"] == "0.2.5"
+
+
+def test_initialize_negotiates_supported_version_with_newer_client(tmp_path):
+    server = _server(tmp_path)
+    response = server.handle({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "claude-desktop", "version": "test"},
+        },
+    })
+    assert response["result"]["protocolVersion"] == MCP_PROTOCOL_VERSION == "2025-06-18"
 
 
 def test_tools_list_maps_connector_surface(tmp_path):
@@ -29,7 +45,8 @@ def test_tools_list_maps_connector_surface(tmp_path):
     tools = {tool["name"]: tool for tool in response["result"]["tools"]}
     assert set(tools) == {
         "moon.status", "moon.next", "moon.handoff", "moon.evidence.list",
-        "moon.evidence.read_json", "moon.evidence.read_image", "moon.frames.sample", "moon.submit",
+        "moon.evidence.read_json", "moon.evidence.read_image", "moon.evidence.clear_sampled",
+        "moon.frames.sample", "moon.submit",
     }
     assert tools["moon.submit"]["inputSchema"]["required"] == ["stage", "payload"]
     assert tools["moon.evidence.read_image"]["inputSchema"]["required"] == ["path"]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ from moon.runner.pipeline import PipelineRunner
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "moon-local"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.2.5"
 
 _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "moon.status": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -41,6 +42,11 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "properties": {"path": {"type": "string"}},
         "required": ["path"],
+        "additionalProperties": False,
+    },
+    "moon.evidence.clear_sampled": {
+        "type": "object",
+        "properties": {},
         "additionalProperties": False,
     },
     "moon.frames.sample": {
@@ -74,6 +80,7 @@ _TOOL_DESCRIPTIONS = {
     "moon.evidence.list": "List typed evidence files for the current semantic stage.",
     "moon.evidence.read_json": "Read JSON evidence inside the local project root.",
     "moon.evidence.read_image": "Read local image evidence and return it as MCP image content for a vision-capable agent.",
+    "moon.evidence.clear_sampled": "Clear registered sampled-frame evidence for the current stage without deleting deterministic analysis.",
     "moon.frames.sample": "Deterministically sample local video frames with FFmpeg; does not choose shots.",
     "moon.submit": "Submit an external-agent semantic decision through Moon validation and optionally advance.",
 }
@@ -100,16 +107,22 @@ class MoonMCPServer:
         ]
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any] | None:
-        request_id = request.get("id")
         method = request.get("method")
         params = request.get("params", {})
+        request_id = request.get("id")
+
+        # JSON-RPC notifications have no id and MUST NOT receive a response.
+        # In particular, Claude sends notifications/cancelled when a request
+        # times out. Responding with id=null is rejected by Claude's MCP schema.
+        if "id" not in request or method == "notifications/initialized" or method == "notifications/cancelled":
+            return None
+        if not self._valid_request_id(request_id):
+            return None
         if not isinstance(method, str):
             return self._error(request_id, -32600, "Invalid Request")
         if not isinstance(params, dict):
             return self._error(request_id, -32602, "Invalid params")
 
-        if method == "notifications/initialized":
-            return None
         if method == "initialize":
             return self._result(request_id, {
                 "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -129,7 +142,7 @@ class MoonMCPServer:
                 data = self.connector.call({"tool": name, "arguments": arguments})
             except Exception as exc:
                 return self._result(request_id, {
-                    "content": [{"type": "text", "text": json.dumps({"error": str(exc)}, ensure_ascii=False)}],
+                    "content": [{"type": "text", "text": str(exc)}],
                     "isError": True,
                 })
             if name == "moon.evidence.read_image":
@@ -154,11 +167,28 @@ class MoonMCPServer:
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
     @staticmethod
-    def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
-        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+    def _error(
+        request_id: str | int,
+        code: int,
+        message: str,
+        data: Any | None = None,
+    ) -> dict[str, Any]:
+        error: dict[str, Any] = {"code": int(code), "message": str(message)}
+        if data is not None:
+            error["data"] = data
+        return {"jsonrpc": "2.0", "id": request_id, "error": error}
+
+    @staticmethod
+    def _valid_request_id(value: Any) -> bool:
+        return not isinstance(value, bool) and isinstance(value, (str, int))
 
 
-def serve_stdio(server: MoonMCPServer, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> None:
+def serve_stdio(
+    server: MoonMCPServer,
+    stdin: BinaryIO | None = None,
+    stdout: BinaryIO | None = None,
+    stderr: Any | None = None,
+) -> None:
     """Serve newline-delimited JSON-RPC over stdio.
 
     MCP stdio messages are one JSON-RPC object per line. Protocol output is written only
@@ -166,6 +196,7 @@ def serve_stdio(server: MoonMCPServer, stdin: BinaryIO | None = None, stdout: Bi
     """
     source = stdin or sys.stdin.buffer
     sink = stdout or sys.stdout.buffer
+    diagnostics = stderr or sys.stderr
     for raw in source:
         if not raw.strip():
             continue
@@ -173,9 +204,13 @@ def serve_stdio(server: MoonMCPServer, stdin: BinaryIO | None = None, stdout: Bi
             request = json.loads(raw.decode("utf-8"))
             if not isinstance(request, dict):
                 raise ValueError("request must be an object")
-            response = server.handle(request)
+            # Third-party libraries and legacy tool code may use print(). Keep
+            # that diagnostic output off the MCP protocol stream.
+            with contextlib.redirect_stdout(diagnostics), contextlib.redirect_stderr(diagnostics):
+                response = server.handle(request)
         except Exception as exc:
-            response = MoonMCPServer._error(None, -32700, f"Parse error: {exc}")
+            print(f"moon-local MCP input error: {exc}", file=diagnostics, flush=True)
+            continue
         if response is not None:
             sink.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
             sink.flush()
