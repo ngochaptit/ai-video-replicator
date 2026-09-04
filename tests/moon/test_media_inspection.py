@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from moon.core.project import MoonProject
-from moon.media.frames import _sample_timestamps
+from moon.media.frames import _sample_timestamps, sample_frames
 from moon.media.inspection import inspect_footage, resolve_project_source
 from moon.media.probe import _orientation, _parse_rate, probe_media
 from moon.protocol import MoonProtocol
@@ -60,6 +60,36 @@ def test_sample_timestamps_cover_requested_window_without_hitting_end() -> None:
     assert values[0] == 120.0
     assert values[-1] < 130.0
     assert len(values) == 3
+
+
+def test_sample_frames_retries_terminal_timestamp_before_eof(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"video")
+    calls: list[float] = []
+
+    def fake_run(command, *, capture_output, text, check):
+        timestamp = float(command[command.index("-ss") + 1])
+        calls.append(timestamp)
+        if timestamp > 9.98:
+            raise __import__("subprocess").CalledProcessError(1, command)
+        Path(command[-1]).write_bytes(b"jpg")
+        return __import__("subprocess").CompletedProcess(command, 0)
+
+    monkeypatch.setattr("moon.media.frames.subprocess.run", fake_run)
+
+    result = sample_frames(
+        source,
+        tmp_path / "frames",
+        start_seconds=0.0,
+        end_seconds=10.0,
+        count=3,
+        width=320,
+    )
+
+    assert len(result["frames"]) == 3
+    assert result["frames"][-1]["timestamp_seconds"] < 9.98
+    assert result["frames"][-1]["timestamp_seconds"] > 9.9
+    assert len(calls) == 4
 
 
 def test_inspect_footage_lists_supported_video_files(tmp_path, monkeypatch) -> None:

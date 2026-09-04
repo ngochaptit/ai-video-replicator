@@ -37,30 +37,49 @@ def sample_frames(
     frames: list[dict[str, Any]] = []
 
     for index, timestamp in enumerate(timestamps, start=1):
-        output_path = target_dir / f"frame_{index:03d}_{timestamp:.3f}s.jpg"
-        command = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-ss",
-            f"{timestamp:.6f}",
-            "-i",
-            str(source_path),
-            "-frames:v",
-            "1",
-            "-vf",
-            f"scale={width}:-2",
-            "-q:v",
-            "2",
-            "-y",
-            str(output_path),
-        ]
-        try:
-            subprocess.run(command, capture_output=True, text=True, check=True)
-        except (OSError, subprocess.CalledProcessError) as exc:
-            raise FrameSamplingError(f"ffmpeg failed at {timestamp:.3f}s for {source_path}: {exc}") from exc
-        frames.append({"timestamp_seconds": round(timestamp, 6), "path": str(output_path)})
+        candidates = [timestamp]
+        if len(timestamps) > 1 and index == len(timestamps):
+            for offset in (0.05, 0.25, 0.5, 1.0):
+                candidate = timestamp - offset
+                if candidate > start_seconds + 1e-6:
+                    candidates.append(candidate)
+
+        last_error: Exception | None = None
+        output_path: Path | None = None
+        actual_timestamp: float | None = None
+        for candidate in candidates:
+            candidate_output = target_dir / f"frame_{index:03d}_{candidate:.3f}s.jpg"
+            command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{candidate:.6f}",
+                "-i",
+                str(source_path),
+                "-frames:v",
+                "1",
+                "-vf",
+                f"scale={width}:-2",
+                "-q:v",
+                "2",
+                "-y",
+                str(candidate_output),
+            ]
+            try:
+                subprocess.run(command, capture_output=True, text=True, check=True)
+                output_path = candidate_output
+                actual_timestamp = candidate
+                break
+            except (OSError, subprocess.CalledProcessError) as exc:
+                last_error = exc
+
+        if output_path is None or actual_timestamp is None:
+            raise FrameSamplingError(
+                f"ffmpeg failed at {timestamp:.3f}s for {source_path}: {last_error}"
+            ) from last_error
+        frames.append({"timestamp_seconds": round(actual_timestamp, 6), "path": str(output_path)})
 
     return {
         "source": str(source_path),
