@@ -38,6 +38,97 @@ python -m moon doctor --project "D:\AI EDIT VIDEO\8.26"
 
 At a semantic boundary Moon packages current state, deterministic input artifacts with hashes, local evidence paths, output validation rules, submission commands, and a deterministic handoff ID. Moon rejects stale-stage responses and validates required semantic structure before persistence.
 
+## Google Drive agent bridge
+
+The Drive bridge lets a web agent exchange one bounded handoff packet with Moon without becoming the local runtime agent. Local packets use:
+
+```text
+<project>/AGENT/
+  request.json
+  response.json
+  evidence/<request_id>/...
+```
+
+The Drive API transport writes only those request-scoped JSON, text, and image evidence files under `MON_EDIT/jobs/<project_id>/AGENT/`. Source video and audio extensions are not eligible for copying or upload. A returned `payload` is untrusted input: Moon checks its envelope, age, job/request/stage identity, duplicate-consumption state, and the existing Moon handoff contract before storing it. No response field is interpreted as a shell command.
+
+### Google OAuth setup
+
+1. Install the bridge clients with `python -m pip install -r requirements.txt`.
+2. In Google Cloud Console, create or select a project, enable **Google Drive API**, then configure **Google Auth Platform**. For a personal account choose an External audience and add your Google account as a test user; a Workspace administrator can choose Internal.
+3. Under **Google Auth Platform > Clients**, create an OAuth client with application type **Desktop app** and download its JSON. Moon requests the `https://www.googleapis.com/auth/drive` scope because this headless CLI uses a configured folder ID rather than Google Picker. Keep the app in testing/internal use unless you complete any Google verification required for broader distribution.
+4. Create a Drive folder named `MON_EDIT`. Copy its folder ID from the URL (`https://drive.google.com/drive/folders/<folder-id>`).
+5. Store the downloaded client JSON and generated token outside both the repository and Moon project, for example:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:APPDATA\Moon\google-drive"
+Move-Item .\client_secret_*.json "$env:APPDATA\Moon\google-drive\client-secret.json"
+```
+
+6. Create `<project>/.moon/bridge.json` (this path is gitignored by this repository):
+
+```json
+{
+  "project_id": "my-edit-job",
+  "transport": "google_drive_api",
+  "poll_interval_seconds": 10,
+  "stale_after_seconds": 86400,
+  "drive": {
+    "root_folder_id": "PASTE_MON_EDIT_FOLDER_ID",
+    "credentials_path": "%APPDATA%\\Moon\\google-drive\\client-secret.json",
+    "token_path": "%APPDATA%\\Moon\\google-drive\\token.json"
+  }
+}
+```
+
+The first API command opens the browser once for consent and atomically stores the refresh token at `token_path`. `MOON_DRIVE_CREDENTIALS`, `MOON_DRIVE_TOKEN`, and `MOON_DRIVE_ROOT_FOLDER_ID` may override the corresponding values without putting machine-specific paths in the config.
+
+Service-account JSON is also accepted in `credentials_path`; share the `MON_EDIT` folder directly with that service account before use. For Google Drive for Desktop, use the optional local transport instead:
+
+```json
+{
+  "project_id": "my-edit-job",
+  "transport": "local_sync",
+  "poll_interval_seconds": 10,
+  "drive": { "sync_root": "G:\\My Drive" }
+}
+```
+
+Here `sync_root` is the directory containing `MON_EDIT`; Drive for Desktop is optional and never auto-detected.
+
+### Commands and response contract
+
+At an existing semantic boundary, publish and wait with:
+
+```powershell
+python -m moon bridge publish "D:\path\to\moon-project" footage
+python -m moon bridge watch "D:\path\to\moon-project"
+python -m moon bridge status "D:\path\to\moon-project"
+```
+
+`request.json` contains the exact `job_id`, `request_id`, stage, timestamps, evidence references, and expected response schema. The web agent must create `response.json` in the same Drive `AGENT` folder, copying the identity values exactly and placing its stage response under `payload`:
+
+```json
+{
+  "version": "1.0",
+  "job_id": "my-edit-job",
+  "request_id": "COPY_FROM_REQUEST",
+  "stage": "footage",
+  "status": "COMPLETED",
+  "created_at": "2026-09-05T12:00:00Z",
+  "payload": { "clips": [] }
+}
+```
+
+The payload shape above is illustrative; the authoritative requirements are embedded in `request.json`. After successful validation Moon marks both files `CONSUMED`, records an idempotency marker under `.moon/`, and resumes to the next safe boundary. A restart retries only a pending resume and never resubmits an already consumed response.
+
+Minimal credentials/connectivity test (it creates `jobs/<project_id>/AGENT` if absent but does not run video work):
+
+```powershell
+python -m moon bridge status "D:\path\to\moon-project"
+```
+
+Google's current setup references are the [Drive Python quickstart](https://developers.google.com/workspace/drive/api/quickstart/python) and [Drive scope guide](https://developers.google.com/workspace/drive/api/guides/api-specific-auth).
+
 ## Phase 7 agent connector tools
 
 The stable tool vocabulary is:

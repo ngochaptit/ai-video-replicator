@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from moon.agent_bridge import AgentBridgeService, parse_bridge_request
 from moon.connector import AgentConnectorService, parse_connector_request
@@ -54,6 +54,16 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="Run read-only Moon runtime, project, and host diagnostics")
     doctor.add_argument("--project", dest="command_project", help="Moon project root")
     doctor.add_argument("--json", action="store_true", dest="output_json")
+    bridge = sub.add_parser("bridge", help="Exchange compact Moon handoffs through Google Drive")
+    bridge_sub = bridge.add_subparsers(dest="bridge_command", required=True)
+    bridge_publish = bridge_sub.add_parser("publish", help="Publish the current stage handoff")
+    bridge_publish.add_argument("bridge_project", type=Path)
+    bridge_publish.add_argument("stage")
+    bridge_watch = bridge_sub.add_parser("watch", help="Wait for, validate, and consume response.json")
+    bridge_watch.add_argument("bridge_project", type=Path)
+    bridge_watch.add_argument("--timeout", type=float, help="Stop waiting after this many seconds")
+    bridge_status = bridge_sub.add_parser("status", help="Show local and Drive bridge state")
+    bridge_status.add_argument("bridge_project", type=Path)
     sub.add_parser("inspect-reference")
     sub.add_parser("inspect-footage")
     sub.add_parser("discover-artifacts")
@@ -103,6 +113,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = run_doctor(selected_project)
         print(json.dumps(result, ensure_ascii=False, indent=2) if args.output_json else format_doctor_report(result))
         return int(result["exit_code"])
+    if args.command == "bridge":
+        from moon.drive_bridge import DriveBridgeConfig, MoonDriveBridge
+
+        bridge_runner = _runner(str(args.bridge_project))
+        service = MoonDriveBridge(
+            bridge_runner,
+            DriveBridgeConfig.load(bridge_runner.project.root),
+        )
+        if args.bridge_command == "publish":
+            result = service.publish(args.stage)
+        elif args.bridge_command == "watch":
+            result = service.watch(timeout_seconds=args.timeout)
+        elif args.bridge_command == "status":
+            result = service.status()
+        else:  # pragma: no cover
+            raise AssertionError(args.bridge_command)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
 
     project_root = selected_project or "."
     runner = _runner(project_root, create=args.command == "init")

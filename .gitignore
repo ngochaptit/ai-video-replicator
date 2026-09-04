@@ -42,6 +42,9 @@ music_library/
 .env
 .env.local
 *.env
+.moon/bridge.json
+.moon/bridge-state.json
+.moon/bridge-history/
 .youtube-token.json
 # Google service-account / Vertex AI keys — never commit
 gcp-*.json
