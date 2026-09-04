@@ -154,14 +154,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "complete-from-artifacts":
         result = protocol.handle({"action": "stage.complete_from_artifacts", "stage": args.stage})["result"]
     elif args.command == "frames":
-        result = protocol.handle({
-            "action": "media.frames",
-            "source": args.source,
-            "start_seconds": args.start_seconds,
-            "end_seconds": args.end_seconds,
-            "count": args.count,
-            "width": args.width,
-        })["result"]
+        result = AgentConnectorService(runner).call({
+            "tool": "moon.frames.sample",
+            "arguments": {
+                "source": args.source,
+                "start_seconds": args.start_seconds,
+                "end_seconds": args.end_seconds,
+                "count": args.count,
+                "width": args.width,
+            },
+        })
     elif args.command == "begin":
         result = protocol.handle({"action": "begin", "stage": args.stage})["result"]
     elif args.command == "complete":
