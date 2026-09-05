@@ -16,6 +16,10 @@ from moon.drive_bridge import (
     MoonDriveBridge,
 )
 from moon.runner.pipeline import PipelineRunner
+from moon.execution import StageExecutionService
+from moon.handoff import AgentHandoffService
+from schemas.artifacts import load_schema
+import jsonschema
 
 
 class MemoryTransport:
@@ -44,6 +48,99 @@ class MemoryTransport:
 
     def status(self) -> dict:
         return {"transport": "memory", "response_present": self.response is not None}
+
+
+def cold_start_payload(stage):
+    if stage == "proposal":
+        return {
+            "version": "1.0",
+            "concept_options": [{"id": f"c{i}", "title": "Pour", "hook": "Watch the pour",
+                "narrative_structure": "tutorial", "visual_approach": "Close shots",
+                "target_duration_seconds": 2, "why_this_works": "Shows the action"} for i in range(3)],
+            "selected_concept": {"concept_id": "c0", "rationale": "User selected"},
+            "production_plan": {"pipeline": "reference-replication", "stages": [], "render_runtime": "ffmpeg",
+                "taste_profile": {"design_read": "Precise", "visual_variance": 3, "motion_intensity": 4, "information_density": 2}},
+            "cost_estimate": {"total_estimated_usd": 0, "line_items": [], "budget_verdict": "within_budget"},
+            "approval": {"status": "approved"},
+        }
+    return {
+        "version": "1.0", "source": {"path": "reference.mp4", "duration_seconds": 2},
+        "segments": [{
+            "id": "seg_001", "start_seconds": 0, "end_seconds": 2, "duration_seconds": 2,
+            "boundary_basis": ["scene_cut", "video_end"],
+            "semantic": {"actor": "barista", "action": "pour", "object": "water", "target": "cup", "interaction": "pour into", "description": "Pour water into cup"},
+            "camera": {"pov": None, "shot_scale": None, "angle": None, "movement": None, "steadiness": None, "playback_speed": None},
+            "spatial": {"actor_position": None, "object_position": None, "entry_direction": None, "exit_direction": None, "depth": None, "framing_notes": ""},
+            "motion": {"motion_type": None, "intensity": None, "flow_variance": None, "speed_behavior": None},
+            "edit": {"transition_in": None, "transition_out": None, "segment_role": None},
+            "text": {"content": None, "position": None, "timing_notes": ""},
+            "audio": {"speech": None, "sound_cue": None, "beat_cue": None, "energy_notes": ""},
+            "evidence": {"scene_index": 0, "frame_paths": ["frame.jpg"], "frame_timestamps": [1]},
+            "confidence": {"timing": 1, "semantic": 0.9, "camera": None, "overall": 0.9},
+        }],
+        "choreography": {"summary": "Pour", "action_order": ["seg_001"], "critical_constraints": [], "soft_constraints": []},
+        "analysis_meta": {"generated_by": "external_agent", "semantic_enrichment_required": False, "source_analysis_path": "brief.json"},
+    }
+
+
+@pytest.mark.parametrize("stage,artifact,next_stage", [
+    ("proposal", "proposal_packet", "analyze"), ("analyze", "reference_blueprint", "footage"),
+])
+def test_cold_start_publish_consume_resume(tmp_path, monkeypatch, stage, artifact, next_stage):
+    runner = PipelineRunner(MoonProject.open(tmp_path / "project", create=True))
+    if stage == "analyze":
+        AgentHandoffService(runner).submit("proposal", cold_start_payload("proposal"))
+        StageExecutionService(runner).run()
+    execution = StageExecutionService(runner)
+    assert execution.run()["status"] == "awaiting_agent"
+    task_path = runner.artifacts.path_for(f"{stage}_agent_task")
+    original = task_path.stat().st_mtime_ns
+    assert execution.run()["task"] == runner.artifacts.read(f"{stage}_agent_task")
+    assert task_path.stat().st_mtime_ns == original
+    transport = MemoryTransport()
+    config = DriveBridgeConfig(project_id="cold-start", transport="local_sync", sync_root=tmp_path / "drive")
+    bridge = MoonDriveBridge(runner, config, transport=transport)
+    request = bridge.publish(stage)["request"]
+    contract = request["expected_response_schema"]["properties"]["payload"]
+    assert {key: contract[key] for key in load_schema(artifact)} == load_schema(artifact)
+    assert contract["artifact"] == artifact
+    response = json.loads(completed_response(request))
+    response["payload"] = cold_start_payload(stage)
+    jsonschema.validate(response, request["expected_response_schema"])
+    transport.response = json.dumps(response).encode()
+    # Only the downstream media boundary is stubbed; resume uses the real agent bridge.
+    def footage_boundary(self):
+        self.runner.artifacts.write("footage_agent_task", {"stage": "footage"})
+        return {"status": "awaiting_agent", "stage": "footage"}
+    monkeypatch.setattr(StageExecutionService, "_run_footage", footage_boundary)
+    result = bridge.poll_once()
+    assert result["status"] == "CONSUMED"
+    assert result["resume"]["stage"] == next_stage
+    assert runner.state.next_stage() == next_stage
+    assert runner.state.completed.count(stage) == 1
+    assert runner.artifacts.read(artifact) == cold_start_payload(stage)
+    assert PipelineRunner(runner.project).state.next_stage() == next_stage
+    assert bridge.publish(next_stage)["request"]["stage"] == next_stage
+
+
+@pytest.mark.parametrize("stage", ["proposal", "analyze"])
+def test_cold_start_rejects_invalid_schema_and_waits_for_ready_output(tmp_path, stage):
+    runner = PipelineRunner(MoonProject.open(tmp_path, create=True))
+    if stage == "analyze": runner.complete("proposal", {"test": True})
+    handoff = AgentHandoffService(runner)
+    with pytest.raises(ValueError, match="requires valid"):
+        handoff.submit(stage, {"version": "1.0"})
+    assert not runner.artifacts.exists(handoff._required_artifact(stage))
+    payload = cold_start_payload(stage)
+    if stage == "proposal": payload["approval"]["status"] = "pending"
+    else: payload["analysis_meta"]["semantic_enrichment_required"] = True
+    with pytest.raises(ValueError, match="before consumption"):
+        handoff.submit(stage, payload)
+    assert not runner.artifacts.exists(handoff._required_artifact(stage))
+    # Existing canonical drafts must also remain resumable without advancing.
+    runner.artifacts.write(handoff._required_artifact(stage), payload)
+    assert StageExecutionService(runner).run()["status"] == "awaiting_agent"
+    assert runner.state.next_stage() == stage
 
 
 def bridge_at(tmp_path: Path, *, resume=None) -> tuple[MoonDriveBridge, MemoryTransport, PipelineRunner]:

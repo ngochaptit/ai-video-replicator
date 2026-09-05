@@ -11,11 +11,38 @@ class StageExecutionService:
     def plan(self)->dict[str,Any]:
         stage=self.runner.state.next_stage()
         if stage is None:return {"stage":None,"done":True,"mode":"complete"}
-        plans={"proposal":("agent","proposal_packet"),"analyze":("agent","reference_blueprint + semantic_enrichment"),"footage":("hybrid","footage_semantic_enrichment"),"match":("hybrid","match_proposal"),"timeline":("deterministic",None),"render":("hybrid","render_plan"),"qc":("agent","qc_bundle")};mode,required=plans[stage];return {"stage":stage,"done":False,"mode":mode,"required_agent_artifact":required}
+        plans={"proposal":("agent","proposal_packet"),"analyze":("agent","reference_blueprint"),"footage":("hybrid","footage_semantic_enrichment"),"match":("hybrid","match_proposal"),"timeline":("deterministic",None),"render":("hybrid","render_plan"),"qc":("agent","qc_bundle")};mode,required=plans[stage];return {"stage":stage,"done":False,"mode":mode,"required_agent_artifact":required}
     def run(self)->dict[str,Any]:
         stage=self.runner.state.next_stage()
         if stage is None:return {"status":"complete","pipeline":self.runner.status()}
+        if stage in {"proposal", "analyze"}: return self._run_cold_start(stage)
         fn={"footage":self._run_footage,"match":self._run_match,"timeline":self._run_timeline,"render":self._run_render,"qc":self._run_qc}.get(stage);return fn() if fn else {"status":"awaiting_agent","stage":stage,"required_agent_artifact":self.plan()["required_agent_artifact"],"pipeline":self.runner.status()}
+    def _run_cold_start(self, stage: str) -> dict[str, Any]:
+        from moon.handoff import AgentHandoffService
+
+        self.runner.begin(stage)
+        handoff = AgentHandoffService(self.runner)
+        artifact = handoff._required_artifact(stage)
+        if self.runner.artifacts.exists(artifact):
+            payload = self.runner.artifacts.read(artifact)
+            handoff._validate(stage, payload)
+            ready = (payload["approval"]["status"] in {"approved", "approved_with_changes"}
+                     if stage == "proposal" else not payload["analysis_meta"]["semantic_enrichment_required"])
+            if ready:
+                return {"status": "completed", "stage": stage, "pipeline": self.runner.complete(
+                    stage, {"source": "external_agent", "artifacts": {artifact: str(self.runner.artifacts.path_for(artifact))}})}
+        task_name = f"{stage}_agent_task"
+        if not self.runner.artifacts.exists(task_name):
+            self.runner.artifacts.write(task_name, {
+                "stage": stage, "revision": self.runner.state.revision,
+                "decision_owner": "external_agent", "required_output_artifact": artifact,
+                "instruction": ("Submit the canonical proposal_packet with the user's approval recorded."
+                                if stage == "proposal" else
+                                "Submit the canonical reference_blueprint with measured evidence and completed semantic enrichment; set analysis_meta.semantic_enrichment_required=false only when complete."),
+            })
+        return {"status": "awaiting_agent", "stage": stage, "task": self.runner.artifacts.read(task_name),
+                "required_agent_artifact": artifact, "pipeline": self.runner.status()}
+
     def _run_footage(self)->dict[str,Any]:
         self.runner.begin("footage");out=self.runner.project.root/"analysis"/"footage";inputs={"footage_dir":str(self.runner.project.root/"footage"),"analysis_depth":"deep","max_keyframes_per_file":30,"max_analysis_window_seconds":2.0,"output_dir":str(out)};enrichment=None
         if self.runner.artifacts.exists("footage_semantic_enrichment"):
