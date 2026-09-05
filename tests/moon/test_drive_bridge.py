@@ -9,11 +9,13 @@ import pytest
 from moon.cli import main
 from moon.core.project import MoonProject
 from moon.drive_bridge import (
+    BridgeError,
     BridgeResponseError,
     BridgeTransportError,
     DriveBridgeConfig,
     DuplicateResponseError,
     MoonDriveBridge,
+    LocalSyncTransport,
 )
 from moon.runner.pipeline import PipelineRunner
 from moon.execution import StageExecutionService
@@ -63,30 +65,44 @@ def cold_start_payload(stage):
             "cost_estimate": {"total_estimated_usd": 0, "line_items": [], "budget_verdict": "within_budget"},
             "approval": {"status": "approved"},
         }
-    return {
-        "version": "1.0", "source": {"path": "reference.mp4", "duration_seconds": 2},
-        "segments": [{
-            "id": "seg_001", "start_seconds": 0, "end_seconds": 2, "duration_seconds": 2,
-            "boundary_basis": ["scene_cut", "video_end"],
-            "semantic": {"actor": "barista", "action": "pour", "object": "water", "target": "cup", "interaction": "pour into", "description": "Pour water into cup"},
-            "camera": {"pov": None, "shot_scale": None, "angle": None, "movement": None, "steadiness": None, "playback_speed": None},
-            "spatial": {"actor_position": None, "object_position": None, "entry_direction": None, "exit_direction": None, "depth": None, "framing_notes": ""},
-            "motion": {"motion_type": None, "intensity": None, "flow_variance": None, "speed_behavior": None},
-            "edit": {"transition_in": None, "transition_out": None, "segment_role": None},
-            "text": {"content": None, "position": None, "timing_notes": ""},
-            "audio": {"speech": None, "sound_cue": None, "beat_cue": None, "energy_notes": ""},
-            "evidence": {"scene_index": 0, "frame_paths": ["frame.jpg"], "frame_timestamps": [1]},
-            "confidence": {"timing": 1, "semantic": 0.9, "camera": None, "overall": 0.9},
-        }],
-        "choreography": {"summary": "Pour", "action_order": ["seg_001"], "critical_constraints": [], "soft_constraints": []},
-        "analysis_meta": {"generated_by": "external_agent", "semantic_enrichment_required": False, "source_analysis_path": "brief.json"},
-    }
+    return {"segments": [{"id": f"seg_{i:03}", "semantic": {
+        "actor": "barista", "action": "pour", "object": "water", "target": "cup",
+        "interaction": "pour into", "description": "Pour water into cup",
+    }} for i in (1, 2)]}
+
+
+@pytest.fixture
+def measured_reference(monkeypatch):
+    from tools.analysis.video_analyzer import VideoAnalyzer
+    from tools.base_tool import ToolResult
+
+    calls = []
+    def analyze(self, inputs):
+        calls.append(inputs)
+        output = Path(inputs["output_dir"])
+        frames = output / "keyframes"
+        frames.mkdir(parents=True, exist_ok=True)
+        keyframes = []
+        for timestamp in (0.0, 1.0, 3.0, 4.0):
+            frame = frames / f"frame-{timestamp}.jpg"
+            frame.write_bytes(b"test-image")
+            keyframes.append({"path": str(frame), "timestamp": timestamp})
+        # Deliberately present a source video beside the evidence: never export it.
+        (frames / "reference.mp4").write_bytes(b"private source")
+        brief = {"source": {"local_path": inputs["source"], "duration_seconds": 4.0},
+                 "structure_analysis": {"scenes": [{"scene_index": 0, "start_time": 0.0, "end_time": 4.0}]},
+                 "keyframes": keyframes}
+        (output / "video_analysis_brief.json").write_text(json.dumps(brief), encoding="utf-8")
+        return ToolResult(success=True, data=brief)
+    monkeypatch.setattr(VideoAnalyzer, "execute", analyze)
+    return calls
+
 
 
 @pytest.mark.parametrize("stage,artifact,next_stage", [
-    ("proposal", "proposal_packet", "analyze"), ("analyze", "reference_blueprint", "footage"),
+    ("proposal", "proposal_packet", "analyze"), ("analyze", "semantic_enrichment", "footage"),
 ])
-def test_cold_start_publish_consume_resume(tmp_path, monkeypatch, stage, artifact, next_stage):
+def test_cold_start_publish_consume_resume(tmp_path, monkeypatch, measured_reference, stage, artifact, next_stage):
     runner = PipelineRunner(MoonProject.open(tmp_path / "project", create=True))
     if stage == "analyze":
         AgentHandoffService(runner).submit("proposal", cold_start_payload("proposal"))
@@ -102,7 +118,8 @@ def test_cold_start_publish_consume_resume(tmp_path, monkeypatch, stage, artifac
     bridge = MoonDriveBridge(runner, config, transport=transport)
     request = bridge.publish(stage)["request"]
     contract = request["expected_response_schema"]["properties"]["payload"]
-    assert {key: contract[key] for key in load_schema(artifact)} == load_schema(artifact)
+    if stage == "proposal":
+        assert {key: contract[key] for key in load_schema(artifact)} == load_schema(artifact)
     assert contract["artifact"] == artifact
     response = json.loads(completed_response(request))
     response["payload"] = cold_start_payload(stage)
@@ -119,11 +136,31 @@ def test_cold_start_publish_consume_resume(tmp_path, monkeypatch, stage, artifac
     assert runner.state.next_stage() == next_stage
     assert runner.state.completed.count(stage) == 1
     assert runner.artifacts.read(artifact) == cold_start_payload(stage)
+    assert len(measured_reference) == 1
+    assert measured_reference[0]["analysis_depth"] == "deep"
+    assert measured_reference[0]["source"] == str(runner.project.root / "reference.mp4")
+    scaffold = runner.artifacts.read("reference_blueprint_scaffold")
+    assert scaffold["analysis_meta"]["semantic_enrichment_required"] is True
+    assert [(seg["start_seconds"], seg["end_seconds"]) for seg in scaffold["segments"]] == [(0, 2), (2, 4)]
+    if stage == "analyze":
+        blueprint = runner.artifacts.read("reference_blueprint")
+        jsonschema.validate(blueprint, load_schema("reference_blueprint"))
+        assert blueprint["analysis_meta"]["semantic_enrichment_required"] is False
+        assert blueprint["source"] == scaffold["source"]
+        assert all(seg["semantic"]["action"] == "pour" for seg in blueprint["segments"])
+        assert [seg["evidence"] for seg in blueprint["segments"]] == [seg["evidence"] for seg in scaffold["segments"]]
+        assert {item.get("artifact") for item in request["evidence"]} >= {"reference_blueprint_scaffold", "video_analysis_brief"}
+        images = [item for item in request["evidence"] if item.get("role") == "reference_frame"]
+        assert {item["timestamp_seconds"] for item in images} == {0, 1, 3, 4}
+        assert all(Path(item["source_path"]).is_file() for item in images)
+        assert all(not item["path"].endswith(".mp4") for item in request["evidence"])
+        assert len(request["evidence"]) <= config.max_evidence_files
+        assert sum(item["bytes"] for item in request["evidence"]) <= config.max_evidence_bytes
     assert PipelineRunner(runner.project).state.next_stage() == next_stage
     assert bridge.publish(next_stage)["request"]["stage"] == next_stage
 
 
-@pytest.mark.parametrize("stage", ["proposal", "analyze"])
+@pytest.mark.parametrize("stage", ["proposal"])
 def test_cold_start_rejects_invalid_schema_and_waits_for_ready_output(tmp_path, stage):
     runner = PipelineRunner(MoonProject.open(tmp_path, create=True))
     if stage == "analyze": runner.complete("proposal", {"test": True})
@@ -141,6 +178,115 @@ def test_cold_start_rejects_invalid_schema_and_waits_for_ready_output(tmp_path, 
     runner.artifacts.write(handoff._required_artifact(stage), payload)
     assert StageExecutionService(runner).run()["status"] == "awaiting_agent"
     assert runner.state.next_stage() == stage
+
+
+@pytest.mark.parametrize("mutation", ["unmeasured", "forged_evidence", "source_override", "gap", "unknown_id"])
+def test_analyze_rejects_ungrounded_enrichment(tmp_path, measured_reference, mutation):
+    runner = PipelineRunner(MoonProject.open(tmp_path / "project", create=True))
+    runner.complete("proposal", {"test": True})
+    StageExecutionService(runner).run()
+    bridge = MoonDriveBridge(runner, DriveBridgeConfig(
+        project_id="grounded", transport="local_sync", sync_root=tmp_path / "drive"), transport=MemoryTransport())
+    request = bridge.publish("analyze")["request"]
+    response = json.loads(completed_response(request))
+    payload = cold_start_payload("analyze")
+    if mutation == "unmeasured":
+        payload["segments"][0].update(start_seconds=0, end_seconds=1.5, boundary_basis=["scene_cut"])
+        payload["segments"][1].update(start_seconds=1.5, end_seconds=4, boundary_basis=["action_change"])
+    elif mutation == "forged_evidence":
+        payload["evidence_catalog"] = [{"path": "fake.jpg", "timestamp": 1.5}]
+    elif mutation == "source_override":
+        payload["source"] = {"duration_seconds": 99}
+    elif mutation == "gap":
+        payload["segments"] = payload["segments"][1:]
+    else:
+        payload["segments"][0]["id"] = "invented"
+    response["payload"] = payload
+    bridge.transport.response = json.dumps(response).encode()
+    with pytest.raises(ValueError, match="valid measured semantic enrichment"):
+        bridge.poll_once()
+    assert not runner.artifacts.exists("semantic_enrichment")
+    assert not runner.artifacts.exists("reference_blueprint")
+    assert runner.state.next_stage() == "analyze"
+
+
+def test_analyze_refines_only_measured_boundaries(tmp_path, measured_reference):
+    runner = PipelineRunner(MoonProject.open(tmp_path, create=True))
+    runner.complete("proposal", {"test": True})
+    execution = StageExecutionService(runner)
+    execution.run()
+    payload = cold_start_payload("analyze")
+    payload["segments"][0].update(start_seconds=0, end_seconds=1, boundary_basis=["scene_cut"])
+    payload["segments"][1].update(start_seconds=1, end_seconds=4, boundary_basis=["action_change"])
+    AgentHandoffService(runner).submit("analyze", payload)
+    assert execution.run()["status"] == "completed"
+    result = runner.artifacts.read("reference_blueprint")
+    assert [(s["start_seconds"], s["end_seconds"]) for s in result["segments"]] == [(0, 1), (1, 4)]
+    assert all(s["start_seconds"] <= t <= s["end_seconds"] for s in result["segments"] for t in s["evidence"]["frame_timestamps"])
+    assert len(measured_reference) == 1
+
+
+def test_local_sync_new_stage_archives_response_and_republish_preserves_it(tmp_path, measured_reference):
+    runner = PipelineRunner(MoonProject.open(tmp_path / "project", create=True))
+    execution = StageExecutionService(runner)
+    execution.run()
+    config = DriveBridgeConfig(project_id="local", transport="local_sync", sync_root=tmp_path / "drive")
+    bridge = MoonDriveBridge(runner, config)
+    proposal = bridge.publish("proposal")["request"]
+    remote = bridge.transport.remote
+    response = json.loads(completed_response(proposal))
+    response["payload"] = cold_start_payload("proposal")
+    (remote / "response.json").write_text(json.dumps(response), encoding="utf-8")
+    assert bridge.poll_once()["resume"]["stage"] == "analyze"
+    consumed_bytes = (remote / "response.json").read_bytes()
+    analyze = bridge.publish("analyze")["request"]
+    assert analyze["request_id"] != proposal["request_id"]
+    assert not (remote / "response.json").exists()
+    assert [p.read_bytes() for p in (remote / "history").glob("response-*.json")] == [consumed_bytes]
+    assert bridge.transport.download_response() is None
+    assert all(path.suffix != ".mp4" for path in remote.rglob("*"))
+    # A late sync of the old response is still rejected by request identity.
+    (remote / "response.json").write_bytes(consumed_bytes)
+    with pytest.raises(BridgeResponseError):
+        bridge.poll_once()
+    assert not runner.artifacts.exists("semantic_enrichment")
+    response = json.loads(completed_response(analyze))
+    response["payload"] = cold_start_payload("analyze")
+    valid_bytes = json.dumps(response).encode()
+    (remote / "response.json").write_bytes(valid_bytes)
+    restarted = MoonDriveBridge(PipelineRunner(runner.project), config)
+    again = restarted.publish("analyze")
+    assert again["idempotent"] is True
+    assert again["request"]["request_id"] == analyze["request_id"]
+    assert (remote / "response.json").read_bytes() == valid_bytes
+    assert len(list((remote / "history").glob("response-*.json"))) == 1
+
+
+def test_analyze_publish_refuses_packet_without_images_within_limits(tmp_path, measured_reference):
+    runner = PipelineRunner(MoonProject.open(tmp_path / "project", create=True))
+    runner.complete("proposal", {"test": True})
+    StageExecutionService(runner).run()
+    bridge = MoonDriveBridge(runner, DriveBridgeConfig(
+        project_id="limits", transport="local_sync", sync_root=tmp_path / "drive", max_evidence_files=1),
+        transport=MemoryTransport())
+    with pytest.raises(BridgeError, match="evidence is missing or exceeds"):
+        bridge.publish("analyze")
+    assert not bridge.transport.published
+
+
+@pytest.mark.parametrize("stage", ["proposal", "analyze"])
+def test_local_sync_new_request_id_clears_old_root_response(tmp_path, stage):
+    transport = LocalSyncTransport(DriveBridgeConfig(
+        project_id="replace", transport="local_sync", sync_root=tmp_path / "drive"))
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"request_id": "first", "stage": "proposal"}), encoding="utf-8")
+    transport.publish(request, [])
+    remote_response = transport.remote / "response.json"
+    remote_response.write_bytes(b"old response")
+    request.write_text(json.dumps({"request_id": "second", "stage": stage}), encoding="utf-8")
+    transport.publish(request, [])
+    assert not remote_response.exists()
+    assert next((transport.remote / "history").glob("response-*.json")).read_bytes() == b"old response"
 
 
 def bridge_at(tmp_path: Path, *, resume=None) -> tuple[MoonDriveBridge, MemoryTransport, PipelineRunner]:

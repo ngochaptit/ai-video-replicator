@@ -20,6 +20,12 @@ Adapters are intentionally thin. Moon Core does not know which model or vendor m
 
 `.moon/` contains project/state JSON, checkpoints, artifacts, and cache. Stage order is `proposal -> analyze -> footage -> match -> timeline -> render -> qc`. A completed stage writes a durable checkpoint before state advances.
 
+Analyze is hybrid: its first `run-stage` invokes `reference_blueprint_builder` on the project's `reference.mp4` with deep analysis and 2-second maximum analysis windows. Moon saves `reference_blueprint_scaffold`, `video_analysis_brief`, and measured keyframes. The analyze Drive handoff includes these JSON inputs and timestamped images, never the source video. Publishing fails if the evidence limits cannot accommodate image coverage for every reference window.
+
+The analyze response payload is `semantic_enrichment`, not a recreated blueprint. Supply `segments` with scaffold `id` values and canonical semantic fields; timing and evidence are inherited. Optional refinements must use measured `start_seconds`, `end_seconds`, and `boundary_basis`. Source/evidence overrides are rejected. Moon applies `ReferenceBlueprintBuilder.apply_semantic_enrichment` to the saved scaffold, validates the canonical result, writes `reference_blueprint` with `semantic_enrichment_required=false`, and resumes to footage without reanalyzing the video.
+
+With `local_sync`, publishing a different request ID or stage archives any previous root `response.json` under `AGENT/history/` before advertising the new request. Republishing the same active request preserves its response. Late responses for an older request remain rejected by request identity.
+
 ## Agent-neutral protocol
 
 Core actions include `status`, `next`, `stage.plan`, `stage.run`, `handoff.package`, and `handoff.submit`. `next` runs deterministic work continuously until complete, blocked, or the next semantic boundary.

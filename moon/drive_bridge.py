@@ -191,11 +191,29 @@ class LocalSyncTransport:
     def publish(self, request_path: Path, evidence: list[tuple[Path, str]]) -> dict[str, Any]:
         try:
             self.remote.mkdir(parents=True, exist_ok=True)
-            self.upload_request(request_path)
+            incoming = json.loads(request_path.read_text(encoding="utf-8"))
+            previous_path = self._target("request.json")
+            previous = {}
+            if previous_path.is_file():
+                try:
+                    previous = json.loads(previous_path.read_text(encoding="utf-8"))
+                except (ValueError, UnicodeError):
+                    pass
+            same_request = isinstance(previous, dict) and all(
+                previous.get(key) == incoming.get(key) for key in ("request_id", "stage")
+            )
             for source, relative in evidence:
                 target = self._target(relative)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
+            if not same_request:
+                response = self._target("response.json")
+                if response.exists():
+                    archived = self._target(f"history/response-{uuid.uuid4().hex}.json")
+                    archived.parent.mkdir(parents=True, exist_ok=True)
+                    response.replace(archived)
+            # Advertise the new request only after its evidence and cleanup are ready.
+            self.upload_request(request_path)
         except OSError as exc:
             raise BridgeTransportError(f"could not publish to Drive sync folder: {exc}") from exc
         return {"transport": "local_sync", "remote_path": str(self.remote), "files": 1 + len(evidence)}
@@ -214,7 +232,7 @@ class LocalSyncTransport:
     def upload_request(self, request_path: Path) -> None:
         try:
             self.remote.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(request_path, self.remote / "request.json")
+            _atomic_json(self._target("request.json"), json.loads(request_path.read_text(encoding="utf-8")))
         except OSError as exc:
             raise BridgeTransportError(f"could not update Drive sync request: {exc}") from exc
 
@@ -667,6 +685,11 @@ class MoonDriveBridge:
         evidence_input = handoff.get("inputs", {}).get("evidence") or {}
         sampled_metadata: dict[Path, dict[str, Any]] = {}
         if isinstance(evidence_input, dict):
+            for frame in evidence_input.get("reference_frames") or []:
+                sampled_metadata[Path(frame["path"]).resolve()] = {
+                    "role": "reference_frame", "timestamp_seconds": frame["timestamp_seconds"],
+                    "source_path": frame["path"],
+                }
             sampled = evidence_input.get("sampled_frames") or {}
             for group in sampled.get("groups") or []:
                 source = group.get("source") or {}
@@ -717,6 +740,16 @@ class MoonDriveBridge:
             result.append((target, relative.as_posix(), descriptor))
             seen.add(resolved)
             total_bytes += size
+        if handoff.get("stage") == "analyze":
+            exported = {item[2].get("artifact") for item in result}
+            frames = [item[2] for item in result if item[2].get("role") == "reference_frame"]
+            scaffold = self.runner.artifacts.read("reference_blueprint_scaffold")
+            if "reference_blueprint_scaffold" not in exported or any(
+                not any(segment["start_seconds"] <= frame["timestamp_seconds"] <= segment["end_seconds"]
+                        for frame in frames)
+                for segment in scaffold["segments"]
+            ):
+                raise BridgeError("analyze evidence is missing or exceeds bridge limits; provide measured images covering every reference window before publishing")
         return result
 
     def _validate_response(self, response: dict[str, Any], active: dict[str, Any]) -> None:

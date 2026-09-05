@@ -11,23 +11,24 @@ class StageExecutionService:
     def plan(self)->dict[str,Any]:
         stage=self.runner.state.next_stage()
         if stage is None:return {"stage":None,"done":True,"mode":"complete"}
-        plans={"proposal":("agent","proposal_packet"),"analyze":("agent","reference_blueprint"),"footage":("hybrid","footage_semantic_enrichment"),"match":("hybrid","match_proposal"),"timeline":("deterministic",None),"render":("hybrid","render_plan"),"qc":("agent","qc_bundle")};mode,required=plans[stage];return {"stage":stage,"done":False,"mode":mode,"required_agent_artifact":required}
+        plans={"proposal":("agent","proposal_packet"),"analyze":("hybrid","semantic_enrichment"),"footage":("hybrid","footage_semantic_enrichment"),"match":("hybrid","match_proposal"),"timeline":("deterministic",None),"render":("hybrid","render_plan"),"qc":("agent","qc_bundle")};mode,required=plans[stage];return {"stage":stage,"done":False,"mode":mode,"required_agent_artifact":required}
     def run(self)->dict[str,Any]:
         stage=self.runner.state.next_stage()
         if stage is None:return {"status":"complete","pipeline":self.runner.status()}
-        if stage in {"proposal", "analyze"}: return self._run_cold_start(stage)
+        if stage == "proposal": return self._run_proposal()
+        if stage == "analyze": return self._run_analyze()
         fn={"footage":self._run_footage,"match":self._run_match,"timeline":self._run_timeline,"render":self._run_render,"qc":self._run_qc}.get(stage);return fn() if fn else {"status":"awaiting_agent","stage":stage,"required_agent_artifact":self.plan()["required_agent_artifact"],"pipeline":self.runner.status()}
-    def _run_cold_start(self, stage: str) -> dict[str, Any]:
+    def _run_proposal(self) -> dict[str, Any]:
         from moon.handoff import AgentHandoffService
 
+        stage = "proposal"
         self.runner.begin(stage)
         handoff = AgentHandoffService(self.runner)
         artifact = handoff._required_artifact(stage)
         if self.runner.artifacts.exists(artifact):
             payload = self.runner.artifacts.read(artifact)
             handoff._validate(stage, payload)
-            ready = (payload["approval"]["status"] in {"approved", "approved_with_changes"}
-                     if stage == "proposal" else not payload["analysis_meta"]["semantic_enrichment_required"])
+            ready = payload["approval"]["status"] in {"approved", "approved_with_changes"}
             if ready:
                 return {"status": "completed", "stage": stage, "pipeline": self.runner.complete(
                     stage, {"source": "external_agent", "artifacts": {artifact: str(self.runner.artifacts.path_for(artifact))}})}
@@ -36,12 +37,49 @@ class StageExecutionService:
             self.runner.artifacts.write(task_name, {
                 "stage": stage, "revision": self.runner.state.revision,
                 "decision_owner": "external_agent", "required_output_artifact": artifact,
-                "instruction": ("Submit the canonical proposal_packet with the user's approval recorded."
-                                if stage == "proposal" else
-                                "Submit the canonical reference_blueprint with measured evidence and completed semantic enrichment; set analysis_meta.semantic_enrichment_required=false only when complete."),
+                "instruction": "Submit the canonical proposal_packet with the user's approval recorded.",
             })
         return {"status": "awaiting_agent", "stage": stage, "task": self.runner.artifacts.read(task_name),
                 "required_agent_artifact": artifact, "pipeline": self.runner.status()}
+
+    def _run_analyze(self) -> dict[str, Any]:
+        from moon.reference_analysis import enrich_reference
+        from schemas.artifacts import validate_artifact
+
+        self.runner.begin("analyze")
+        out = self.runner.project.root / "analysis" / "reference"
+        if not self.runner.artifacts.exists("reference_blueprint_scaffold"):
+            result = self._execute_tool("reference_blueprint_builder", {
+                "source": str(self.runner.project.root / "reference.mp4"),
+                "output_dir": str(out), "analysis_depth": "deep",
+                "max_analysis_window_seconds": 2.0, "max_keyframes": 40,
+            })
+            if not result["success"]:
+                self.runner.fail("analyze", result["error"])
+                return {"status": "blocked", "stage": "analyze", **result}
+            scaffold = result["data"]
+            validate_artifact("reference_blueprint", scaffold)
+            brief_path = Path(scaffold["analysis_meta"]["source_analysis_path"])
+            self.runner.artifacts.write("video_analysis_brief", json.loads(brief_path.read_text(encoding="utf-8")))
+            self.runner.artifacts.write("reference_blueprint_scaffold", scaffold)
+        scaffold = self.runner.artifacts.read("reference_blueprint_scaffold")
+        if self.runner.artifacts.exists("semantic_enrichment"):
+            blueprint = enrich_reference(scaffold, self.runner.artifacts.read("semantic_enrichment"))
+            self.runner.artifacts.write("reference_blueprint", blueprint)
+            return {"status": "completed", "stage": "analyze", "pipeline": self.runner.complete(
+                "analyze", {"source": "stage_execution_adapter", "tool": "reference_blueprint_builder",
+                            "artifacts": {name: str(self.runner.artifacts.path_for(name))
+                                          for name in ("reference_blueprint", "semantic_enrichment")}})}
+        task = {
+            "stage": "analyze", "revision": self.runner.state.revision,
+            "decision_owner": "external_agent", "required_output_artifact": "semantic_enrichment",
+            "evidence_root": str(out / "source_analysis" / "keyframes"),
+            "instruction": "Inspect reference_blueprint_scaffold, video_analysis_brief and measured keyframes. Submit semantic_enrichment segments by scaffold ID to inherit timing; refine boundaries only at measured timestamps with in-range evidence. Describe semantic/choreography/camera/spatial/motion/text/audio fields. Do not invent source metadata, evidence, or timestamps.",
+        }
+        # Replace tasks from the previous cold-start implementation as well.
+        if not self.runner.artifacts.exists("analyze_agent_task") or self.runner.artifacts.read("analyze_agent_task") != task:
+            self.runner.artifacts.write("analyze_agent_task", task)
+        return {"status": "awaiting_agent", "stage": "analyze", "task": task, "pipeline": self.runner.status()}
 
     def _run_footage(self)->dict[str,Any]:
         self.runner.begin("footage");out=self.runner.project.root/"analysis"/"footage";inputs={"footage_dir":str(self.runner.project.root/"footage"),"analysis_depth":"deep","max_keyframes_per_file":30,"max_analysis_window_seconds":2.0,"output_dir":str(out)};enrichment=None
@@ -130,4 +168,4 @@ class StageExecutionService:
     def _materialize_artifact(self,name:str)->Path:
         source=self._require_artifact(name);target=self.runner.project.cache_dir/"stage-inputs"/f"{name}.json";target.parent.mkdir(parents=True,exist_ok=True);target.write_text(source.read_text(encoding="utf-8"),encoding="utf-8");return target
     def _execute_tool(self,name:str,inputs:dict[str,Any])->dict[str,Any]:
-        factories={"footage_profile_builder":lambda:__import__("tools.analysis.footage_profile_builder",fromlist=["FootageProfileBuilder"]).FootageProfileBuilder(),"reference_candidate_ranker":lambda:__import__("tools.analysis.reference_candidate_ranker",fromlist=["ReferenceCandidateRanker"]).ReferenceCandidateRanker(),"reference_match_validator":lambda:__import__("tools.analysis.reference_match_validator",fromlist=["ReferenceMatchValidator"]).ReferenceMatchValidator(),"reference_timeline_builder":lambda:__import__("tools.video.reference_timeline_builder",fromlist=["ReferenceTimelineBuilder"]).ReferenceTimelineBuilder(),"reference_render_plan_builder":lambda:__import__("tools.video.reference_render_plan_builder",fromlist=["ReferenceRenderPlanBuilder"]).ReferenceRenderPlanBuilder(),"reference_video_renderer":lambda:__import__("tools.video.reference_video_renderer",fromlist=["ReferenceVideoRenderer"]).ReferenceVideoRenderer(),"replication_quality_evaluator":lambda:__import__("tools.analysis.replication_quality_evaluator",fromlist=["ReplicationQualityEvaluator"]).ReplicationQualityEvaluator()};result=factories[name]().execute(inputs);return {"success":bool(result.success),"data":result.data or {},"artifacts":list(result.artifacts or []),"error":result.error}
+        factories={"reference_blueprint_builder":lambda:__import__("tools.analysis.reference_blueprint_builder",fromlist=["ReferenceBlueprintBuilder"]).ReferenceBlueprintBuilder(),"footage_profile_builder":lambda:__import__("tools.analysis.footage_profile_builder",fromlist=["FootageProfileBuilder"]).FootageProfileBuilder(),"reference_candidate_ranker":lambda:__import__("tools.analysis.reference_candidate_ranker",fromlist=["ReferenceCandidateRanker"]).ReferenceCandidateRanker(),"reference_match_validator":lambda:__import__("tools.analysis.reference_match_validator",fromlist=["ReferenceMatchValidator"]).ReferenceMatchValidator(),"reference_timeline_builder":lambda:__import__("tools.video.reference_timeline_builder",fromlist=["ReferenceTimelineBuilder"]).ReferenceTimelineBuilder(),"reference_render_plan_builder":lambda:__import__("tools.video.reference_render_plan_builder",fromlist=["ReferenceRenderPlanBuilder"]).ReferenceRenderPlanBuilder(),"reference_video_renderer":lambda:__import__("tools.video.reference_video_renderer",fromlist=["ReferenceVideoRenderer"]).ReferenceVideoRenderer(),"replication_quality_evaluator":lambda:__import__("tools.analysis.replication_quality_evaluator",fromlist=["ReplicationQualityEvaluator"]).ReplicationQualityEvaluator()};result=factories[name]().execute(inputs);return {"success":bool(result.success),"data":result.data or {},"artifacts":list(result.artifacts or []),"error":result.error}

@@ -335,13 +335,21 @@ class ReferenceBlueprintBuilder(BaseTool):
         for index, spec in enumerate(segment_specs, start=1):
             if not isinstance(spec, dict):
                 raise ValueError(f"segment specification {index} must be an object")
+            # An agent may enrich an existing window by ID without reauthoring
+            # deterministic timing. Refined intervals still need measured bounds.
+            original = next((item for item in blueprint["segments"] if item["id"] == spec.get("id")), None)
+            spec = deepcopy(spec)
+            if original and "start_seconds" not in spec and "end_seconds" not in spec:
+                for field in ("start_seconds", "end_seconds", "boundary_basis"):
+                    spec.setdefault(field, original[field])
             start = round(float(spec["start_seconds"]), 6)
             end = round(float(spec["end_seconds"]), 6)
+            unchanged_window = original and self._close(start, original["start_seconds"]) and self._close(end, original["end_seconds"])
             if end <= start:
                 raise ValueError(f"segment {index} must have positive duration")
-            if not self._timestamp_is_measured(start, measured_timestamps):
+            if not unchanged_window and not self._timestamp_is_measured(start, measured_timestamps):
                 raise ValueError(f"segment {index} start {start} is not a measured timestamp")
-            if not self._timestamp_is_measured(end, measured_timestamps):
+            if not unchanged_window and not self._timestamp_is_measured(end, measured_timestamps):
                 raise ValueError(f"segment {index} end {end} is not a measured timestamp")
             if index == 1 and not self._close(start, 0.0):
                 raise ValueError("first enriched segment must start at 0")
@@ -360,7 +368,7 @@ class ReferenceBlueprintBuilder(BaseTool):
                     "audio_cue",
                     "motion_change",
                 }.intersection(basis)
-                if not meaningful:
+                if not meaningful and not (unchanged_window and basis == original["boundary_basis"]):
                     raise ValueError(
                         f"segment {index} boundary must be action/interaction-derived or another measured editorial boundary"
                     )

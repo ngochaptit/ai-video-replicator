@@ -33,8 +33,6 @@ class AgentHandoffService:
         self._validate(stage, payload)
         if stage == "proposal" and payload["approval"]["status"] not in {"approved", "approved_with_changes"}:
             raise ValueError("proposal handoff requires recorded user approval before consumption")
-        if stage == "analyze" and payload["analysis_meta"]["semantic_enrichment_required"]:
-            raise ValueError("analyze handoff requires completed semantic enrichment before consumption")
         if stage in {"footage", "match"} and self._semantic_artifacts_ready(stage):
             validate_semantic_submission(self.runner, stage, payload)
         artifact = self._required_artifact(stage); path = self.runner.artifacts.write(artifact, payload)
@@ -50,7 +48,7 @@ class AgentHandoffService:
     def _inputs(self, stage: str) -> dict[str, Any]:
         names={"footage":["footage_profiles_scaffold"],"match":["reference_blueprint","footage_profiles","candidate_rankings"],"render":["timeline"],"qc":["draft_render","timeline","match_decisions","replication_quality_report"]}.get(stage,[]); result={}
         if stage == "proposal": names = ["research_brief", "brief"]
-        if stage == "analyze": names = ["proposal_packet", "video_analysis_brief", "reference_blueprint", "semantic_enrichment"]
+        if stage == "analyze": names = ["reference_blueprint_scaffold", "video_analysis_brief", "proposal_packet"]
         for name in names:
             if self.runner.artifacts.exists(name):
                 path=self.runner.artifacts.path_for(name); result[name]={"path":str(path),"sha256":self._sha256(path)}
@@ -60,20 +58,29 @@ class AgentHandoffService:
         if evidence_root:
             root=Path(evidence_root); files=[str(p) for p in sorted(root.rglob("*")) if p.is_file()][:500] if root.is_dir() else []
         else: root=self.runner.project.evidence_dir
+        reference_frames = []
+        if stage == "analyze" and self.runner.artifacts.exists("reference_blueprint_scaffold"):
+            for segment in self.runner.artifacts.read("reference_blueprint_scaffold")["segments"]:
+                evidence = segment["evidence"]
+                reference_frames.extend({"path": path, "timestamp_seconds": timestamp}
+                    for path, timestamp in zip(evidence["frame_paths"], evidence["frame_timestamps"]))
+            files = list(dict.fromkeys(frame["path"] for frame in reference_frames))
         if sampled["groups"]:
             files.append(sampled["registry_path"])
             files.extend(str(frame["absolute_path"]) for group in sampled["groups"] for frame in group.get("frames") or [])
         if evidence_root or sampled["groups"]:
             result["evidence"]={"root":str(root),"sampled_root":str(self.runner.project.evidence_dir),"files":list(dict.fromkeys(files)),"sampled_frames":sampled}
+            if reference_frames: result["evidence"]["reference_frames"] = reference_frames
         return result
 
     @staticmethod
     def _output_contract(stage: str) -> dict[str, Any]:
-        if stage in {"proposal", "analyze"}:
-            artifact = "proposal_packet" if stage == "proposal" else "reference_blueprint"
-            rule = ("Record user approval before submitting the completed proposal."
-                    if stage == "proposal" else "Complete semantic enrichment before submitting the reference blueprint.")
-            return {**load_schema(artifact), "artifact": artifact, "rules": [rule]}
+        if stage == "analyze":
+            from moon.reference_analysis import enrichment_contract
+            return enrichment_contract()
+        if stage == "proposal":
+            return {**load_schema("proposal_packet"), "artifact": "proposal_packet",
+                    "rules": ["Record user approval before submitting the completed proposal."]}
         contracts={
             "footage":{"artifact":"footage_semantic_enrichment","required":["clips"],"rules":["clips must exactly cover measured clip_id values from footage_profiles_scaffold","unusable clips may set usable=false and omit segments","usable clips require measured non-overlapping segments","each segment requires source_in, source_out, boundary_basis and in-range frame evidence","semantic/camera/spatial/motion/quality/confidence fields may be supplied by the external vision agent","adaptive sampled frames are measured evidence and may be used as source_in/source_out boundaries","for long clips, inspect coarse coverage first and call moon.frames.sample on narrower windows before finalizing ambiguous action boundaries"]},
             "match":{"artifact":"match_proposal","required":["matches"],"rules":["exactly one match per reference blueprint segment","footage_segment_id must exist in enriched footage profiles","scores require action, interaction, camera, spatial, motion, duration, overall in [0,1] (non-overall may be null)","fallback requires an improvement_request for that reference segment","rationale must be non-empty"]},
@@ -84,7 +91,12 @@ class AgentHandoffService:
 
     def _validate(self, stage: str, payload: dict[str, Any]) -> None:
         if not isinstance(payload,dict): raise ValueError("handoff response must be a JSON object")
-        if stage in {"proposal", "analyze"}:
+        if stage == "analyze":
+            from moon.reference_analysis import enrich_reference
+            if not self.runner.artifacts.exists("reference_blueprint_scaffold"):
+                raise ValueError("run analyze first; missing measured reference_blueprint_scaffold")
+            enrich_reference(self.runner.artifacts.read("reference_blueprint_scaffold"), payload)
+        elif stage == "proposal":
             artifact = self._required_artifact(stage)
             try:
                 validate_artifact(artifact, payload)
