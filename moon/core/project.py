@@ -30,6 +30,10 @@ class MoonProject:
         return self.moon_dir / "state.json"
 
     @property
+    def agent_state_path(self) -> Path:
+        return self.moon_dir / "agent-state.json"
+
+    @property
     def project_path(self) -> Path:
         return self.moon_dir / "project.json"
 

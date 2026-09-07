@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from moon.agent_bridge import AgentBridgeService
+from moon.agent_state import AgentStateStore, transition, utc_now
 from moon.handoff import AgentHandoffService
 from moon.runner.pipeline import PipelineRunner
 
@@ -177,6 +178,8 @@ class BridgeTransport(Protocol):
 
     def upload_response(self, response_path: Path) -> None: ...
 
+    def archive_response(self, request_id: str, revision: int) -> None: ...
+
     def status(self) -> dict[str, Any]: ...
 
 
@@ -242,6 +245,20 @@ class LocalSyncTransport:
             shutil.copy2(response_path, self.remote / "response.json")
         except OSError as exc:
             raise BridgeTransportError(f"could not update Drive sync response: {exc}") from exc
+
+    def archive_response(self, request_id: str, revision: int) -> None:
+        response = self.remote / "response.json"
+        if not response.exists():
+            return
+        try:
+            history = self.remote / "history"
+            history.mkdir(parents=True, exist_ok=True)
+            target = history / f"response-{request_id}-r{revision}.json"
+            if target.exists():
+                target = history / f"response-{request_id}-r{revision}-{uuid.uuid4().hex}.json"
+            response.replace(target)
+        except OSError as exc:
+            raise BridgeTransportError(f"could not archive Drive sync response: {exc}") from exc
 
     def status(self) -> dict[str, Any]:
         response = self.remote / "response.json"
@@ -320,6 +337,23 @@ class GoogleDriveTransport:
 
     def upload_response(self, response_path: Path) -> None:
         self._upload_file(response_path, "response.json", self._agent_folder())
+
+    def archive_response(self, request_id: str, revision: int) -> None:
+        folder = self._agent_folder()
+        response = self._find_one(folder, "response.json")
+        if response is None:
+            return
+        history = self._find_or_create_folder(folder, "history")
+        try:
+            self.service.files().update(
+                fileId=response["id"],
+                body={"name": f"response-{request_id}-r{revision}.json"},
+                addParents=history,
+                removeParents=folder,
+                supportsAllDrives=True,
+            ).execute()
+        except Exception as exc:  # pragma: no cover - depends on Drive
+            raise BridgeTransportError(f"could not archive Drive response: {exc}") from exc
 
     def status(self) -> dict[str, Any]:
         response = self._find_one(self._agent_folder(), "response.json")
@@ -486,6 +520,7 @@ class MoonDriveBridge:
         self.request_path = self.agent_dir / "request.json"
         self.response_path = self.agent_dir / "response.json"
         self.state_path = runner.project.moon_dir / "bridge-state.json"
+        self.agent_state = AgentStateStore(runner.project.agent_state_path)
         self.transport = transport or self._transport_for(config)
         self._resume = resume or (lambda: AgentBridgeService(self.runner).next())
         self._sleep = sleeper
@@ -509,6 +544,7 @@ class MoonDriveBridge:
             and self.request_path.is_file()
         ):
             request = self._read_json(self.request_path)
+            self._ensure_agent_state(state, request)
             evidence = self._evidence_paths(request)
             remote = self.transport.publish(self.request_path, evidence)
             return {"status": "WAITING_AGENT", "idempotent": True, "request": request, "remote": remote}
@@ -531,6 +567,7 @@ class MoonDriveBridge:
             "evidence": [descriptor for _, _, descriptor in evidence],
             "expected_response_schema": self._response_schema(handoff["output_contract"]),
         }
+        request["route"] = self._initial_route(request, handoff)
         self.agent_dir.mkdir(parents=True, exist_ok=True)
         self._archive_previous_response(state)
         _atomic_json(self.request_path, request)
@@ -541,8 +578,10 @@ class MoonDriveBridge:
             "status": "WAITING_AGENT",
             "created_at": request["created_at"],
             "expires_at": request["expires_at"],
+            "revision": request["route"]["revision"],
         }
         self._write_state(state)
+        self.agent_state.save(request["route"])
         remote = self.transport.publish(
             self.request_path, [(source, relative) for source, relative, _ in evidence]
         )
@@ -563,18 +602,38 @@ class MoonDriveBridge:
             was_pending = bool(consumed[request_id].get("resume_pending"))
             resume = self._resume_pending(state, request_id)
             if was_pending:
+                warnings: list[str] = []
+                if resume and resume.get("status") != "resume_pending":
+                    try:
+                        self.transport.upload_request(self.request_path)
+                    except BridgeTransportError as exc:
+                        warnings.append(str(exc))
                 return {
                     "status": "CONSUMED" if resume and resume.get("status") != "resume_pending" else "CONSUMED_RESUME_PENDING",
                     "request_id": request_id,
                     "stage": consumed[request_id].get("stage"),
                     "submission": {"accepted": False, "duplicate": True},
                     "resume": resume,
-                    "warnings": [],
+                    "warnings": warnings,
                 }
             raise DuplicateResponseError(
                 f"response for request_id {request_id!r} was already consumed"
             )
         self._validate_response(response, active)
+        review = response.get("review") if isinstance(response.get("review"), dict) else None
+        if response["stage"] == "analyze" and review:
+            self._validate_analyze_review(review, active)
+            if review["decision"] == "REVISION_REQUIRED":
+                return self._route_analyze_revision(response, raw, state, active, review)
+        routing_review = review
+        if response["stage"] == "analyze" and routing_review is None:
+            # Responses produced before the routed protocol remain consumable.
+            # Record the implied GPT approval so the durable state machine is complete.
+            routing_review = {
+                "actor": "gpt",
+                "decision": "APPROVED",
+                "revision": int(active.get("revision", self.runner.state.revision)),
+            }
         response_hash = _sha256_bytes(raw)
         submission = AgentHandoffService(self.runner).submit(response["stage"], response["payload"])
         consumed_at = _iso(_utc_now())
@@ -584,9 +643,12 @@ class MoonDriveBridge:
         consumed_response["updated_at"] = consumed_at
         _atomic_json(self.response_path, consumed_response)
         request = self._read_json(self.request_path)
+        route = self._route_to_moon(request.get("route"), review=routing_review)
         request["status"] = "CONSUMED"
+        request["route"] = route
         request["updated_at"] = consumed_at
         _atomic_json(self.request_path, request)
+        self.agent_state.save(route)
         consumed[request_id] = {
             "response_sha256": response_hash,
             "stage": response["stage"],
@@ -607,6 +669,12 @@ class MoonDriveBridge:
         except BridgeTransportError as exc:
             sync_warnings.append(str(exc))
         resume = self._resume_pending(state, request_id)
+        if resume and resume.get("status") != "resume_pending":
+            self._mark_moon_continue()
+            try:
+                self.transport.upload_request(self.request_path)
+            except BridgeTransportError as exc:
+                sync_warnings.append(str(exc))
         return {
             "status": "CONSUMED" if resume and resume.get("status") != "resume_pending" else "CONSUMED_RESUME_PENDING",
             "request_id": request_id,
@@ -638,6 +706,7 @@ class MoonDriveBridge:
 
     def status(self) -> dict[str, Any]:
         state = self._read_state()
+        route = self._ensure_agent_state(state)
         return {
             "job_id": self.config.project_id,
             "local_agent_dir": str(self.agent_dir),
@@ -645,6 +714,10 @@ class MoonDriveBridge:
             "active_request": state.get("active_request"),
             "consumed_count": len(state.get("consumed") or {}),
             "remote": self.transport.status(),
+            "current_actor": route.get("current_actor") if route else None,
+            "next_actor": route.get("next_actor") if route else None,
+            "next_action": route.get("next_action") if route else None,
+            "agent_state": route,
         }
 
     def _resume_pending(self, state: dict[str, Any], request_id: str) -> dict[str, Any] | None:
@@ -656,6 +729,7 @@ class MoonDriveBridge:
             entry["resume_pending"] = False
             entry["resume_result"] = {"status": "already_advanced", "pipeline": self.runner.status()}
             self._write_state(state)
+            self._mark_moon_continue()
             return entry["resume_result"]
         try:
             result = self._resume()
@@ -667,7 +741,369 @@ class MoonDriveBridge:
         entry["resume_result"] = result
         entry.pop("resume_error", None)
         self._write_state(state)
+        self._mark_moon_continue()
         return result
+
+    def _initial_route(
+        self, request: dict[str, Any], handoff: dict[str, Any]
+    ) -> dict[str, Any]:
+        stage = request["stage"]
+        artifact = str(handoff["output_contract"].get("artifact") or "stage_payload")
+        revision = int(handoff.get("pipeline", {}).get("revision", self.runner.state.revision))
+        required_inputs = [str(item["path"]) for item in request.get("evidence") or []]
+        instruction = str(request.get("task", {}).get("instruction") or f"Complete {stage}.")
+        if stage == "analyze":
+            ack = self._acknowledgement(
+                request, actor="gemini", decision="COMPLETED", output=artifact,
+                next_actor="gpt", next_action="REVIEW_GEMINI_ANALYSIS", revision=revision,
+            )
+            state = {
+                "version": "1.0",
+                "job_id": request["job_id"],
+                "stage": stage,
+                "revision": revision,
+                "request_id": request["request_id"],
+                "status": "MOON_PREPARE",
+                "current_actor": "moon",
+                "next_actor": "gemini",
+                "next_action": "ANALYZE_EVIDENCE",
+                "task": instruction,
+                "required_inputs": required_inputs,
+                "expected_output": {
+                    "artifact": artifact,
+                    "delivery": "Return the artifact in chat; do not write raw JSON to Drive.",
+                    "schema_ref": "request.json.expected_response_schema.properties.payload",
+                },
+                "completion_contract": {
+                    "terminal_acknowledgement": ack,
+                    "gemini_return": {
+                        "required": [artifact, "terminal_acknowledgement"],
+                        "handoff": "Give the complete Gemini result and acknowledgement to GPT.",
+                    },
+                    "gpt_review": {
+                        "input": "The pasted Gemini result plus this Drive request and evidence.",
+                        "output_file": "response.json",
+                        "decisions": ["APPROVED", "REVISION_REQUIRED"],
+                        "acknowledgements": {
+                            "APPROVED": self._acknowledgement(
+                                request, actor="gpt", decision="APPROVED",
+                                output="response.json", next_actor="moon",
+                                next_action="CONSUME_RESPONSE", revision=revision,
+                            ),
+                            "REVISION_REQUIRED": self._acknowledgement(
+                                request, actor="gpt", decision="REVISION_REQUIRED",
+                                output="revision_targets", next_actor="gemini",
+                                next_action="RECHECK_TARGETS", revision=revision,
+                            ),
+                        },
+                    },
+                    "on_approval": {
+                        "next_actor": "moon",
+                        "next_action": "CONSUME_RESPONSE",
+                    },
+                    "on_revision": {
+                        "next_actor": "gemini",
+                        "next_action": "RECHECK_TARGETS",
+                        "required_metadata": ["segment_id", "reason"],
+                    },
+                },
+                "actor_instructions": {
+                    "gemini": "Read every required input, return the semantic enrichment in chat, then end with the exact terminal acknowledgement.",
+                    "gpt": "Review the pasted Gemini result against the Drive evidence. Write response.json only after recording APPROVED or REVISION_REQUIRED in review.decision.",
+                },
+                "updated_at": utc_now(),
+                "transition_history": [],
+            }
+            state = transition(
+                state, "MOON_PREPARE", current_actor="moon", next_actor="gemini",
+                next_action="ANALYZE_EVIDENCE",
+            )
+            return transition(
+                state, "WAITING_GEMINI", current_actor="gemini", next_actor="gpt",
+                next_action="REVIEW_GEMINI_ANALYSIS",
+            )
+        ack = self._acknowledgement(
+            request, actor="gpt", decision="COMPLETED", output=artifact,
+            next_actor="moon", next_action="CONSUME_RESPONSE", revision=revision,
+        )
+        state = {
+            "version": "1.0",
+            "job_id": request["job_id"],
+            "stage": stage,
+            "revision": revision,
+            "request_id": request["request_id"],
+            "status": "MOON_PREPARE",
+            "current_actor": "moon",
+            "next_actor": "gpt",
+            "next_action": f"COMPLETE_{stage.upper()}",
+            "task": instruction,
+            "required_inputs": required_inputs,
+            "expected_output": {
+                "artifact": artifact,
+                "delivery": "Write response.json in the Drive AGENT folder.",
+                "schema_ref": "request.json.expected_response_schema",
+            },
+            "completion_contract": {
+                "terminal_acknowledgement": ack,
+                "on_approval": {"next_actor": "moon", "next_action": "CONSUME_RESPONSE"},
+                "on_revision": {"next_actor": "gpt", "next_action": f"REVISE_{stage.upper()}"},
+            },
+            "updated_at": utc_now(),
+            "transition_history": [],
+        }
+        state = transition(
+            state, "MOON_PREPARE", current_actor="moon", next_actor="gpt",
+            next_action=f"COMPLETE_{stage.upper()}",
+        )
+        return transition(
+            state, "WAITING_GPT", current_actor="gpt", next_actor="moon",
+            next_action="CONSUME_RESPONSE",
+        )
+
+    @staticmethod
+    def _acknowledgement(
+        request: dict[str, Any], *, actor: str, decision: str, output: str,
+        next_actor: str, next_action: str, revision: int,
+    ) -> str:
+        return (
+            f"TASK_COMPLETED job_id={request['job_id']} request_id={request['request_id']} "
+            f"stage={request['stage']} revision={revision} actor={actor} decision={decision} "
+            f"output={output} next_actor={next_actor} next_action={next_action}"
+        )
+
+    def _validate_analyze_review(
+        self, review: dict[str, Any], active: dict[str, Any]
+    ) -> None:
+        allowed = {
+            "actor", "decision", "revision", "revision_targets", "gemini_acknowledgement"
+        }
+        unknown = sorted(set(review) - allowed)
+        if unknown:
+            raise BridgeResponseError(
+                f"analyze review contains unsupported fields: {', '.join(unknown)}"
+            )
+        if review.get("actor", "gpt") != "gpt":
+            raise BridgeResponseError("analyze review actor must be gpt")
+        if review.get("decision") not in {"APPROVED", "REVISION_REQUIRED"}:
+            raise BridgeResponseError("analyze review decision must be APPROVED or REVISION_REQUIRED")
+        revision = review.get("revision", active.get("revision", self.runner.state.revision))
+        if isinstance(revision, bool) or not isinstance(revision, int):
+            raise BridgeResponseError("analyze review revision must be an integer")
+        if revision != int(active.get("revision", self.runner.state.revision)):
+            raise BridgeResponseError("analyze review revision does not match active request")
+        if review["decision"] == "REVISION_REQUIRED":
+            targets = review.get("revision_targets")
+            if not isinstance(targets, list) or not targets:
+                raise BridgeResponseError("REVISION_REQUIRED needs non-empty revision_targets")
+            valid_segment_ids: set[str] = set()
+            if self.runner.artifacts.exists("reference_blueprint_scaffold"):
+                scaffold = self.runner.artifacts.read("reference_blueprint_scaffold")
+                valid_segment_ids = {
+                    str(segment.get("id"))
+                    for segment in scaffold.get("segments") or []
+                    if isinstance(segment, dict) and segment.get("id")
+                }
+            for target in targets:
+                if not isinstance(target, dict) or set(target) != {"segment_id", "reason"}:
+                    raise BridgeResponseError("each revision target requires only segment_id and reason")
+                segment_id = str(target.get("segment_id") or "").strip()
+                if not segment_id or not str(target.get("reason") or "").strip():
+                    raise BridgeResponseError("each revision target requires segment_id and reason")
+                if valid_segment_ids and segment_id not in valid_segment_ids:
+                    raise BridgeResponseError(
+                        f"revision target segment_id {segment_id!r} is not in the active analyze scaffold"
+                    )
+
+    def _route_analyze_revision(
+        self,
+        response: dict[str, Any],
+        raw: bytes,
+        bridge_state: dict[str, Any],
+        active: dict[str, Any],
+        review: dict[str, Any],
+    ) -> dict[str, Any]:
+        request = self._read_json(self.request_path)
+        route = self._ensure_agent_state(bridge_state, request) or request["route"]
+        done_status = "GEMINI_RECHECK_DONE" if int(route.get("revision", 0)) else "GEMINI_DONE"
+        route = transition(
+            route, done_status, current_actor="gemini", next_actor="gpt",
+            next_action="REVIEW_GEMINI_ANALYSIS",
+        )
+        route = transition(
+            route, "WAITING_GPT", current_actor="gpt", next_actor="moon",
+            next_action="CONSUME_RESPONSE",
+        )
+        route = transition(
+            route, "GPT_REVISION_REQUIRED", current_actor="gpt", next_actor="gemini",
+            next_action="RECHECK_TARGETS",
+        )
+        old_revision = int(route.get("revision", 0))
+        new_revision = old_revision + 1
+        targets = [
+            {"segment_id": str(item["segment_id"]), "reason": str(item["reason"])}
+            for item in review["revision_targets"]
+        ]
+        route["revision"] = new_revision
+        route["revision_targets"] = targets
+        route["task"] = "Recheck only the listed target segments against the published evidence and return a corrected complete semantic_enrichment artifact."
+        route["completion_contract"] = dict(route["completion_contract"])
+        route["completion_contract"]["terminal_acknowledgement"] = self._acknowledgement(
+            request, actor="gemini", decision="RECHECK_COMPLETED",
+            output=str(route["expected_output"]["artifact"]), next_actor="gpt",
+            next_action="REVIEW_GEMINI_ANALYSIS", revision=new_revision,
+        )
+        gpt_review = dict(route["completion_contract"].get("gpt_review") or {})
+        gpt_review["acknowledgements"] = {
+            "APPROVED": self._acknowledgement(
+                request, actor="gpt", decision="APPROVED", output="response.json",
+                next_actor="moon", next_action="CONSUME_RESPONSE", revision=new_revision,
+            ),
+            "REVISION_REQUIRED": self._acknowledgement(
+                request, actor="gpt", decision="REVISION_REQUIRED",
+                output="revision_targets", next_actor="gemini",
+                next_action="RECHECK_TARGETS", revision=new_revision,
+            ),
+        }
+        route["completion_contract"]["gpt_review"] = gpt_review
+        route = transition(
+            route, "WAITING_GEMINI", current_actor="gemini", next_actor="gpt",
+            next_action="REVIEW_GEMINI_ANALYSIS",
+        )
+        now = _utc_now()
+        request.update(
+            status="WAITING_AGENT", route=route, updated_at=_iso(now),
+            created_at=_iso(now),
+            expires_at=_iso(now + timedelta(seconds=self.config.stale_after_seconds)),
+        )
+        active.update(
+            status="WAITING_AGENT", revision=new_revision,
+            created_at=request["created_at"], expires_at=request["expires_at"],
+        )
+        reviewed = bridge_state.get("reviewed") or {}
+        reviewed[f"{response['request_id']}:r{old_revision}"] = {
+            "response_sha256": _sha256_bytes(raw),
+            "decision": "REVISION_REQUIRED",
+            "revision_targets": targets,
+            "reviewed_at": _iso(now),
+        }
+        bridge_state["reviewed"] = dict(list(reviewed.items())[-100:])
+        bridge_state["active_request"] = active
+        _atomic_json(self.request_path, request)
+        self.agent_state.save(route)
+        self._write_state(bridge_state)
+        self._archive_local_review(response, old_revision)
+        archive = getattr(self.transport, "archive_response", None)
+        if callable(archive):
+            archive(response["request_id"], old_revision)
+        elif hasattr(self.transport, "response"):
+            self.transport.response = None
+        evidence = self._evidence_paths(request)
+        remote = self.transport.publish(self.request_path, evidence)
+        return {
+            "status": "WAITING_GEMINI",
+            "request_id": response["request_id"],
+            "stage": "analyze",
+            "revision": new_revision,
+            "revision_targets": targets,
+            "next_actor": "gemini",
+            "next_action": "RECHECK_TARGETS",
+            "remote": remote,
+        }
+
+    def _route_to_moon(
+        self, route_value: Any, *, review: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        route = dict(route_value) if isinstance(route_value, dict) else {}
+        if route.get("stage") == "analyze" and review:
+            done_status = "GEMINI_RECHECK_DONE" if int(route.get("revision", 0)) else "GEMINI_DONE"
+            route = transition(
+                route, done_status, current_actor="gemini", next_actor="gpt",
+                next_action="REVIEW_GEMINI_ANALYSIS",
+            )
+            route = transition(
+                route, "WAITING_GPT", current_actor="gpt", next_actor="moon",
+                next_action="CONSUME_RESPONSE",
+            )
+            route = transition(
+                route, "GPT_APPROVED", current_actor="gpt", next_actor="moon",
+                next_action="CONSUME_RESPONSE",
+            )
+        return transition(
+            route, "WAITING_MOON", current_actor="moon", next_actor="moon",
+            next_action="CONSUME_RESPONSE",
+        )
+
+    def _mark_moon_continue(self) -> None:
+        if not self.request_path.is_file():
+            return
+        request = self._read_json(self.request_path)
+        route = request.get("route")
+        if not isinstance(route, dict) or route.get("status") == "MOON_CONTINUE":
+            return
+        route = transition(
+            route, "MOON_CONTINUE", current_actor="moon", next_actor="moon",
+            next_action="ADVANCE_PIPELINE",
+        )
+        request["route"] = route
+        request["updated_at"] = _iso(_utc_now())
+        _atomic_json(self.request_path, request)
+        self.agent_state.save(route)
+
+    def _ensure_agent_state(
+        self, bridge_state: dict[str, Any], request: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        if request is None and self.request_path.is_file():
+            try:
+                request = self._read_json(self.request_path)
+            except (OSError, ValueError, json.JSONDecodeError):
+                request = None
+        active = bridge_state.get("active_request") or {}
+        published = request.get("route") if isinstance(request, dict) else None
+        local = self.agent_state.load()
+        expected_identity = (
+            active.get("job_id"), active.get("request_id"), active.get("stage"),
+            int(active.get("revision", self.runner.state.revision)),
+        )
+
+        def identity(value: dict[str, Any]) -> tuple[Any, Any, Any, int]:
+            return (
+                value.get("job_id"), value.get("request_id"), value.get("stage"),
+                int(value.get("revision", self.runner.state.revision)),
+            )
+
+        if isinstance(published, dict) and identity(published) == expected_identity:
+            if local != published:
+                local = self.agent_state.save(published)
+            return local
+        if local is not None and identity(local) == expected_identity:
+            return local
+        if isinstance(request, dict) and all(
+            request.get(field) == active.get(field) for field in ("job_id", "request_id", "stage")
+        ):
+            output_contract = (
+                (request.get("expected_response_schema") or {}).get("properties", {}).get("payload")
+                or {"artifact": "stage_payload"}
+            )
+            reconstructed = self._initial_route(
+                request,
+                {
+                    "output_contract": output_contract,
+                    "pipeline": {"revision": expected_identity[3]},
+                },
+            )
+            request["route"] = reconstructed
+            active["revision"] = reconstructed["revision"]
+            bridge_state["active_request"] = active
+            _atomic_json(self.request_path, request)
+            self._write_state(bridge_state)
+            return self.agent_state.save(reconstructed)
+        return None
+
+    def _archive_local_review(self, response: dict[str, Any], revision: int) -> None:
+        history = self.runner.project.moon_dir / "bridge-history"
+        history.mkdir(parents=True, exist_ok=True)
+        target = history / f"{response['request_id']}-review-r{revision}.json"
+        _atomic_json(target, response)
 
     def _stage_evidence(
         self, request_id: str, handoff: dict[str, Any]
@@ -773,6 +1209,8 @@ class MoonDriveBridge:
             "payload",
             "created_at",
             "updated_at",
+            "revision",
+            "review",
         }
         unknown = sorted(set(response) - allowed)
         if unknown:
@@ -792,6 +1230,14 @@ class MoonDriveBridge:
             raise BridgeResponseError("response status must be COMPLETED")
         if not isinstance(response["payload"], dict):
             raise BridgeResponseError("response payload must be a JSON object")
+        if "revision" in response:
+            revision = response["revision"]
+            if isinstance(revision, bool) or not isinstance(revision, int):
+                raise BridgeResponseError("response revision must be an integer")
+            if revision != active.get("revision", self.runner.state.revision):
+                raise BridgeResponseError("response revision does not match active request")
+        if "review" in response and not isinstance(response["review"], dict):
+            raise BridgeResponseError("response review must be a JSON object")
         created = _parse_timestamp(response["created_at"], "created_at")
         request_created = _parse_timestamp(active.get("created_at"), "request created_at")
         expires = _parse_timestamp(active.get("expires_at"), "request expires_at")
@@ -826,6 +1272,34 @@ class MoonDriveBridge:
                 "created_at": {"type": "string", "format": "date-time"},
                 "updated_at": {"type": "string", "format": "date-time"},
                 "payload": output_contract,
+                "revision": {"type": "integer", "minimum": 0},
+                "review": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["actor", "decision", "revision"],
+                    "properties": {
+                        "actor": {"const": "gpt"},
+                        "decision": {"enum": ["APPROVED", "REVISION_REQUIRED"]},
+                        "revision": {"type": "integer", "minimum": 0},
+                        "revision_targets": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["segment_id", "reason"],
+                                "properties": {
+                                    "segment_id": {"type": "string", "minLength": 1},
+                                    "reason": {"type": "string", "minLength": 1},
+                                },
+                            },
+                        },
+                        "gemini_acknowledgement": {"type": "string", "minLength": 1},
+                    },
+                    "allOf": [{
+                        "if": {"properties": {"decision": {"const": "REVISION_REQUIRED"}}},
+                        "then": {"required": ["revision_targets"], "properties": {"revision_targets": {"minItems": 1}}},
+                    }],
+                },
             },
         }
 

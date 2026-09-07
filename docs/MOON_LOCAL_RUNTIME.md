@@ -55,6 +55,13 @@ The Drive bridge lets a web agent exchange one bounded handoff packet with Moon 
   evidence/<request_id>/...
 ```
 
+Moon also keeps a compact local routing cache at `<project>/.moon/agent-state.json`.
+The cache is Moon-owned and is reconstructed from the canonical pipeline and
+bridge artifacts if it is missing, invalid, or stale; it is not a second source
+of pipeline truth. The same state is published once as `request.json.route`, so
+a fresh web chat can identify its actor, exact task and inputs, expected output,
+terminal acknowledgement, and next actor without relying on prior chat history.
+
 The Drive API transport writes only those request-scoped JSON, text, and image evidence files under `MON_EDIT/jobs/<project_id>/AGENT/`. Source video and audio extensions are not eligible for copying or upload. A returned `payload` is untrusted input: Moon checks its envelope, age, job/request/stage identity, duplicate-consumption state, and the existing Moon handoff contract before storing it. No response field is interpreted as a shell command.
 
 ### Google OAuth setup
@@ -111,7 +118,11 @@ python -m moon bridge watch "D:\path\to\moon-project"
 python -m moon bridge status "D:\path\to\moon-project"
 ```
 
-`request.json` contains the exact `job_id`, `request_id`, stage, timestamps, evidence references, and expected response schema. The web agent must create `response.json` in the same Drive `AGENT` folder, copying the identity values exactly and placing its stage response under `payload`:
+`request.json` contains the exact `job_id`, `request_id`, stage, revision,
+timestamps, evidence references, expected response schema, and canonical `route`
+block. For stages other than analyze, the web agent creates `response.json` in
+the same Drive `AGENT` folder, copying the identity values exactly and placing
+its stage response under `payload`:
 
 ```json
 {
@@ -126,6 +137,32 @@ python -m moon bridge status "D:\path\to\moon-project"
 ```
 
 The payload shape above is illustrative; the authoritative requirements are embedded in `request.json`. After successful validation Moon marks both files `CONSUMED`, records an idempotency marker under `.moon/`, and resumes to the next safe boundary. A restart retries only a pending resume and never resubmits an already consumed response.
+
+The analyze stage uses the human-triggered Gemini-to-GPT route embedded in the
+request. Gemini reads the listed Drive evidence, returns the complete
+`semantic_enrichment` in chat, and ends with the exact
+`TASK_COMPLETED ... next_actor=gpt next_action=REVIEW_GEMINI_ANALYSIS` line from
+the route. The user gives that result to GPT. GPT reviews it against the same
+request and evidence, then writes `response.json` with structured review data:
+
+```json
+{
+  "version": "1.0",
+  "job_id": "my-edit-job",
+  "request_id": "COPY_FROM_REQUEST",
+  "stage": "analyze",
+  "status": "COMPLETED",
+  "created_at": "2026-09-05T12:00:00Z",
+  "payload": { "segments": [] },
+  "review": { "actor": "gpt", "decision": "APPROVED", "revision": 0 }
+}
+```
+
+`APPROVED` routes the response to Moon for consumption. `REVISION_REQUIRED`
+must include a non-empty `revision_targets` array whose entries each contain a
+`segment_id` and `reason`. Moon keeps the same job, stage, and request identity,
+increments the handoff revision, republishes the explicit targets for Gemini,
+and waits for GPT review again. Gemini never needs to overwrite raw JSON.
 
 Minimal credentials/connectivity test (it creates `jobs/<project_id>/AGENT` if absent but does not run video work):
 

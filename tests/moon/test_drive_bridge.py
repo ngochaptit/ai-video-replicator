@@ -510,3 +510,166 @@ def test_cli_bridge_publish_uses_project_positional_argument(tmp_path: Path, cap
     remote = tmp_path / "drive" / "MON_EDIT" / "jobs" / "job-123" / "AGENT"
     assert (remote / "request.json").is_file()
     assert all(path.suffix.lower() != ".mp4" for path in remote.rglob("*"))
+
+
+def test_proposal_publish_creates_persistent_gpt_route_state(tmp_path: Path):
+    runner = PipelineRunner(MoonProject.open(tmp_path / "project", create=True))
+    assert StageExecutionService(runner).run()["status"] == "awaiting_agent"
+    transport = MemoryTransport()
+    bridge = MoonDriveBridge(
+        runner,
+        DriveBridgeConfig(project_id="proposal-state", transport="local_sync", sync_root=tmp_path / "drive"),
+        transport=transport,
+    )
+
+    request = bridge.publish("proposal")["request"]
+    local_state = json.loads(runner.project.agent_state_path.read_text(encoding="utf-8"))
+
+    assert local_state == request["route"]
+    assert local_state["status"] == "WAITING_GPT"
+    assert local_state["current_actor"] == "gpt"
+    assert local_state["next_actor"] == "moon"
+    assert local_state["next_action"] == "CONSUME_RESPONSE"
+    assert local_state["expected_output"]["artifact"] == "proposal_packet"
+    assert local_state["completion_contract"]["terminal_acknowledgement"].startswith(
+        "TASK_COMPLETED job_id=proposal-state"
+    )
+
+
+def analyze_bridge_at(tmp_path: Path, measured_reference) -> tuple[MoonDriveBridge, MemoryTransport, PipelineRunner]:
+    runner = PipelineRunner(MoonProject.open(tmp_path / "project", create=True))
+    AgentHandoffService(runner).submit("proposal", cold_start_payload("proposal"))
+    assert StageExecutionService(runner).run()["status"] == "completed"
+    assert StageExecutionService(runner).run()["status"] == "awaiting_agent"
+    transport = MemoryTransport()
+    bridge = MoonDriveBridge(
+        runner,
+        DriveBridgeConfig(project_id="analyze-state", transport="local_sync", sync_root=tmp_path / "drive"),
+        transport=transport,
+        resume=lambda: {"status": "resumed"},
+    )
+    return bridge, transport, runner
+
+
+def reviewed_analyze_response(request: dict, decision: str, *, revision: int = 0) -> bytes:
+    response = json.loads(completed_response(request))
+    response["payload"] = cold_start_payload("analyze")
+    response["review"] = {"actor": "gpt", "decision": decision, "revision": revision}
+    return json.dumps(response).encode("utf-8")
+
+
+def test_analyze_publish_routes_gemini_to_gpt_review(tmp_path: Path, measured_reference):
+    bridge, _, runner = analyze_bridge_at(tmp_path, measured_reference)
+
+    request = bridge.publish("analyze")["request"]
+    route = request["route"]
+
+    assert route["status"] == "WAITING_GEMINI"
+    assert route["current_actor"] == "gemini"
+    assert route["next_actor"] == "gpt"
+    assert route["next_action"] == "REVIEW_GEMINI_ANALYSIS"
+    assert route["required_inputs"] == [item["path"] for item in request["evidence"]]
+    assert route["expected_output"]["artifact"] == "semantic_enrichment"
+    assert "do not write raw JSON to Drive" in route["expected_output"]["delivery"]
+    assert route["completion_contract"]["on_approval"] == {
+        "next_actor": "moon", "next_action": "CONSUME_RESPONSE"
+    }
+    assert route["completion_contract"]["on_revision"]["required_metadata"] == [
+        "segment_id", "reason"
+    ]
+    assert "actor=gpt decision=APPROVED" in route["completion_contract"]["gpt_review"]["acknowledgements"]["APPROVED"]
+    assert "next_actor=gemini next_action=RECHECK_TARGETS" in route["completion_contract"]["gpt_review"]["acknowledgements"]["REVISION_REQUIRED"]
+    assert json.loads(runner.project.agent_state_path.read_text(encoding="utf-8")) == route
+
+
+def test_gpt_approval_routes_to_moon_and_resumes(tmp_path: Path, measured_reference):
+    bridge, transport, runner = analyze_bridge_at(tmp_path, measured_reference)
+    request = bridge.publish("analyze")["request"]
+    transport.response = reviewed_analyze_response(request, "APPROVED")
+
+    result = bridge.poll_once()
+    route = json.loads(runner.project.agent_state_path.read_text(encoding="utf-8"))
+
+    assert result["status"] == "CONSUMED"
+    assert runner.artifacts.exists("semantic_enrichment")
+    assert route["status"] == "MOON_CONTINUE"
+    assert route["current_actor"] == "moon"
+    assert [item["status"] for item in route["transition_history"]][-5:] == [
+        "GEMINI_DONE", "WAITING_GPT", "GPT_APPROVED", "WAITING_MOON", "MOON_CONTINUE"
+    ]
+
+
+def test_gpt_revision_routes_to_gemini_with_targets_and_preserves_request(
+    tmp_path: Path, measured_reference
+):
+    bridge, transport, runner = analyze_bridge_at(tmp_path, measured_reference)
+    request = bridge.publish("analyze")["request"]
+    response = json.loads(reviewed_analyze_response(request, "REVISION_REQUIRED"))
+    response["review"]["revision_targets"] = [
+        {"segment_id": "seg_002", "reason": "Action conflicts with frame evidence"}
+    ]
+    transport.response = json.dumps(response).encode("utf-8")
+
+    result = bridge.poll_once()
+    revised_request = json.loads(bridge.request_path.read_text(encoding="utf-8"))
+    route = revised_request["route"]
+
+    assert result["status"] == "WAITING_GEMINI"
+    assert revised_request["request_id"] == request["request_id"]
+    assert route["revision"] == 1
+    assert route["status"] == "WAITING_GEMINI"
+    assert route["current_actor"] == "gemini"
+    assert route["revision_targets"] == response["review"]["revision_targets"]
+    assert "RECHECK_COMPLETED" in route["completion_contract"]["terminal_acknowledgement"]
+    assert not runner.artifacts.exists("semantic_enrichment")
+    assert transport.response is None
+
+    retry = bridge.publish("analyze")
+    assert retry["idempotent"] is True
+    assert retry["request"]["request_id"] == request["request_id"]
+    assert retry["request"]["route"] == route
+
+
+def test_stale_review_revision_cannot_advance_route(tmp_path: Path, measured_reference):
+    bridge, transport, runner = analyze_bridge_at(tmp_path, measured_reference)
+    request = bridge.publish("analyze")["request"]
+    revision = json.loads(reviewed_analyze_response(request, "REVISION_REQUIRED"))
+    revision["review"]["revision_targets"] = [{"segment_id": "seg_001", "reason": "Wrong actor"}]
+    transport.response = json.dumps(revision).encode("utf-8")
+    bridge.poll_once()
+    before = json.loads(runner.project.agent_state_path.read_text(encoding="utf-8"))
+    revised_request = json.loads(bridge.request_path.read_text(encoding="utf-8"))
+    transport.response = reviewed_analyze_response(revised_request, "APPROVED", revision=0)
+
+    with pytest.raises(BridgeResponseError, match="revision does not match"):
+        bridge.poll_once()
+
+    assert json.loads(runner.project.agent_state_path.read_text(encoding="utf-8")) == before
+    assert not runner.artifacts.exists("semantic_enrichment")
+
+
+def test_missing_agent_state_reconstructs_from_published_request(tmp_path: Path, measured_reference):
+    bridge, _, runner = analyze_bridge_at(tmp_path, measured_reference)
+    request = bridge.publish("analyze")["request"]
+    runner.project.agent_state_path.unlink()
+
+    status = bridge.status()
+
+    assert status["agent_state"] == request["route"]
+    assert status["current_actor"] == "gemini"
+    assert status["next_actor"] == "gpt"
+    assert status["next_action"] == "REVIEW_GEMINI_ANALYSIS"
+    assert json.loads(runner.project.agent_state_path.read_text(encoding="utf-8")) == request["route"]
+
+
+def test_stale_agent_state_reconstructs_from_published_request(tmp_path: Path, measured_reference):
+    bridge, _, runner = analyze_bridge_at(tmp_path, measured_reference)
+    request = bridge.publish("analyze")["request"]
+    stale = dict(request["route"])
+    stale.update(job_id="other-job", request_id="stale-request", revision=99)
+    runner.project.agent_state_path.write_text(json.dumps(stale), encoding="utf-8")
+
+    status = bridge.status()
+
+    assert status["agent_state"] == request["route"]
+    assert json.loads(runner.project.agent_state_path.read_text(encoding="utf-8")) == request["route"]
