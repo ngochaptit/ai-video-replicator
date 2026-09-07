@@ -44,6 +44,7 @@ class StageExecutionService:
 
     def _run_analyze(self) -> dict[str, Any]:
         from moon.reference_analysis import enrich_reference
+        from moon.reference_coverage import measured_reference_scaffold
         from schemas.artifacts import validate_artifact
 
         self.runner.begin("analyze")
@@ -62,7 +63,7 @@ class StageExecutionService:
             brief_path = Path(scaffold["analysis_meta"]["source_analysis_path"])
             self.runner.artifacts.write("video_analysis_brief", json.loads(brief_path.read_text(encoding="utf-8")))
             self.runner.artifacts.write("reference_blueprint_scaffold", scaffold)
-        scaffold = self.runner.artifacts.read("reference_blueprint_scaffold")
+        scaffold = measured_reference_scaffold(self.runner)
         if self.runner.artifacts.exists("semantic_enrichment"):
             blueprint = enrich_reference(scaffold, self.runner.artifacts.read("semantic_enrichment"))
             self.runner.artifacts.write("reference_blueprint", blueprint)

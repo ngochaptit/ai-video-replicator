@@ -689,6 +689,7 @@ class MoonDriveBridge:
                 sampled_metadata[Path(frame["path"]).resolve()] = {
                     "role": "reference_frame", "timestamp_seconds": frame["timestamp_seconds"],
                     "source_path": frame["path"],
+                    "origin": frame.get("origin", "video_analyzer"),
                 }
             sampled = evidence_input.get("sampled_frames") or {}
             for group in sampled.get("groups") or []:
@@ -714,6 +715,7 @@ class MoonDriveBridge:
         result: list[tuple[Path, str, dict[str, Any]]] = []
         seen: set[Path] = set()
         total_bytes = 0
+        eligible: dict[Path, tuple[int, str]] = {}
         for relative_hint, source, metadata in candidates:
             try:
                 resolved = source.expanduser().resolve(strict=True)
@@ -724,6 +726,7 @@ class MoonDriveBridge:
             if resolved.suffix.lower() not in SAFE_EVIDENCE_SUFFIXES:
                 continue
             size = resolved.stat().st_size
+            eligible[resolved] = (size, metadata.get("role", ""))
             if len(result) >= self.config.max_evidence_files or total_bytes + size > self.config.max_evidence_bytes:
                 continue
             relative = Path("evidence") / request_id / _safe_relative(relative_hint)
@@ -749,7 +752,15 @@ class MoonDriveBridge:
                         for frame in frames)
                 for segment in scaffold["segments"]
             ):
-                raise BridgeError("analyze evidence is missing or exceeds bridge limits; provide measured images covering every reference window before publishing")
+                frame_count = sum(role == "reference_frame" for _, role in eligible.values())
+                raise BridgeError(
+                    "analyze evidence is missing or exceeds bridge limits; "
+                    f"prepared evidence has {len(eligible)} files including {frame_count} reference frames "
+                    f"and {sum(size for size, _ in eligible.values())} bytes; "
+                    f"configured max_evidence_files={self.config.max_evidence_files}, "
+                    f"max_evidence_bytes={self.config.max_evidence_bytes}; "
+                    "images covering every reference window are required before publishing"
+                )
         return result
 
     def _validate_response(self, response: dict[str, Any], active: dict[str, Any]) -> None:

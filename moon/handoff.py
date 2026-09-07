@@ -60,10 +60,8 @@ class AgentHandoffService:
         else: root=self.runner.project.evidence_dir
         reference_frames = []
         if stage == "analyze" and self.runner.artifacts.exists("reference_blueprint_scaffold"):
-            for segment in self.runner.artifacts.read("reference_blueprint_scaffold")["segments"]:
-                evidence = segment["evidence"]
-                reference_frames.extend({"path": path, "timestamp_seconds": timestamp}
-                    for path, timestamp in zip(evidence["frame_paths"], evidence["frame_timestamps"]))
+            from moon.reference_coverage import ensure_reference_coverage
+            reference_frames = ensure_reference_coverage(self.runner)
             files = list(dict.fromkeys(frame["path"] for frame in reference_frames))
         if sampled["groups"]:
             files.append(sampled["registry_path"])
@@ -93,9 +91,10 @@ class AgentHandoffService:
         if not isinstance(payload,dict): raise ValueError("handoff response must be a JSON object")
         if stage == "analyze":
             from moon.reference_analysis import enrich_reference
+            from moon.reference_coverage import measured_reference_scaffold
             if not self.runner.artifacts.exists("reference_blueprint_scaffold"):
                 raise ValueError("run analyze first; missing measured reference_blueprint_scaffold")
-            enrich_reference(self.runner.artifacts.read("reference_blueprint_scaffold"), payload)
+            enrich_reference(measured_reference_scaffold(self.runner), payload)
         elif stage == "proposal":
             artifact = self._required_artifact(stage)
             try:

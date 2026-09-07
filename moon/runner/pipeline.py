@@ -16,6 +16,7 @@ _REVISION_ARTIFACTS: dict[str, tuple[str, ...]] = {
     "proposal": ("proposal_packet", "proposal_agent_task", "proposal_handoff"),
     "analyze": (
         "reference_blueprint_scaffold",
+        "reference_bridge_frames",
         "video_analysis_brief",
         "reference_blueprint",
         "semantic_enrichment",
