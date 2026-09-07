@@ -30,6 +30,7 @@ class MemoryTransport:
         self.fail_downloads = 0
         self.published: list[str] = []
         self.request: dict = {}
+        self.archived_responses: list[bytes] = []
 
     def publish(self, request_path: Path, evidence: list[tuple[Path, str]]) -> dict:
         self.request = json.loads(request_path.read_text(encoding="utf-8"))
@@ -47,6 +48,11 @@ class MemoryTransport:
 
     def upload_response(self, response_path: Path) -> None:
         self.response = response_path.read_bytes()
+
+    def archive_response(self, request_id: str, revision: int) -> None:
+        if self.response is not None:
+            self.archived_responses.append(self.response)
+            self.response = None
 
     def status(self) -> dict:
         return {"transport": "memory", "response_present": self.response is not None}
@@ -673,3 +679,122 @@ def test_stale_agent_state_reconstructs_from_published_request(tmp_path: Path, m
 
     assert status["agent_state"] == request["route"]
     assert json.loads(runner.project.agent_state_path.read_text(encoding="utf-8")) == request["route"]
+
+
+def expire_active_request(
+    bridge: MoonDriveBridge, request: dict, *, revision: int | None = None
+) -> None:
+    expired_at = datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()
+    bridge_state = json.loads(bridge.state_path.read_text(encoding="utf-8"))
+    bridge_state["active_request"]["expires_at"] = expired_at
+    if revision is not None:
+        bridge_state["active_request"]["revision"] = revision
+    bridge.state_path.write_text(json.dumps(bridge_state), encoding="utf-8")
+    request = dict(request)
+    request["expires_at"] = expired_at
+    if revision is not None:
+        request["route"] = dict(request["route"])
+        request["route"]["revision"] = revision
+    bridge.request_path.write_text(json.dumps(request), encoding="utf-8")
+
+
+def test_expired_waiting_request_is_replaced_and_route_uses_fresh_identity(tmp_path: Path):
+    bridge, transport, runner = bridge_at(tmp_path)
+    stale_request = bridge.publish("footage")["request"]
+    stale_response = completed_response(stale_request)
+    transport.response = stale_response
+    expire_active_request(bridge, stale_request, revision=2)
+
+    result = bridge.publish("footage")
+    fresh_request = result["request"]
+    local_state = json.loads(runner.project.agent_state_path.read_text(encoding="utf-8"))
+
+    assert result["idempotent"] is False
+    assert fresh_request["request_id"] != stale_request["request_id"]
+    assert fresh_request["stage"] == stale_request["stage"] == "footage"
+    assert fresh_request["created_at"] != stale_request["created_at"]
+    assert datetime.fromisoformat(fresh_request["expires_at"].replace("Z", "+00:00")) > datetime.now(timezone.utc)
+    assert fresh_request["route"]["request_id"] == fresh_request["request_id"]
+    assert fresh_request["route"]["revision"] == 2
+    assert fresh_request["task"]["revision"] == 2
+    assert local_state == fresh_request["route"]
+    assert transport.response is None
+    assert transport.archived_responses == [stale_response]
+    assert all(fresh_request["request_id"] in item["path"] for item in fresh_request["evidence"])
+    bridge_state = json.loads(bridge.state_path.read_text(encoding="utf-8"))
+    assert bridge_state["expired"][stale_request["request_id"]]["replacement_request_id"] == fresh_request["request_id"]
+
+
+def test_fresh_waiting_request_remains_idempotent(tmp_path: Path):
+    bridge, transport, _ = bridge_at(tmp_path)
+    first = bridge.publish("footage")["request"]
+    pending_response = completed_response(first)
+    transport.response = pending_response
+
+    result = bridge.publish("footage")
+
+    assert result["idempotent"] is True
+    assert result["request"]["request_id"] == first["request_id"]
+    assert result["request"]["created_at"] == first["created_at"]
+    assert result["request"]["expires_at"] == first["expires_at"]
+    assert transport.response == pending_response
+    assert transport.archived_responses == []
+
+
+def test_stale_response_cannot_be_consumed_after_expired_request_refresh(tmp_path: Path):
+    bridge, transport, runner = bridge_at(tmp_path)
+    stale_request = bridge.publish("footage")["request"]
+    stale_response = completed_response(stale_request)
+    transport.response = stale_response
+    expire_active_request(bridge, stale_request)
+    fresh_request = bridge.publish("footage")["request"]
+    state_before = json.loads(runner.project.agent_state_path.read_text(encoding="utf-8"))
+    transport.response = stale_response
+
+    with pytest.raises(BridgeResponseError, match="request_id"):
+        bridge.poll_once()
+
+    assert not runner.artifacts.exists("footage_semantic_enrichment")
+    assert json.loads(runner.project.agent_state_path.read_text(encoding="utf-8")) == state_before
+    assert json.loads(bridge.request_path.read_text(encoding="utf-8"))["request_id"] == fresh_request["request_id"]
+
+
+def test_bridge_status_marks_expired_waiting_request(tmp_path: Path):
+    bridge, _, _ = bridge_at(tmp_path)
+    request = bridge.publish("footage")["request"]
+    expire_active_request(bridge, request)
+
+    status = bridge.status()
+
+    assert status["request_expired"] is True
+    assert status["request_lifecycle"] == "expired"
+
+
+def test_expired_analyze_request_rebuilds_gemini_route_and_evidence(
+    tmp_path: Path, measured_reference
+):
+    bridge, transport, runner = analyze_bridge_at(tmp_path, measured_reference)
+    stale_request = bridge.publish("analyze")["request"]
+    stale_response = reviewed_analyze_response(stale_request, "APPROVED")
+    transport.response = stale_response
+    expire_active_request(bridge, stale_request, revision=1)
+
+    result = bridge.publish("analyze")
+    fresh_request = result["request"]
+
+    assert result["idempotent"] is False
+    assert fresh_request["request_id"] != stale_request["request_id"]
+    assert fresh_request["route"]["request_id"] == fresh_request["request_id"]
+    assert fresh_request["route"]["revision"] == 1
+    assert fresh_request["task"]["revision"] == 1
+    assert fresh_request["route"]["status"] == "WAITING_GEMINI"
+    assert fresh_request["route"]["current_actor"] == "gemini"
+    assert fresh_request["route"]["required_inputs"] == [
+        item["path"] for item in fresh_request["evidence"]
+    ]
+    assert all(
+        fresh_request["request_id"] in item["path"]
+        for item in fresh_request["evidence"]
+    )
+    assert transport.archived_responses == [stale_response]
+    assert json.loads(runner.project.agent_state_path.read_text(encoding="utf-8")) == fresh_request["route"]

@@ -164,6 +164,12 @@ must include a non-empty `revision_targets` array whose entries each contain a
 increments the handoff revision, republishes the explicit targets for Gemini,
 and waits for GPT review again. Gemini never needs to overwrite raw JSON.
 
+A pending request is idempotently republished only while its identity matches
+the active bridge request and its expiry is still in the future. Publishing the
+same pending stage after expiry archives any stale `response.json`, issues a new
+request ID and timestamps, rebuilds the route and local agent state, and retains
+the current revision. Responses carrying the replaced request ID remain invalid.
+
 Minimal credentials/connectivity test (it creates `jobs/<project_id>/AGENT` if absent but does not run video work):
 
 ```powershell

@@ -537,17 +537,42 @@ class MoonDriveBridge:
                 "request": self._read_json(self.request_path),
                 "resume": resume,
             }
-        if (
+        pending_same_stage = (
             active.get("stage") == stage
             and active.get("status") == "WAITING_AGENT"
             and self.runner.state.next_stage() == stage
-            and self.request_path.is_file()
-        ):
-            request = self._read_json(self.request_path)
-            self._ensure_agent_state(state, request)
-            evidence = self._evidence_paths(request)
+        )
+        pending_request: dict[str, Any] | None = None
+        if pending_same_stage and self.request_path.is_file():
+            try:
+                pending_request = self._read_json(self.request_path)
+            except (OSError, UnicodeError, json.JSONDecodeError, BridgeError):
+                pending_request = None
+        expired_pending = pending_same_stage and (
+            self._active_request_expired(active)
+            or pending_request is None
+            or self._active_request_expired(pending_request)
+        )
+        reusable_pending = (
+            pending_same_stage
+            and not expired_pending
+            and pending_request is not None
+            and self._request_matches_active(pending_request, active)
+        )
+        if reusable_pending:
+            self._ensure_agent_state(state, pending_request)
+            evidence = self._evidence_paths(pending_request)
             remote = self.transport.publish(self.request_path, evidence)
-            return {"status": "WAITING_AGENT", "idempotent": True, "request": request, "remote": remote}
+            return {
+                "status": "WAITING_AGENT",
+                "idempotent": True,
+                "request": pending_request,
+                "remote": remote,
+            }
+
+        refreshing_pending = pending_same_stage and not reusable_pending
+        if refreshing_pending:
+            self._archive_remote_response(active)
 
         handoff = AgentHandoffService(self.runner).package(stage)
         request_id = uuid.uuid4().hex
@@ -567,10 +592,33 @@ class MoonDriveBridge:
             "evidence": [descriptor for _, _, descriptor in evidence],
             "expected_response_schema": self._response_schema(handoff["output_contract"]),
         }
-        request["route"] = self._initial_route(request, handoff)
+        preserved_revision = self.runner.state.revision
+        if refreshing_pending:
+            preserved_revision = max(
+                int(active.get("revision", self.runner.state.revision)),
+                self.runner.state.revision,
+            )
+        if isinstance(request.get("task"), dict):
+            request["task"]["revision"] = preserved_revision
+        request["route"] = self._initial_route(
+            request, handoff, revision=preserved_revision
+        )
         self.agent_dir.mkdir(parents=True, exist_ok=True)
         self._archive_previous_response(state)
         _atomic_json(self.request_path, request)
+        if refreshing_pending:
+            expired = state.get("expired") or {}
+            expired_request_id = str(active.get("request_id") or "unknown")
+            expired[expired_request_id] = {
+                "job_id": active.get("job_id"),
+                "stage": active.get("stage"),
+                "revision": preserved_revision,
+                "expired_at": active.get("expires_at"),
+                "reason": "expired" if expired_pending else "pending_request_invalid",
+                "replaced_at": request["created_at"],
+                "replacement_request_id": request_id,
+            }
+            state["expired"] = dict(list(expired.items())[-100:])
         state["active_request"] = {
             "job_id": self.config.project_id,
             "request_id": request_id,
@@ -707,11 +755,27 @@ class MoonDriveBridge:
     def status(self) -> dict[str, Any]:
         state = self._read_state()
         route = self._ensure_agent_state(state)
+        active = state.get("active_request") or {}
+        request_expired = (
+            active.get("status") == "WAITING_AGENT"
+            and self._active_request_expired(active)
+        )
+        if not request_expired and active.get("status") == "WAITING_AGENT" and self.request_path.is_file():
+            try:
+                request_expired = self._active_request_expired(
+                    self._read_json(self.request_path)
+                )
+            except (OSError, UnicodeError, json.JSONDecodeError, BridgeError):
+                request_expired = True
         return {
             "job_id": self.config.project_id,
             "local_agent_dir": str(self.agent_dir),
             "remote_path": self.config.remote_path,
             "active_request": state.get("active_request"),
+            "request_expired": request_expired,
+            "request_lifecycle": "expired" if request_expired else (
+                "fresh" if active.get("status") == "WAITING_AGENT" else active.get("status")
+            ),
             "consumed_count": len(state.get("consumed") or {}),
             "remote": self.transport.status(),
             "current_actor": route.get("current_actor") if route else None,
@@ -745,11 +809,18 @@ class MoonDriveBridge:
         return result
 
     def _initial_route(
-        self, request: dict[str, Any], handoff: dict[str, Any]
+        self,
+        request: dict[str, Any],
+        handoff: dict[str, Any],
+        *,
+        revision: int | None = None,
     ) -> dict[str, Any]:
         stage = request["stage"]
         artifact = str(handoff["output_contract"].get("artifact") or "stage_payload")
-        revision = int(handoff.get("pipeline", {}).get("revision", self.runner.state.revision))
+        if revision is None:
+            revision = int(
+                handoff.get("pipeline", {}).get("revision", self.runner.state.revision)
+            )
         required_inputs = [str(item["path"]) for item in request.get("evidence") or []]
         instruction = str(request.get("task", {}).get("instruction") or f"Complete {stage}.")
         if stage == "analyze":
@@ -1104,6 +1175,40 @@ class MoonDriveBridge:
         history.mkdir(parents=True, exist_ok=True)
         target = history / f"{response['request_id']}-review-r{revision}.json"
         _atomic_json(target, response)
+
+    @staticmethod
+    def _request_matches_active(
+        request: dict[str, Any], active: dict[str, Any]
+    ) -> bool:
+        return all(
+            request.get(field) == active.get(field)
+            for field in ("job_id", "request_id", "stage", "status")
+        )
+
+    @staticmethod
+    def _active_request_expired(
+        active: dict[str, Any], *, now: datetime | None = None
+    ) -> bool:
+        value = active.get("expires_at")
+        if not isinstance(value, str) or not value.strip():
+            return True
+        try:
+            expires = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if expires.tzinfo is None:
+            return True
+        return (now or _utc_now()) >= expires.astimezone(timezone.utc)
+
+    def _archive_remote_response(self, active: dict[str, Any]) -> None:
+        archive = getattr(self.transport, "archive_response", None)
+        if callable(archive):
+            archive(
+                str(active.get("request_id") or "unknown"),
+                int(active.get("revision", self.runner.state.revision)),
+            )
+        elif hasattr(self.transport, "response"):
+            self.transport.response = None
 
     def _stage_evidence(
         self, request_id: str, handoff: dict[str, Any]
