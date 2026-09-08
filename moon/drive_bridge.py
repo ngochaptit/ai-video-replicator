@@ -18,6 +18,7 @@ from typing import Any, Protocol
 
 from moon.agent_bridge import AgentBridgeService
 from moon.agent_state import AgentStateStore, transition, utc_now
+from moon.gemini_handoff import GeminiHandoffPacketBuilder
 from moon.handoff import AgentHandoffService
 from moon.runner.pipeline import PipelineRunner
 
@@ -561,7 +562,8 @@ class MoonDriveBridge:
         )
         if reusable_pending:
             self._ensure_agent_state(state, pending_request)
-            evidence = self._evidence_paths(pending_request)
+            self._ensure_portable_packet(pending_request)
+            evidence = self._publish_paths(pending_request)
             remote = self.transport.publish(self.request_path, evidence)
             return {
                 "status": "WAITING_AGENT",
@@ -604,6 +606,7 @@ class MoonDriveBridge:
             request, handoff, revision=preserved_revision
         )
         self.agent_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_portable_packet(request)
         self._archive_previous_response(state)
         _atomic_json(self.request_path, request)
         if refreshing_pending:
@@ -630,9 +633,7 @@ class MoonDriveBridge:
         }
         self._write_state(state)
         self.agent_state.save(request["route"])
-        remote = self.transport.publish(
-            self.request_path, [(source, relative) for source, relative, _ in evidence]
-        )
+        remote = self.transport.publish(self.request_path, self._publish_paths(request))
         return {"status": "WAITING_AGENT", "idempotent": False, "request": request, "remote": remote}
 
     def poll_once(self) -> dict[str, Any] | None:
@@ -879,9 +880,10 @@ class MoonDriveBridge:
                     },
                 },
                 "actor_instructions": {
-                    "gemini": "Read every required input, return the semantic enrichment in chat, then end with the exact terminal acknowledgement.",
+                    "gemini": "Read every required input, return the semantic enrichment in chat, then end with the exact terminal acknowledgement. If direct Drive reading is unavailable, ask the user to upload the single gemini_handoff.pdf packet instead of pasting files.",
                     "gpt": "Review the pasted Gemini result against the Drive evidence. Write response.json only after recording APPROVED or REVISION_REQUIRED in review.decision.",
                 },
+                "portable_packet": "gemini_handoff.pdf",
                 "updated_at": utc_now(),
                 "transition_history": [],
             }
@@ -1046,6 +1048,9 @@ class MoonDriveBridge:
             created_at=_iso(now),
             expires_at=_iso(now + timedelta(seconds=self.config.stale_after_seconds)),
         )
+        if isinstance(request.get("task"), dict):
+            request["task"]["revision"] = new_revision
+        self._ensure_portable_packet(request)
         active.update(
             status="WAITING_AGENT", revision=new_revision,
             created_at=request["created_at"], expires_at=request["expires_at"],
@@ -1068,8 +1073,7 @@ class MoonDriveBridge:
             archive(response["request_id"], old_revision)
         elif hasattr(self.transport, "response"):
             self.transport.response = None
-        evidence = self._evidence_paths(request)
-        remote = self.transport.publish(self.request_path, evidence)
+        remote = self.transport.publish(self.request_path, self._publish_paths(request))
         return {
             "status": "WAITING_GEMINI",
             "request_id": response["request_id"],
@@ -1209,6 +1213,56 @@ class MoonDriveBridge:
             )
         elif hasattr(self.transport, "response"):
             self.transport.response = None
+
+    def _ensure_portable_packet(self, request: dict[str, Any]) -> Path | None:
+        if request.get("stage") != "analyze":
+            return None
+        route = request.get("route")
+        if not isinstance(route, dict):
+            raise BridgeError("analyze request route is missing")
+        route["portable_packet"] = "gemini_handoff.pdf"
+        packet_path = self.agent_dir / "gemini_handoff.pdf"
+        packet = route.get("portable_packet_manifest")
+        if (
+            isinstance(packet, dict)
+            and packet.get("request_id") == request.get("request_id")
+            and packet.get("revision") == route.get("revision")
+            and packet_path.is_file()
+            and _sha256(packet_path) == packet.get("sha256")
+        ):
+            return packet_path
+        try:
+            packet = GeminiHandoffPacketBuilder(self.agent_dir).build(
+                request, route, packet_path
+            )
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise BridgeError(f"could not build Gemini handoff packet: {exc}") from exc
+        route["portable_packet_manifest"] = packet
+        if self.request_path.is_file() and self._request_matches_active(
+            request, (self._read_state().get("active_request") or {})
+        ):
+            _atomic_json(self.request_path, request)
+            self.agent_state.save(route)
+        return packet_path
+
+    def _publish_paths(self, request: dict[str, Any]) -> list[tuple[Path, str]]:
+        paths = self._evidence_paths(request)
+        if request.get("stage") != "analyze":
+            return paths
+        route = request.get("route") or {}
+        packet = route.get("portable_packet_manifest") or {}
+        relative = str(route.get("portable_packet") or "")
+        packet_path = (self.agent_dir / relative).resolve()
+        if (
+            relative != "gemini_handoff.pdf"
+            or not _is_within(packet_path, self.agent_dir)
+            or not packet_path.is_file()
+            or _sha256(packet_path) != packet.get("sha256")
+            or packet.get("request_id") != request.get("request_id")
+        ):
+            raise BridgeError("Gemini handoff packet is missing, changed, or stale")
+        paths.append((packet_path, relative))
+        return paths
 
     def _stage_evidence(
         self, request_id: str, handoff: dict[str, Any]

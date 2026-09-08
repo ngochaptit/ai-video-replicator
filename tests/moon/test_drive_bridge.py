@@ -84,6 +84,8 @@ def measured_reference(monkeypatch):
 
     calls = []
     def analyze(self, inputs):
+        from PIL import Image
+
         calls.append(inputs)
         output = Path(inputs["output_dir"])
         frames = output / "keyframes"
@@ -91,7 +93,11 @@ def measured_reference(monkeypatch):
         keyframes = []
         for timestamp in (0.0, 1.0, 3.0, 4.0):
             frame = frames / f"frame-{timestamp}.jpg"
-            frame.write_bytes(b"test-image")
+            Image.new(
+                "RGB",
+                (640, 360),
+                (int(timestamp * 40) % 255, 80, 160),
+            ).save(frame, format="JPEG", quality=95)
             keyframes.append({"path": str(frame), "timestamp": timestamp})
         # Deliberately present a source video beside the evidence: never export it.
         (frames / "reference.mp4").write_bytes(b"private source")
@@ -248,6 +254,8 @@ def test_local_sync_new_stage_archives_response_and_republish_preserves_it(tmp_p
     analyze = bridge.publish("analyze")["request"]
     assert analyze["request_id"] != proposal["request_id"]
     assert not (remote / "response.json").exists()
+    assert (remote / "gemini_handoff.pdf").is_file()
+    assert (remote / "gemini_handoff.pdf").read_bytes() == (bridge.agent_dir / "gemini_handoff.pdf").read_bytes()
     assert [p.read_bytes() for p in (remote / "history").glob("response-*.json")] == [consumed_bytes]
     assert bridge.transport.download_response() is None
     assert all(path.suffix != ".mp4" for path in remote.rglob("*"))
@@ -627,6 +635,9 @@ def test_gpt_revision_routes_to_gemini_with_targets_and_preserves_request(
     assert route["current_actor"] == "gemini"
     assert route["revision_targets"] == response["review"]["revision_targets"]
     assert "RECHECK_COMPLETED" in route["completion_contract"]["terminal_acknowledgement"]
+    assert route["portable_packet_manifest"]["revision"] == 1
+    assert route["portable_packet_manifest"]["request_id"] == request["request_id"]
+    assert revised_request["task"]["revision"] == 1
     assert not runner.artifacts.exists("semantic_enrichment")
     assert transport.response is None
 
@@ -775,6 +786,7 @@ def test_expired_analyze_request_rebuilds_gemini_route_and_evidence(
 ):
     bridge, transport, runner = analyze_bridge_at(tmp_path, measured_reference)
     stale_request = bridge.publish("analyze")["request"]
+    stale_packet = (bridge.agent_dir / "gemini_handoff.pdf").read_bytes()
     stale_response = reviewed_analyze_response(stale_request, "APPROVED")
     transport.response = stale_response
     expire_active_request(bridge, stale_request, revision=1)
@@ -798,3 +810,65 @@ def test_expired_analyze_request_rebuilds_gemini_route_and_evidence(
     )
     assert transport.archived_responses == [stale_response]
     assert json.loads(runner.project.agent_state_path.read_text(encoding="utf-8")) == fresh_request["route"]
+    fresh_packet = (bridge.agent_dir / "gemini_handoff.pdf").read_bytes()
+    assert fresh_packet != stale_packet
+    assert fresh_request["request_id"].encode("ascii") in fresh_packet
+    assert stale_request["request_id"].encode("ascii") not in fresh_packet
+    assert fresh_request["route"]["portable_packet_manifest"]["request_id"] == fresh_request["request_id"]
+
+
+def test_analyze_visual_packet_contains_identity_manifest_and_every_frame(
+    tmp_path: Path, measured_reference
+):
+    bridge, transport, _ = analyze_bridge_at(tmp_path, measured_reference)
+    request = bridge.publish("analyze")["request"]
+    packet_path = bridge.agent_dir / "gemini_handoff.pdf"
+    packet = packet_path.read_bytes()
+    frame_descriptors = [
+        item for item in request["evidence"] if item.get("role") == "reference_frame"
+    ]
+    manifest = request["route"]["portable_packet_manifest"]
+
+    assert packet.startswith(b"%PDF-1.7")
+    assert packet.endswith(b"%%EOF\n")
+    assert request["route"]["portable_packet"] == "gemini_handoff.pdf"
+    assert "gemini_handoff.pdf" in transport.published
+    assert manifest["job_id"] == request["job_id"]
+    assert manifest["request_id"] == request["request_id"]
+    assert manifest["stage"] == "analyze"
+    assert manifest["revision"] == request["route"]["revision"]
+    assert manifest["frame_count"] == len(frame_descriptors)
+    assert f"request_id={request['request_id']}".encode("ascii") in packet
+    assert f'"request_id":"{request["request_id"]}"'.encode("ascii") in packet
+    assert manifest["manifest_sha256"].encode("ascii") in packet
+    for descriptor in frame_descriptors:
+        assert descriptor["path"].encode("ascii") in packet
+        assert descriptor["sha256"].encode("ascii") in packet
+
+
+def test_analyze_visual_packet_rebuild_is_deterministic_for_same_request(
+    tmp_path: Path, measured_reference
+):
+    bridge, _, _ = analyze_bridge_at(tmp_path, measured_reference)
+    request = bridge.publish("analyze")["request"]
+    packet_path = bridge.agent_dir / "gemini_handoff.pdf"
+    original = packet_path.read_bytes()
+    original_manifest = request["route"]["portable_packet_manifest"]
+    packet_path.unlink()
+
+    result = bridge.publish("analyze")
+    rebuilt = packet_path.read_bytes()
+
+    assert result["idempotent"] is True
+    assert rebuilt == original
+    assert result["request"]["route"]["portable_packet_manifest"] == original_manifest
+
+
+def test_non_analyze_publish_does_not_create_or_publish_gemini_packet(tmp_path: Path):
+    bridge, transport, _ = bridge_at(tmp_path)
+
+    request = bridge.publish("footage")["request"]
+
+    assert "portable_packet" not in request["route"]
+    assert not (bridge.agent_dir / "gemini_handoff.pdf").exists()
+    assert "gemini_handoff.pdf" not in transport.published

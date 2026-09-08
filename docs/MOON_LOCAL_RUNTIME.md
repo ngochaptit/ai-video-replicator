@@ -62,7 +62,7 @@ of pipeline truth. The same state is published once as `request.json.route`, so
 a fresh web chat can identify its actor, exact task and inputs, expected output,
 terminal acknowledgement, and next actor without relying on prior chat history.
 
-The Drive API transport writes only those request-scoped JSON, text, and image evidence files under `MON_EDIT/jobs/<project_id>/AGENT/`. Source video and audio extensions are not eligible for copying or upload. A returned `payload` is untrusted input: Moon checks its envelope, age, job/request/stage identity, duplicate-consumption state, and the existing Moon handoff contract before storing it. No response field is interpreted as a shell command.
+The Drive API transport writes only those request-scoped JSON, text, and image evidence files, plus Moon's generated analyze handoff PDF, under `MON_EDIT/jobs/<project_id>/AGENT/`. Source video and audio extensions are not eligible for copying or upload. A returned `payload` is untrusted input: Moon checks its envelope, age, job/request/stage identity, duplicate-consumption state, and the existing Moon handoff contract before storing it. No response field is interpreted as a shell command.
 
 ### Google OAuth setup
 
@@ -144,6 +144,13 @@ request. Gemini reads the listed Drive evidence, returns the complete
 `TASK_COMPLETED ... next_actor=gpt next_action=REVIEW_GEMINI_ANALYSIS` line from
 the route. The user gives that result to GPT. GPT reviews it against the same
 request and evidence, then writes `response.json` with structured review data:
+
+Moon also generates `AGENT/gemini_handoff.pdf` for analyze requests and publishes
+it beside `request.json`. If Gemini Web cannot dereference Drive links, upload
+this one PDF to Gemini. It contains the route, response rules, canonical analyze
+artifacts, and every required measured frame with timing/origin labels. Its
+embedded manifest and `request.json.route.portable_packet_manifest` bind it to
+the current request ID, revision, source hashes, and packet hash.
 
 ```json
 {
