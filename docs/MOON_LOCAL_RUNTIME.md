@@ -145,12 +145,17 @@ request. Gemini reads the listed Drive evidence, returns the complete
 the route. The user gives that result to GPT. GPT reviews it against the same
 request and evidence, then writes `response.json` with structured review data:
 
-Moon also generates `AGENT/gemini_handoff.pdf` for analyze requests and publishes
-it beside `request.json`. If Gemini Web cannot dereference Drive links, upload
-this one PDF to Gemini. It contains the route, response rules, canonical analyze
-artifacts, and every required measured frame with timing/origin labels. Its
-embedded manifest and `request.json.route.portable_packet_manifest` bind it to
-the current request ID, revision, source hashes, and packet hash.
+Moon also generates `AGENT/gemini_handoff.pdf` for analyze and footage requests
+and publishes it beside `request.json`. If Gemini Web cannot dereference Drive
+links, upload this one PDF to Gemini. Analyze packets contain the route, response
+rules, canonical analyze artifacts, and every required measured reference frame.
+Footage packets contain the footage scaffold, analysis brief, coverage summary,
+output/refinement contracts, and every current adaptive or refinement frame with
+clip, timestamp, sample-group/window, origin, and evidence-path labels. The
+embedded manifest and `request.json.route.portable_packet_manifest` bind each
+packet to the current request ID, handoff revision, source hashes, and packet
+hash. The PDF is a portable view; canonical truth remains in the Moon artifacts,
+`request.json`, and `.moon/agent-state.json`.
 
 ```json
 {
@@ -271,6 +276,6 @@ Moon never chooses a footage match, invents timestamps, silently switches render
 
 The `footage` stage now seeds deterministic full-clip frame coverage before asking an external vision agent for semantic segmentation. The default target is roughly one measured frame every 4 seconds, bounded to 120 initial frames per clip and chunked into FFmpeg sampling groups of at most 24 frames.
 
-This is evidence generation only; Moon still does not decide what an action means or where a semantic action starts. The external agent scans coarse coverage, requests denser `moon.frames.sample` windows around suspected action/interaction changes, and submits measured action segments. Registered sampled frames are automatically merged into the `footage_profile_builder` evidence catalog on the enrichment pass, so those refined timestamps can become canonical segment boundaries.
+This is evidence generation only; Moon still does not decide what an action means or where a semantic action starts. Gemini scans the portable coarse coverage. If a boundary remains ambiguous, it returns a strict `footage_refinement_request` with measured `clip_id`, `start_seconds`, `end_seconds`, and `reason` values. GPT records `REQUEST_REFINEMENT`; Moon—not Gemini—runs the deterministic sampler, appends the new measured frames, advances the handoff revision, and republishes a fresh route and packet for `RECHECK_TARGETS`. Registered sampled frames are automatically merged into the `footage_profile_builder` evidence catalog on the enrichment pass, so those refined timestamps can become canonical segment boundaries.
 
 The quality goal is to avoid the failure mode where a long single-take clip with few hard scene cuts is reduced to a handful of 60–90 second semantic segments, which later forces extreme speed-up and source reuse during matching/rendering.

@@ -19,6 +19,8 @@ from moon.drive_bridge import (
 )
 from moon.runner.pipeline import PipelineRunner
 from moon.execution import StageExecutionService
+from moon.evidence import SampledFrameEvidenceStore
+from moon.footage_evidence import FootageEvidencePlanner
 from moon.handoff import AgentHandoffService
 from schemas.artifacts import load_schema
 import jsonschema
@@ -523,6 +525,7 @@ def test_cli_bridge_publish_uses_project_positional_argument(tmp_path: Path, cap
     assert output["request"]["stage"] == "footage"
     remote = tmp_path / "drive" / "MON_EDIT" / "jobs" / "job-123" / "AGENT"
     assert (remote / "request.json").is_file()
+    assert (remote / "gemini_handoff.pdf").is_file()
     assert all(path.suffix.lower() != ".mp4" for path in remote.rglob("*"))
 
 
@@ -864,11 +867,340 @@ def test_analyze_visual_packet_rebuild_is_deterministic_for_same_request(
     assert result["request"]["route"]["portable_packet_manifest"] == original_manifest
 
 
-def test_non_analyze_publish_does_not_create_or_publish_gemini_packet(tmp_path: Path):
-    bridge, transport, _ = bridge_at(tmp_path)
+def test_nonvisual_publish_does_not_create_or_publish_gemini_packet(tmp_path: Path):
+    runner = PipelineRunner(MoonProject.open(tmp_path / "project", create=True))
+    assert StageExecutionService(runner).run()["status"] == "awaiting_agent"
+    transport = MemoryTransport()
+    bridge = MoonDriveBridge(
+        runner,
+        DriveBridgeConfig(
+            project_id="nonvisual", transport="local_sync", sync_root=tmp_path / "drive"
+        ),
+        transport=transport,
+    )
 
-    request = bridge.publish("footage")["request"]
+    request = bridge.publish("proposal")["request"]
 
     assert "portable_packet" not in request["route"]
     assert not (bridge.agent_dir / "gemini_handoff.pdf").exists()
     assert "gemini_handoff.pdf" not in transport.published
+
+
+def footage_packet_bridge_at(
+    tmp_path: Path,
+) -> tuple[MoonDriveBridge, MemoryTransport, PipelineRunner]:
+    from PIL import Image
+
+    project = tmp_path / "project"
+    runner = PipelineRunner(MoonProject.open(project, create=True))
+    runner.complete("proposal", {"test": True})
+    runner.complete("analyze", {"test": True})
+    source = project / "footage" / "oneshot.mp4"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"source video must not be transported")
+    scaffold = {
+        "clips": [
+            {
+                "clip_id": "clip_001",
+                "path": "footage/oneshot.mp4",
+                "duration_seconds": 12.0,
+                "segments": [],
+            }
+        ]
+    }
+    runner.artifacts.write("footage_profiles_scaffold", scaffold)
+    frame_root = project / ".moon" / "cache" / "fixture-frames"
+    frame_root.mkdir(parents=True, exist_ok=True)
+    frames = []
+    for index, timestamp in enumerate((0.0, 6.0, 12.0)):
+        path = frame_root / f"coarse-{index}.jpg"
+        Image.new("RGB", (640, 360), (40 + index * 60, 90, 150)).save(
+            path, format="JPEG", quality=95
+        )
+        frames.append({"timestamp_seconds": timestamp, "path": str(path)})
+    store = SampledFrameEvidenceStore(runner.project, runner.state.revision)
+    group_id = store.group_id(
+        "footage", source, start_seconds=0.0, end_seconds=12.0, count=3, width=320
+    )
+    store.register(
+        "footage",
+        {
+            "source": str(source),
+            "start_seconds": 0.0,
+            "end_seconds": 12.0,
+            "count": 3,
+            "width": 320,
+            "frames": frames,
+        },
+        group_id=group_id,
+        clip_id="clip_001",
+    )
+    planner = FootageEvidencePlanner(runner.project, runner.state.revision)
+    runner.artifacts.write(
+        "footage_evidence_catalog",
+        {
+            "version": "1.0",
+            "entries": planner.evidence_catalog(scaffold),
+            "coverage": planner.coverage_summary(scaffold),
+            "policy": "adaptive_uniform_seed_v1",
+        },
+    )
+    analysis = project / "analysis" / "footage"
+    analysis.mkdir(parents=True, exist_ok=True)
+    (analysis / "video_analysis_brief.json").write_text(
+        json.dumps({"clip_id": "clip_001", "duration_seconds": 12.0}),
+        encoding="utf-8",
+    )
+    runner.artifacts.write(
+        "footage_agent_task",
+        {
+            "stage": "footage",
+            "revision": runner.state.revision,
+            "decision_owner": "external_agent",
+            "required_output_artifact": "footage_semantic_enrichment",
+            "evidence_root": str(analysis),
+            "sampling": {
+                "policy": "adaptive_uniform_seed_v1",
+                "coverage": planner.coverage_summary(scaffold),
+            },
+            "instruction": "Review every adaptive frame coarse-to-fine.",
+        },
+    )
+    transport = MemoryTransport()
+    bridge = MoonDriveBridge(
+        runner,
+        DriveBridgeConfig(
+            project_id="footage-packet",
+            transport="local_sync",
+            sync_root=tmp_path / "drive",
+        ),
+        transport=transport,
+        resume=lambda: {"status": "resumed"},
+    )
+    return bridge, transport, runner
+
+
+def footage_refinement_response(
+    request: dict, *, revision: int | None = None
+) -> bytes:
+    route_revision = request["route"]["revision"] if revision is None else revision
+    response = json.loads(completed_response(request))
+    response["revision"] = route_revision
+    response["payload"] = {
+        "artifact": "footage_refinement_request",
+        "requests": [
+            {
+                "clip_id": "clip_001",
+                "start_seconds": 4.0,
+                "end_seconds": 5.0,
+                "reason": "The hand-to-object contact boundary is ambiguous.",
+            }
+        ],
+    }
+    response["review"] = {
+        "actor": "gpt",
+        "decision": "REQUEST_REFINEMENT",
+        "revision": route_revision,
+    }
+    return json.dumps(response).encode("utf-8")
+
+
+def footage_approval_response(request: dict) -> bytes:
+    response = json.loads(completed_response(request))
+    response["revision"] = request["route"]["revision"]
+    response["payload"] = {
+        "clips": [
+            {
+                "clip_id": "clip_001",
+                "path": "footage/oneshot.mp4",
+                "usable": True,
+                "segments": [
+                    {
+                        "id": "clip_001_seg_001",
+                        "source_in": 0.0,
+                        "source_out": 12.0,
+                        "boundary_basis": ["clip_bounds"],
+                        "evidence": {"frame_timestamps": [0.0, 6.0, 12.0]},
+                        "semantic": {"action": "measured action"},
+                        "camera": {"shot": "measured"},
+                        "spatial": {},
+                        "motion": {},
+                        "quality": {},
+                        "confidence": 0.9,
+                    }
+                ],
+            }
+        ]
+    }
+    response["review"] = {
+        "actor": "gpt",
+        "decision": "APPROVED",
+        "revision": request["route"]["revision"],
+    }
+    return json.dumps(response).encode("utf-8")
+
+
+def test_footage_packet_contains_all_coarse_frames_and_request_binding(tmp_path: Path):
+    bridge, transport, _ = footage_packet_bridge_at(tmp_path)
+
+    request = bridge.publish("footage")["request"]
+    packet = (bridge.agent_dir / "gemini_handoff.pdf").read_bytes()
+    frames = [item for item in request["evidence"] if item.get("role") == "sampled_frame"]
+    manifest = request["route"]["portable_packet_manifest"]
+
+    assert request["route"]["status"] == "WAITING_GEMINI"
+    assert request["route"]["next_action"] == "REVIEW_GEMINI_FOOTAGE"
+    assert request["route"]["portable_packet"] == "gemini_handoff.pdf"
+    assert "gemini_handoff.pdf" in transport.published
+    assert all(not path.lower().endswith((".mp4", ".wav")) for path in transport.published)
+    assert manifest["request_id"] == request["request_id"]
+    assert manifest["revision"] == request["route"]["revision"] == 0
+    assert manifest["stage"] == "footage"
+    assert manifest["frame_count"] == len(frames) == 3
+    jsonschema.validate(
+        json.loads(footage_refinement_response(request)),
+        request["expected_response_schema"],
+    )
+    assert manifest["manifest_sha256"].encode("ascii") in packet
+    assert f'request_id={request["request_id"]}'.encode("ascii") in packet
+    for frame in frames:
+        assert frame["clip_id"] == "clip_001"
+        assert frame["group_id"]
+        assert frame["window_start_seconds"] == 0.0
+        assert frame["window_end_seconds"] == 12.0
+        assert frame["origin"] == "ffmpeg_single_frame_seek_v1"
+        assert frame["path"].encode("ascii") in packet
+        assert frame["sha256"].encode("ascii") in packet
+
+
+def test_footage_packet_is_deterministic_for_unchanged_request(tmp_path: Path):
+    bridge, _, _ = footage_packet_bridge_at(tmp_path)
+    request = bridge.publish("footage")["request"]
+    packet_path = bridge.agent_dir / "gemini_handoff.pdf"
+    original = packet_path.read_bytes()
+    original_manifest = request["route"]["portable_packet_manifest"]
+    packet_path.unlink()
+
+    result = bridge.publish("footage")
+
+    assert result["idempotent"] is True
+    assert packet_path.read_bytes() == original
+    assert result["request"]["route"]["portable_packet_manifest"] == original_manifest
+
+
+def test_invalid_gemini_footage_refinement_request_is_rejected(tmp_path: Path):
+    bridge, transport, runner = footage_packet_bridge_at(tmp_path)
+    request = bridge.publish("footage")["request"]
+    response = json.loads(footage_refinement_response(request))
+    response["payload"]["requests"][0]["unexpected"] = "unsafe"
+    transport.response = json.dumps(response).encode("utf-8")
+
+    with pytest.raises(BridgeResponseError, match="invalid footage_refinement_request"):
+        bridge.poll_once()
+
+    assert runner.state.revision == 0
+    assert request == json.loads(bridge.request_path.read_text(encoding="utf-8"))
+
+
+def test_moon_samples_refinement_and_regenerates_fresh_footage_packet(
+    tmp_path: Path, monkeypatch
+):
+    from PIL import Image
+
+    bridge, transport, runner = footage_packet_bridge_at(tmp_path)
+    request = bridge.publish("footage")["request"]
+    original_packet = (bridge.agent_dir / "gemini_handoff.pdf").read_bytes()
+    calls: list[dict] = []
+
+    def fake_sample(source, output_dir, *, start_seconds, end_seconds, count, width):
+        calls.append(
+            {
+                "source": source,
+                "start_seconds": start_seconds,
+                "end_seconds": end_seconds,
+                "count": count,
+                "width": width,
+            }
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        frames = []
+        for index in range(count):
+            timestamp = start_seconds + (end_seconds - start_seconds) * index / (count - 1)
+            path = output_dir / f"refined-{index:02d}.jpg"
+            Image.new("RGB", (width, 360), (120, 40 + index, 80)).save(path, "JPEG")
+            frames.append({"timestamp_seconds": timestamp, "path": str(path)})
+        return {
+            "source": str(source),
+            "start_seconds": start_seconds,
+            "end_seconds": end_seconds,
+            "count": count,
+            "width": width,
+            "frames": frames,
+        }
+
+    monkeypatch.setattr("moon.footage_refinement.sample_frames", fake_sample)
+    transport.response = footage_refinement_response(request)
+
+    result = bridge.poll_once()
+    revised = json.loads(bridge.request_path.read_text(encoding="utf-8"))
+    revised_packet = (bridge.agent_dir / "gemini_handoff.pdf").read_bytes()
+    frames = [item for item in revised["evidence"] if item.get("role") == "sampled_frame"]
+
+    assert result["status"] == "WAITING_GEMINI"
+    assert result["next_action"] == "RECHECK_TARGETS"
+    assert result["revision"] == 1
+    assert len(calls) == 1
+    assert calls[0]["start_seconds"] == 4.0
+    assert calls[0]["end_seconds"] == 5.0
+    assert calls[0]["count"] == 9
+    assert calls[0]["width"] == 640
+    assert revised["request_id"] == request["request_id"]
+    assert revised["route"]["revision"] == revised["task"]["revision"] == 1
+    assert revised["created_at"] != request["created_at"]
+    assert json.loads(runner.project.agent_state_path.read_text(encoding="utf-8")) == revised["route"]
+    assert revised["route"]["portable_packet_manifest"]["revision"] == 1
+    assert revised["route"]["portable_packet_manifest"]["frame_count"] == 12
+    assert len(frames) == 12
+    assert revised_packet != original_packet
+    assert b"revision=1" in revised_packet
+    assert "revision=1" in revised["route"]["completion_contract"]["terminal_acknowledgement"]
+    assert transport.response is None
+    assert not runner.artifacts.exists("footage_semantic_enrichment")
+    assert [item["status"] for item in revised["route"]["transition_history"]][-5:] == [
+        "GEMINI_FOOTAGE_DONE",
+        "WAITING_GPT",
+        "REQUEST_REFINEMENT",
+        "RECHECK_TARGETS",
+        "WAITING_GEMINI",
+    ]
+
+    stale = footage_refinement_response(revised, revision=0)
+    transport.response = stale
+    with pytest.raises(BridgeResponseError, match="revision does not match"):
+        bridge.poll_once()
+    assert json.loads(bridge.request_path.read_text(encoding="utf-8")) == revised
+
+    transport.response = footage_approval_response(revised)
+    consumed = bridge.poll_once()
+    assert consumed["status"] == "CONSUMED"
+    assert runner.artifacts.read("footage_semantic_enrichment")["clips"][0]["clip_id"] == "clip_001"
+
+
+def test_expired_footage_request_regenerates_packet_with_fresh_identity(tmp_path: Path):
+    bridge, transport, _ = footage_packet_bridge_at(tmp_path)
+    stale = bridge.publish("footage")["request"]
+    stale_packet = (bridge.agent_dir / "gemini_handoff.pdf").read_bytes()
+    transport.response = footage_refinement_response(stale)
+    expire_active_request(bridge, stale)
+
+    fresh = bridge.publish("footage")["request"]
+    fresh_packet = (bridge.agent_dir / "gemini_handoff.pdf").read_bytes()
+
+    assert fresh["request_id"] != stale["request_id"]
+    assert fresh["route"]["request_id"] == fresh["request_id"]
+    assert fresh["route"]["revision"] == stale["route"]["revision"]
+    assert fresh["route"]["portable_packet_manifest"]["request_id"] == fresh["request_id"]
+    assert fresh_packet != stale_packet
+    assert fresh["request_id"].encode("ascii") in fresh_packet
+    assert stale["request_id"].encode("ascii") not in fresh_packet
+    assert transport.response is None

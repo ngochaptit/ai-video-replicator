@@ -59,7 +59,7 @@ def _pdf_literal(value: str) -> bytes:
 
 
 class GeminiHandoffPacketBuilder:
-    """Build one visual, request-scoped analyze packet from canonical inputs."""
+    """Build one visual, request-scoped packet from canonical Moon inputs."""
 
     def __init__(self, agent_dir: Path) -> None:
         self.agent_dir = agent_dir.resolve()
@@ -74,11 +74,17 @@ class GeminiHandoffPacketBuilder:
         route: dict[str, Any],
         output_path: Path,
     ) -> dict[str, Any]:
-        if request.get("stage") != "analyze":
-            raise ValueError("Gemini visual handoff packets are analyze-only")
+        stage = str(request.get("stage") or "")
+        if stage not in {"analyze", "footage"}:
+            raise ValueError("Gemini visual handoff packets require analyze or footage")
         artifacts, frames = self._load_inputs(request)
-        scaffold = artifacts.get("reference_blueprint_scaffold") or {}
-        frame_manifest = self._frame_manifest(frames, scaffold)
+        scaffold_name = (
+            "reference_blueprint_scaffold"
+            if stage == "analyze"
+            else "footage_profiles_scaffold"
+        )
+        scaffold = artifacts.get(scaffold_name) or {}
+        frame_manifest = self._frame_manifest(frames, scaffold, stage=stage)
         source_manifest = [
             {
                 "artifact": name,
@@ -105,19 +111,54 @@ class GeminiHandoffPacketBuilder:
 
         pages: list[tuple[bytes, int, int]] = []
         pages.extend(self._route_pages(request, route, manifest_hash))
-        pages.extend(
-            self._json_pages(
-                "Proposal packet",
-                artifacts.get("proposal_packet", {}).get("content"),
+        if stage == "analyze":
+            pages.extend(
+                self._json_pages(
+                    "Proposal packet",
+                    artifacts.get("proposal_packet", {}).get("content"),
+                )
             )
-        )
-        pages.extend(
-            self._json_pages(
-                "Video analysis brief",
-                artifacts.get("video_analysis_brief", {}).get("content"),
+            pages.extend(
+                self._json_pages(
+                    "Video analysis brief",
+                    artifacts.get("video_analysis_brief", {}).get("content"),
+                )
             )
-        )
-        pages.extend(self._scaffold_pages(scaffold.get("content") or {}))
+            pages.extend(self._scaffold_pages(scaffold.get("content") or {}))
+        else:
+            pages.extend(
+                self._json_pages(
+                    "Footage profiles scaffold",
+                    scaffold.get("content"),
+                )
+            )
+            pages.extend(
+                self._json_pages(
+                    "Sampling coverage summary",
+                    artifacts.get("footage_evidence_catalog", {}).get("content"),
+                )
+            )
+            for name, value in sorted(artifacts.items()):
+                if name.startswith("footage_brief:"):
+                    pages.extend(
+                        self._json_pages(
+                            f"Footage / video analysis brief: {value['path']}",
+                            value["content"],
+                        )
+                    )
+            pages.extend(
+                self._text_pages(
+                    "Coarse-to-fine review instructions",
+                    "Review every coarse sampled frame before making semantic decisions. "
+                    "Use only measured timestamps and in-range frame evidence. If an action "
+                    "or interaction boundary remains ambiguous, return the strict "
+                    "footage_refinement_request described in the response schema. Do not "
+                    "execute Moon or local commands. Moon will sample the requested narrower "
+                    "windows and publish a fresh request revision and packet. On a recheck, "
+                    "inspect the requested windows and their added frames before returning a "
+                    "complete footage_semantic_enrichment.",
+                )
+            )
         for frame, labels in zip(frames, frame_manifest, strict=True):
             pages.append(self._frame_page(frame["absolute_path"], labels))
         pages.extend(
@@ -134,7 +175,7 @@ class GeminiHandoffPacketBuilder:
             title=f"Moon Gemini handoff {request['job_id']}",
             subject=(
                 f"job_id={request['job_id']} request_id={request['request_id']} "
-                f"stage=analyze revision={route['revision']} manifest_sha256={manifest_hash}"
+                f"stage={stage} revision={route['revision']} manifest_sha256={manifest_hash}"
             ),
             created_at=created_at,
         )
@@ -147,7 +188,7 @@ class GeminiHandoffPacketBuilder:
             "path": output_path.name,
             "job_id": request["job_id"],
             "request_id": request["request_id"],
-            "stage": "analyze",
+            "stage": stage,
             "revision": route["revision"],
             "manifest_sha256": manifest_hash,
             "sha256": _sha256_bytes(pdf),
@@ -175,6 +216,8 @@ class GeminiHandoffPacketBuilder:
                 "proposal_packet",
                 "video_analysis_brief",
                 "reference_blueprint_scaffold",
+                "footage_profiles_scaffold",
+                "footage_evidence_catalog",
             }:
                 content = json.loads(path.read_text(encoding="utf-8"))
                 artifacts[str(artifact)] = {
@@ -182,19 +225,53 @@ class GeminiHandoffPacketBuilder:
                     "sha256": descriptor["sha256"],
                     "content": content,
                 }
-            if descriptor.get("role") == "reference_frame":
+            if (
+                request.get("stage") == "footage"
+                and descriptor.get("role") == "stage_evidence"
+                and path.suffix.lower() == ".json"
+            ):
+                artifacts[f"footage_brief:{relative}"] = {
+                    "path": relative,
+                    "sha256": descriptor["sha256"],
+                    "content": json.loads(path.read_text(encoding="utf-8")),
+                }
+            expected_role = (
+                "reference_frame"
+                if request.get("stage") == "analyze"
+                else "sampled_frame"
+            )
+            if descriptor.get("role") == expected_role:
                 frames.append({**descriptor, "absolute_path": path})
         frames.sort(
             key=lambda item: (
-                float(item.get("timestamp_seconds", 0.0)), str(item.get("path") or "")
+                str(item.get("clip_id") or ""),
+                float(item.get("timestamp_seconds", 0.0)),
+                str(item.get("group_id") or ""),
+                str(item.get("path") or ""),
             )
         )
         return artifacts, frames
 
     @staticmethod
     def _frame_manifest(
-        frames: list[dict[str, Any]], scaffold: dict[str, Any]
+        frames: list[dict[str, Any]], scaffold: dict[str, Any], *, stage: str
     ) -> list[dict[str, Any]]:
+        if stage == "footage":
+            return [
+                {
+                    "path": frame["path"],
+                    "sha256": frame["sha256"],
+                    "clip_id": frame.get("clip_id"),
+                    "timestamp_seconds": float(frame["timestamp_seconds"]),
+                    "sample_group": frame.get("group_id"),
+                    "window": {
+                        "start_seconds": frame.get("window_start_seconds"),
+                        "end_seconds": frame.get("window_end_seconds"),
+                    },
+                    "origin": frame.get("origin"),
+                }
+                for frame in frames
+            ]
         segments = (scaffold.get("content") or {}).get("segments") or []
         result = []
         for frame in frames:
@@ -230,7 +307,7 @@ class GeminiHandoffPacketBuilder:
             [
                 f"job_id: {request['job_id']}",
                 f"request_id: {request['request_id']}",
-                "stage: analyze",
+                f"stage: {request['stage']}",
                 f"revision: {route['revision']}",
                 f"current_actor: {route['current_actor']}",
                 f"next_actor: {route['next_actor']}",
@@ -332,22 +409,37 @@ class GeminiHandoffPacketBuilder:
     ) -> tuple[bytes, int, int]:
         page = Image.new("RGB", PAGE_SIZE, "white")
         draw = ImageDraw.Draw(page)
-        segments = labels.get("associated_segments") or []
-        segment_label = ", ".join(
-            f"{item['segment_id']} [{item['start_seconds']}, {item['end_seconds']}]"
-            for item in segments
-        ) or "none"
-        label_lines = [
-            f"timestamp_seconds: {labels['timestamp_seconds']}",
-            f"origin: {labels.get('origin')}",
-            f"associated segment/window: {segment_label}",
-            f"source evidence: {labels['path']}",
-            f"sha256: {labels['sha256']}",
-        ]
+        if labels.get("clip_id") is not None:
+            window = labels.get("window") or {}
+            label_lines = [
+                f"clip_id: {labels.get('clip_id')}",
+                f"timestamp_seconds: {labels['timestamp_seconds']}",
+                f"sample group: {labels.get('sample_group')}",
+                "sample window: "
+                f"[{window.get('start_seconds')}, {window.get('end_seconds')}]",
+                f"origin: {labels.get('origin')}",
+                f"measured evidence path/reference: {labels['path']}",
+                f"sha256: {labels['sha256']}",
+            ]
+            frame_title = "Measured footage frame"
+        else:
+            segments = labels.get("associated_segments") or []
+            segment_label = ", ".join(
+                f"{item['segment_id']} [{item['start_seconds']}, {item['end_seconds']}]"
+                for item in segments
+            ) or "none"
+            label_lines = [
+                f"timestamp_seconds: {labels['timestamp_seconds']}",
+                f"origin: {labels.get('origin')}",
+                f"associated segment/window: {segment_label}",
+                f"source evidence: {labels['path']}",
+                f"sha256: {labels['sha256']}",
+            ]
+            frame_title = "Measured reference frame"
         y = PAGE_MARGIN
         draw.text(
             (PAGE_MARGIN, y),
-            "Measured reference frame",
+            frame_title,
             font=self.title_font,
             fill="#111111",
         )

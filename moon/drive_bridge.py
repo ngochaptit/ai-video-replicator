@@ -18,6 +18,11 @@ from typing import Any, Protocol
 
 from moon.agent_bridge import AgentBridgeService
 from moon.agent_state import AgentStateStore, transition, utc_now
+from moon.evidence import SampledFrameEvidenceStore
+from moon.footage_refinement import (
+    FOOTAGE_REFINEMENT_REQUEST_SCHEMA,
+    FootageRefinementService,
+)
 from moon.gemini_handoff import GeminiHandoffPacketBuilder
 from moon.handoff import AgentHandoffService
 from moon.runner.pipeline import PipelineRunner
@@ -592,7 +597,9 @@ class MoonDriveBridge:
             "expires_at": _iso(expires),
             "task": self._compact_task(handoff["task"]),
             "evidence": [descriptor for _, _, descriptor in evidence],
-            "expected_response_schema": self._response_schema(handoff["output_contract"]),
+            "expected_response_schema": self._response_schema(
+                handoff["output_contract"], stage=stage
+            ),
         }
         preserved_revision = self.runner.state.revision
         if refreshing_pending:
@@ -674,8 +681,14 @@ class MoonDriveBridge:
             self._validate_analyze_review(review, active)
             if review["decision"] == "REVISION_REQUIRED":
                 return self._route_analyze_revision(response, raw, state, active, review)
+        if response["stage"] == "footage" and review:
+            self._validate_footage_review(response, review, active)
+            if review["decision"] == "REQUEST_REFINEMENT":
+                return self._route_footage_refinement(
+                    response, raw, state, active
+                )
         routing_review = review
-        if response["stage"] == "analyze" and routing_review is None:
+        if response["stage"] in {"analyze", "footage"} and routing_review is None:
             # Responses produced before the routed protocol remain consumable.
             # Record the implied GPT approval so the durable state machine is complete.
             routing_review = {
@@ -895,6 +908,93 @@ class MoonDriveBridge:
                 state, "WAITING_GEMINI", current_actor="gemini", next_actor="gpt",
                 next_action="REVIEW_GEMINI_ANALYSIS",
             )
+        if stage == "footage":
+            completed_ack = self._acknowledgement(
+                request, actor="gemini", decision="COMPLETED", output=artifact,
+                next_actor="gpt", next_action="REVIEW_GEMINI_FOOTAGE",
+                revision=revision,
+            )
+            refinement_ack = self._acknowledgement(
+                request, actor="gemini", decision="REQUEST_REFINEMENT",
+                output="footage_refinement_request", next_actor="gpt",
+                next_action="REVIEW_GEMINI_FOOTAGE", revision=revision,
+            )
+            state = {
+                "version": "1.0",
+                "job_id": request["job_id"],
+                "stage": stage,
+                "revision": revision,
+                "request_id": request["request_id"],
+                "status": "MOON_PREPARE",
+                "current_actor": "moon",
+                "next_actor": "gemini",
+                "next_action": "ANALYZE_FOOTAGE_EVIDENCE",
+                "task": instruction,
+                "required_inputs": required_inputs,
+                "expected_output": {
+                    "artifact": artifact,
+                    "alternate_artifact": "footage_refinement_request",
+                    "delivery": "Return one complete artifact in chat; do not write raw JSON to Drive.",
+                    "schema_ref": "request.json.expected_response_schema.properties.payload",
+                },
+                "completion_contract": {
+                    "terminal_acknowledgement": completed_ack,
+                    "gemini_return": {
+                        "required": [
+                            "footage_semantic_enrichment or footage_refinement_request",
+                            "terminal_acknowledgement",
+                        ],
+                        "acknowledgements": {
+                            "COMPLETED": completed_ack,
+                            "REQUEST_REFINEMENT": refinement_ack,
+                        },
+                        "handoff": "Give the complete Gemini result and acknowledgement to GPT.",
+                    },
+                    "gpt_review": {
+                        "input": "The pasted Gemini result plus this request and evidence.",
+                        "output_file": "response.json",
+                        "decisions": ["APPROVED", "REQUEST_REFINEMENT"],
+                        "acknowledgements": {
+                            "APPROVED": self._acknowledgement(
+                                request, actor="gpt", decision="APPROVED",
+                                output="response.json", next_actor="moon",
+                                next_action="CONSUME_RESPONSE", revision=revision,
+                            ),
+                            "REQUEST_REFINEMENT": self._acknowledgement(
+                                request, actor="gpt", decision="REQUEST_REFINEMENT",
+                                output="footage_refinement_request", next_actor="moon",
+                                next_action="REQUEST_REFINEMENT", revision=revision,
+                            ),
+                        },
+                    },
+                    "on_approval": {
+                        "next_actor": "moon",
+                        "next_action": "CONSUME_RESPONSE",
+                    },
+                    "on_refinement": {
+                        "next_actor": "moon",
+                        "next_action": "REQUEST_REFINEMENT",
+                        "required_metadata": [
+                            "clip_id", "start_seconds", "end_seconds", "reason"
+                        ],
+                    },
+                },
+                "actor_instructions": {
+                    "gemini": "Read every required input and review all sampled frames coarse-to-fine. Never execute Moon or local commands. If a boundary is ambiguous, return the strict footage_refinement_request so Moon can sample narrower windows. Otherwise return complete footage_semantic_enrichment. End with the matching exact acknowledgement. If direct Drive reading is unavailable, ask the user to upload only gemini_handoff.pdf.",
+                    "gpt": "Review the pasted Gemini result against the request and evidence. Write response.json with review.decision APPROVED for a complete valid enrichment, or REQUEST_REFINEMENT with the strict footage_refinement_request payload. Never ask Gemini to execute local sampling commands.",
+                },
+                "portable_packet": "gemini_handoff.pdf",
+                "updated_at": utc_now(),
+                "transition_history": [],
+            }
+            state = transition(
+                state, "MOON_PREPARE", current_actor="moon", next_actor="gemini",
+                next_action="ANALYZE_FOOTAGE_EVIDENCE",
+            )
+            return transition(
+                state, "WAITING_GEMINI", current_actor="gemini", next_actor="gpt",
+                next_action="REVIEW_GEMINI_FOOTAGE",
+            )
         ack = self._acknowledgement(
             request, actor="gpt", decision="COMPLETED", output=artifact,
             next_actor="moon", next_action="CONSUME_RESPONSE", revision=revision,
@@ -986,6 +1086,184 @@ class MoonDriveBridge:
                     raise BridgeResponseError(
                         f"revision target segment_id {segment_id!r} is not in the active analyze scaffold"
                     )
+
+    def _validate_footage_review(
+        self,
+        response: dict[str, Any],
+        review: dict[str, Any],
+        active: dict[str, Any],
+    ) -> None:
+        allowed = {"actor", "decision", "revision", "gemini_acknowledgement"}
+        unknown = sorted(set(review) - allowed)
+        if unknown:
+            raise BridgeResponseError(
+                f"footage review contains unsupported fields: {', '.join(unknown)}"
+            )
+        if review.get("actor", "gpt") != "gpt":
+            raise BridgeResponseError("footage review actor must be gpt")
+        if review.get("decision") not in {"APPROVED", "REQUEST_REFINEMENT"}:
+            raise BridgeResponseError(
+                "footage review decision must be APPROVED or REQUEST_REFINEMENT"
+            )
+        revision = review.get(
+            "revision", active.get("revision", self.runner.state.revision)
+        )
+        if isinstance(revision, bool) or not isinstance(revision, int):
+            raise BridgeResponseError("footage review revision must be an integer")
+        if revision != int(active.get("revision", self.runner.state.revision)):
+            raise BridgeResponseError(
+                "footage review revision does not match active request"
+            )
+        if review["decision"] == "REQUEST_REFINEMENT":
+            try:
+                FootageRefinementService(self.runner).validate(response["payload"])
+            except (OSError, ValueError) as exc:
+                raise BridgeResponseError(str(exc)) from exc
+        elif response["payload"].get("artifact") == "footage_refinement_request":
+            raise BridgeResponseError(
+                "footage_refinement_request requires review.decision=REQUEST_REFINEMENT"
+            )
+
+    def _route_footage_refinement(
+        self,
+        response: dict[str, Any],
+        raw: bytes,
+        bridge_state: dict[str, Any],
+        active: dict[str, Any],
+    ) -> dict[str, Any]:
+        request = self._read_json(self.request_path)
+        route = self._ensure_agent_state(bridge_state, request) or request["route"]
+        old_revision = int(route.get("revision", 0))
+        route = transition(
+            route,
+            "GEMINI_FOOTAGE_RECHECK_DONE" if old_revision else "GEMINI_FOOTAGE_DONE",
+            current_actor="gemini",
+            next_actor="gpt",
+            next_action="REVIEW_GEMINI_FOOTAGE",
+        )
+        route = transition(
+            route, "WAITING_GPT", current_actor="gpt", next_actor="moon",
+            next_action="REQUEST_REFINEMENT",
+        )
+        route = transition(
+            route, "REQUEST_REFINEMENT", current_actor="gpt", next_actor="moon",
+            next_action="REQUEST_REFINEMENT",
+        )
+        service = FootageRefinementService(self.runner)
+        try:
+            targets = service.validate(response["payload"])
+            new_revision = old_revision + 1
+            sampling = service.sample(targets, handoff_revision=new_revision)
+        except (OSError, ValueError) as exc:
+            raise BridgeResponseError(f"could not satisfy footage refinement: {exc}") from exc
+
+        handoff = AgentHandoffService(self.runner).package("footage")
+        evidence = self._stage_evidence(response["request_id"], handoff)
+        route["revision"] = new_revision
+        route["refinement_targets"] = targets
+        route["refinement_sampling"] = sampling
+        route["required_inputs"] = [relative for _, relative, _ in evidence]
+        route["task"] = (
+            "Recheck only the listed footage refinement targets using their newly "
+            "sampled measured frames. Return another footage_refinement_request only "
+            "if a listed boundary remains ambiguous; otherwise return a complete "
+            "footage_semantic_enrichment. Never execute Moon or local commands."
+        )
+        route["completion_contract"] = dict(route["completion_contract"])
+        completed_ack = self._acknowledgement(
+            request, actor="gemini", decision="RECHECK_COMPLETED",
+            output=str(route["expected_output"]["artifact"]), next_actor="gpt",
+            next_action="REVIEW_GEMINI_FOOTAGE", revision=new_revision,
+        )
+        refinement_ack = self._acknowledgement(
+            request, actor="gemini", decision="REQUEST_REFINEMENT",
+            output="footage_refinement_request", next_actor="gpt",
+            next_action="REVIEW_GEMINI_FOOTAGE", revision=new_revision,
+        )
+        route["completion_contract"]["terminal_acknowledgement"] = completed_ack
+        gemini_return = dict(
+            route["completion_contract"].get("gemini_return") or {}
+        )
+        gemini_return["acknowledgements"] = {
+            "COMPLETED": completed_ack,
+            "REQUEST_REFINEMENT": refinement_ack,
+        }
+        route["completion_contract"]["gemini_return"] = gemini_return
+        gpt_review = dict(route["completion_contract"].get("gpt_review") or {})
+        gpt_review["acknowledgements"] = {
+            "APPROVED": self._acknowledgement(
+                request, actor="gpt", decision="APPROVED", output="response.json",
+                next_actor="moon", next_action="CONSUME_RESPONSE",
+                revision=new_revision,
+            ),
+            "REQUEST_REFINEMENT": self._acknowledgement(
+                request, actor="gpt", decision="REQUEST_REFINEMENT",
+                output="footage_refinement_request", next_actor="moon",
+                next_action="REQUEST_REFINEMENT", revision=new_revision,
+            ),
+        }
+        route["completion_contract"]["gpt_review"] = gpt_review
+        route = transition(
+            route, "RECHECK_TARGETS", current_actor="moon", next_actor="gemini",
+            next_action="RECHECK_TARGETS",
+        )
+        route = transition(
+            route, "WAITING_GEMINI", current_actor="gemini", next_actor="gpt",
+            next_action="REVIEW_GEMINI_FOOTAGE",
+        )
+        now = _utc_now()
+        request.update(
+            status="WAITING_AGENT",
+            route=route,
+            evidence=[descriptor for _, _, descriptor in evidence],
+            updated_at=_iso(now),
+            created_at=_iso(now),
+            expires_at=_iso(
+                now + timedelta(seconds=self.config.stale_after_seconds)
+            ),
+        )
+        if isinstance(request.get("task"), dict):
+            request["task"]["revision"] = new_revision
+        self._ensure_portable_packet(request)
+        archive = getattr(self.transport, "archive_response", None)
+        if callable(archive):
+            archive(response["request_id"], old_revision)
+        elif hasattr(self.transport, "response"):
+            self.transport.response = None
+        active.update(
+            status="WAITING_AGENT",
+            revision=new_revision,
+            created_at=request["created_at"],
+            expires_at=request["expires_at"],
+        )
+        reviewed = bridge_state.get("reviewed") or {}
+        reviewed[f"{response['request_id']}:r{old_revision}"] = {
+            "response_sha256": _sha256_bytes(raw),
+            "decision": "REQUEST_REFINEMENT",
+            "refinement_targets": targets,
+            "sampling": sampling,
+            "reviewed_at": _iso(now),
+        }
+        bridge_state["reviewed"] = dict(list(reviewed.items())[-100:])
+        bridge_state["active_request"] = active
+        _atomic_json(self.request_path, request)
+        self.agent_state.save(route)
+        self._write_state(bridge_state)
+        self._archive_local_review(response, old_revision)
+        remote = self.transport.publish(
+            self.request_path, self._publish_paths(request)
+        )
+        return {
+            "status": "WAITING_GEMINI",
+            "request_id": response["request_id"],
+            "stage": "footage",
+            "revision": new_revision,
+            "refinement_targets": targets,
+            "sampling": sampling,
+            "next_actor": "gemini",
+            "next_action": "RECHECK_TARGETS",
+            "remote": remote,
+        }
 
     def _route_analyze_revision(
         self,
@@ -1089,11 +1367,24 @@ class MoonDriveBridge:
         self, route_value: Any, *, review: dict[str, Any] | None
     ) -> dict[str, Any]:
         route = dict(route_value) if isinstance(route_value, dict) else {}
-        if route.get("stage") == "analyze" and review:
-            done_status = "GEMINI_RECHECK_DONE" if int(route.get("revision", 0)) else "GEMINI_DONE"
+        if route.get("stage") in {"analyze", "footage"} and review:
+            if route.get("stage") == "analyze":
+                done_status = (
+                    "GEMINI_RECHECK_DONE"
+                    if int(route.get("revision", 0))
+                    else "GEMINI_DONE"
+                )
+                review_action = "REVIEW_GEMINI_ANALYSIS"
+            else:
+                done_status = (
+                    "GEMINI_FOOTAGE_RECHECK_DONE"
+                    if int(route.get("revision", 0))
+                    else "GEMINI_FOOTAGE_DONE"
+                )
+                review_action = "REVIEW_GEMINI_FOOTAGE"
             route = transition(
                 route, done_status, current_actor="gemini", next_actor="gpt",
-                next_action="REVIEW_GEMINI_ANALYSIS",
+                next_action=review_action,
             )
             route = transition(
                 route, "WAITING_GPT", current_actor="gpt", next_actor="moon",
@@ -1215,17 +1506,18 @@ class MoonDriveBridge:
             self.transport.response = None
 
     def _ensure_portable_packet(self, request: dict[str, Any]) -> Path | None:
-        if request.get("stage") != "analyze":
+        if request.get("stage") not in {"analyze", "footage"}:
             return None
         route = request.get("route")
         if not isinstance(route, dict):
-            raise BridgeError("analyze request route is missing")
+            raise BridgeError("visual request route is missing")
         route["portable_packet"] = "gemini_handoff.pdf"
         packet_path = self.agent_dir / "gemini_handoff.pdf"
         packet = route.get("portable_packet_manifest")
         if (
             isinstance(packet, dict)
             and packet.get("request_id") == request.get("request_id")
+            and packet.get("stage") == request.get("stage")
             and packet.get("revision") == route.get("revision")
             and packet_path.is_file()
             and _sha256(packet_path) == packet.get("sha256")
@@ -1247,7 +1539,7 @@ class MoonDriveBridge:
 
     def _publish_paths(self, request: dict[str, Any]) -> list[tuple[Path, str]]:
         paths = self._evidence_paths(request)
-        if request.get("stage") != "analyze":
+        if request.get("stage") not in {"analyze", "footage"}:
             return paths
         route = request.get("route") or {}
         packet = route.get("portable_packet_manifest") or {}
@@ -1259,6 +1551,8 @@ class MoonDriveBridge:
             or not packet_path.is_file()
             or _sha256(packet_path) != packet.get("sha256")
             or packet.get("request_id") != request.get("request_id")
+            or packet.get("stage") != request.get("stage")
+            or packet.get("revision") != route.get("revision")
         ):
             raise BridgeError("Gemini handoff packet is missing, changed, or stale")
         paths.append((packet_path, relative))
@@ -1289,6 +1583,7 @@ class MoonDriveBridge:
             sampled = evidence_input.get("sampled_frames") or {}
             for group in sampled.get("groups") or []:
                 source = group.get("source") or {}
+                window = group.get("request") or {}
                 for frame in group.get("frames") or []:
                     absolute = frame.get("absolute_path")
                     if absolute:
@@ -1297,8 +1592,21 @@ class MoonDriveBridge:
                             "clip_id": source.get("clip_id"),
                             "group_id": group.get("group_id"),
                             "timestamp_seconds": frame.get("timestamp_seconds"),
+                            "window_start_seconds": window.get("start_seconds"),
+                            "window_end_seconds": window.get("end_seconds"),
+                            "origin": group.get("sampling_method"),
+                            "source_path": source.get("path"),
                         }
-            for item in evidence_input.get("files") or []:
+            evidence_files = list(evidence_input.get("files") or [])
+            evidence_files.sort(
+                key=lambda item: (
+                    0
+                    if Path(str(item)).resolve() in sampled_metadata
+                    else 1,
+                    str(item),
+                )
+            )
+            for item in evidence_files:
                 source = Path(str(item))
                 try:
                     relative = source.resolve().relative_to(self.runner.project.root.resolve())
@@ -1356,6 +1664,43 @@ class MoonDriveBridge:
                     f"max_evidence_bytes={self.config.max_evidence_bytes}; "
                     "images covering every reference window are required before publishing"
                 )
+        if handoff.get("stage") == "footage":
+            exported = SampledFrameEvidenceStore(
+                self.runner.project, self.runner.state.revision
+            ).exported("footage")
+            expected_paths = {
+                Path(str(frame["absolute_path"])).resolve()
+                for group in exported.get("groups") or []
+                for frame in group.get("frames") or []
+            }
+            expected_hashes = {_sha256(path) for path in expected_paths}
+            prepared_frames = [
+                descriptor
+                for _, _, descriptor in result
+                if descriptor.get("role") == "sampled_frame"
+            ]
+            prepared_hashes = {str(item.get("sha256")) for item in prepared_frames}
+            exported_artifacts = {item[2].get("artifact") for item in result}
+            if (
+                len(expected_paths) != len(prepared_frames)
+                or expected_hashes != prepared_hashes
+                or (
+                    expected_paths
+                    and "footage_profiles_scaffold" not in exported_artifacts
+                )
+                or (
+                    expected_paths
+                    and "footage_evidence_catalog" not in exported_artifacts
+                )
+            ):
+                raise BridgeError(
+                    "footage evidence is missing or exceeds bridge limits; "
+                    f"prepared {len(prepared_frames)} of {len(expected_paths)} sampled frames; "
+                    f"prepared artifacts={sorted(str(item) for item in exported_artifacts)}; "
+                    f"configured max_evidence_files={self.config.max_evidence_files}, "
+                    f"max_evidence_bytes={self.config.max_evidence_bytes}; all current "
+                    "adaptive and refinement frames are required before publishing"
+                )
         return result
 
     def _validate_response(self, response: dict[str, Any], active: dict[str, Any]) -> None:
@@ -1395,6 +1740,13 @@ class MoonDriveBridge:
                 raise BridgeResponseError("response revision must be an integer")
             if revision != active.get("revision", self.runner.state.revision):
                 raise BridgeResponseError("response revision does not match active request")
+        elif (
+            response.get("stage") == "footage"
+            and int(active.get("revision", self.runner.state.revision)) > 0
+        ):
+            raise BridgeResponseError(
+                "footage response revision is required after refinement"
+            )
         if "review" in response and not isinstance(response["review"], dict):
             raise BridgeResponseError("response review must be a JSON object")
         created = _parse_timestamp(response["created_at"], "created_at")
@@ -1409,8 +1761,89 @@ class MoonDriveBridge:
             raise BridgeResponseError("response is stale: active request has expired")
 
     @staticmethod
-    def _response_schema(output_contract: dict[str, Any]) -> dict[str, Any]:
-        return {
+    def _response_schema(
+        output_contract: dict[str, Any], *, stage: str | None = None
+    ) -> dict[str, Any]:
+        payload_schema = output_contract
+        decisions = ["APPROVED", "REVISION_REQUIRED"]
+        review_conditions: list[dict[str, Any]] = [{
+            "if": {"properties": {"decision": {"const": "REVISION_REQUIRED"}}},
+            "then": {
+                "required": ["revision_targets"],
+                "properties": {"revision_targets": {"minItems": 1}},
+            },
+        }]
+        root_conditions: list[dict[str, Any]] = []
+        if stage == "footage":
+            payload_schema = {
+                "type": "object",
+                "artifact": output_contract.get("artifact"),
+                "rules": output_contract.get("rules") or [],
+                "anyOf": [output_contract, FOOTAGE_REFINEMENT_REQUEST_SCHEMA],
+                "refinement_schema": FOOTAGE_REFINEMENT_REQUEST_SCHEMA,
+            }
+            decisions = ["APPROVED", "REQUEST_REFINEMENT"]
+            review_conditions = []
+            root_conditions = [
+                {
+                    "if": {
+                        "required": ["review"],
+                        "properties": {
+                            "review": {
+                                "required": ["decision"],
+                                "properties": {
+                                    "decision": {"const": "REQUEST_REFINEMENT"}
+                                },
+                            }
+                        },
+                    },
+                    "then": {
+                        "properties": {
+                            "payload": FOOTAGE_REFINEMENT_REQUEST_SCHEMA
+                        }
+                    },
+                },
+                {
+                    "if": {
+                        "required": ["review"],
+                        "properties": {
+                            "review": {
+                                "required": ["decision"],
+                                "properties": {
+                                    "decision": {"const": "APPROVED"}
+                                },
+                            }
+                        },
+                    },
+                    "then": {"properties": {"payload": output_contract}},
+                },
+            ]
+        review_schema: dict[str, Any] = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["actor", "decision", "revision"],
+            "properties": {
+                "actor": {"const": "gpt"},
+                "decision": {"enum": decisions},
+                "revision": {"type": "integer", "minimum": 0},
+                "revision_targets": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["segment_id", "reason"],
+                        "properties": {
+                            "segment_id": {"type": "string", "minLength": 1},
+                            "reason": {"type": "string", "minLength": 1},
+                        },
+                    },
+                },
+                "gemini_acknowledgement": {"type": "string", "minLength": 1},
+            },
+        }
+        if review_conditions:
+            review_schema["allOf"] = review_conditions
+        schema = {
             "type": "object",
             "additionalProperties": False,
             "required": [
@@ -1430,37 +1863,14 @@ class MoonDriveBridge:
                 "status": {"const": "COMPLETED"},
                 "created_at": {"type": "string", "format": "date-time"},
                 "updated_at": {"type": "string", "format": "date-time"},
-                "payload": output_contract,
+                "payload": payload_schema,
                 "revision": {"type": "integer", "minimum": 0},
-                "review": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["actor", "decision", "revision"],
-                    "properties": {
-                        "actor": {"const": "gpt"},
-                        "decision": {"enum": ["APPROVED", "REVISION_REQUIRED"]},
-                        "revision": {"type": "integer", "minimum": 0},
-                        "revision_targets": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "required": ["segment_id", "reason"],
-                                "properties": {
-                                    "segment_id": {"type": "string", "minLength": 1},
-                                    "reason": {"type": "string", "minLength": 1},
-                                },
-                            },
-                        },
-                        "gemini_acknowledgement": {"type": "string", "minLength": 1},
-                    },
-                    "allOf": [{
-                        "if": {"properties": {"decision": {"const": "REVISION_REQUIRED"}}},
-                        "then": {"required": ["revision_targets"], "properties": {"revision_targets": {"minItems": 1}}},
-                    }],
-                },
+                "review": review_schema,
             },
         }
+        if root_conditions:
+            schema["allOf"] = root_conditions
+        return schema
 
     @staticmethod
     def _compact_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -1472,6 +1882,7 @@ class MoonDriveBridge:
             "required_output_artifacts",
             "quality_gate",
             "render_integrity",
+            "sampling",
             "instruction",
         }
         return {key: value for key, value in task.items() if key in allowed}
