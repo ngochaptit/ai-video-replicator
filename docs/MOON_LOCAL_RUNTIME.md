@@ -6,6 +6,27 @@ Moon is a local, resumable, deterministic video-editing runtime. External agents
 
 Moon Local deliberately does not introduce a web app, cloud database, Drive-backed state, account system, local LLM/VLM, or agent-specific business logic.
 
+## Windows operator launcher
+
+For a non-technical operator, double-click `START_AI_EDIT.bat` in the repository.
+The launcher opens without a command workflow. Choose a project folder containing
+`reference.mp4` and a non-empty `footage/` folder, then click **START AI EDIT**.
+The seven Moon stages are shown with operator-friendly status labels. The launcher
+uses the repository `.venv`, keeps Moon and Drive polling in a background worker,
+and can be closed and reopened while that worker continues.
+
+At an analyze or footage Gemini boundary, the launcher shows **Cần phân tích bằng
+Gemini** and **MỞ FILE GỬI GEMINI**. The operator uploads that one current PDF to
+Gemini; no Moon command, request ID, or JSON editing is required. Other external
+agent boundaries continue through the existing Drive `AGENT` request/response
+contract. When `output/final.mp4` exists and the pipeline is complete, the launcher
+offers **OPEN FINAL VIDEO** and **OPEN OUTPUT FOLDER**.
+
+The install/admin setup must provide `.venv` and the existing per-project
+`.moon/bridge.json` Drive configuration. This one-time machine/configuration work
+is intentionally outside the operator screen. A collapsed **Chi tiết kỹ thuật**
+panel is available for support staff and is hidden by default.
+
 ```text
 Antigravity / Claude Desktop / Codex / generic MCP client
                          |

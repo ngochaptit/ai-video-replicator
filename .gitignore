@@ -45,6 +45,10 @@ music_library/
 .moon/bridge.json
 .moon/bridge-state.json
 .moon/bridge-history/
+.moon/operator-status.json
+.moon/operator-run.lock
+.moon/operator-stdout.log
+.moon/operator-stderr.log
 .youtube-token.json
 # Google service-account / Vertex AI keys — never commit
 gcp-*.json
