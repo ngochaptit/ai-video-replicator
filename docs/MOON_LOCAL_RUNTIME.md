@@ -11,7 +11,10 @@ Moon Local deliberately does not introduce a web app, cloud database, Drive-back
 For a non-technical operator, double-click `START_AI_EDIT.bat` in the repository.
 The launcher opens without a command workflow. Choose a project folder containing
 `reference.mp4` and a non-empty `footage/` folder, then click **START AI EDIT**.
-The seven Moon stages are shown with operator-friendly status labels. The launcher
+The large **CURRENT TASK** card shows the active stage and whether Moon, Gemini,
+or ChatGPT owns the next action. The seven Moon stages are shown below it with
+operator-friendly status labels. A stage is only shown as **Running** while its
+worker lock is live; a stopped resumable stage is shown as **Ready**. The launcher
 uses the repository `.venv`, keeps Moon and Drive polling in a background worker,
 and can be closed and reopened while that worker continues.
 
@@ -21,6 +24,18 @@ Gemini; no Moon command, request ID, or JSON editing is required. Other external
 agent boundaries continue through the existing Drive `AGENT` request/response
 contract. When `output/final.mp4` exists and the pipeline is complete, the launcher
 offers **OPEN FINAL VIDEO** and **OPEN OUTPUT FOLDER**.
+
+Moon polls the existing Drive `AGENT` request/response contract and resumes
+automatically after a valid response. Operator ownership comes from the canonical
+active request route. Before exposing a Gemini PDF, the launcher checks its request
+ID, stage, revision, and SHA-256 binding. GPT-owned requests provide a button to
+open ChatGPT and a short copyable instruction; no Moon command, request ID, or JSON
+editing is required.
+
+Browser destinations can be configured by an administrator with
+`MOON_OPERATOR_GEMINI_URL` / `MOON_OPERATOR_CHATGPT_URL`, or per project in
+`.moon/operator.json` using `gemini_url` and `chatgpt_url`. The buttons only open
+the configured sites and do not automate browser sessions.
 
 The install/admin setup must provide `.venv` and the existing per-project
 `.moon/bridge.json` Drive configuration. This one-time machine/configuration work

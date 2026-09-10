@@ -4,9 +4,10 @@ import argparse
 import os
 import subprocess
 import sys
+import webbrowser
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -14,16 +15,25 @@ from tkinter import filedialog, messagebox, ttk
 from moon.operator import (
     COMPLETED,
     FAILED,
+    LOCAL_PROCESSING,
     PENDING,
+    READY,
+    RESPONSE_RECEIVED,
     RUNNING,
+    TASK_COMPLETE,
+    TASK_FAILED,
     WAITING_AGENT,
+    WAITING_CHATGPT,
+    WAITING_GEMINI,
+    WAITING_GPT_AFTER_GEMINI,
     DuplicateProjectRun,
+    OperatorWebConfig,
     OperatorWorkerProcess,
     WorkerLaunchError,
+    chatgpt_handoff_instruction,
     inspect_operator_project,
     validate_operator_project,
 )
-
 
 BG = "#f4f6f8"
 CARD = "#ffffff"
@@ -35,10 +45,20 @@ RED = "#c0362c"
 AMBER = "#a35d00"
 STATUS_COLORS = {
     PENDING: MUTED,
+    READY: BLUE,
     RUNNING: BLUE,
     WAITING_AGENT: AMBER,
     COMPLETED: GREEN,
     FAILED: RED,
+}
+TASK_COLORS = {
+    LOCAL_PROCESSING: BLUE,
+    WAITING_GEMINI: AMBER,
+    WAITING_CHATGPT: AMBER,
+    WAITING_GPT_AFTER_GEMINI: AMBER,
+    RESPONSE_RECEIVED: GREEN,
+    TASK_FAILED: RED,
+    TASK_COMPLETE: GREEN,
 }
 
 
@@ -46,14 +66,18 @@ class OperatorLauncher(tk.Tk):
     def __init__(self, *, initial_project: str | None = None) -> None:
         super().__init__()
         self.title("AI Video Replicator")
-        self.geometry("820x760")
-        self.minsize(720, 650)
+        self.geometry("900x880")
+        self.minsize(760, 700)
         self.configure(bg=BG)
         self.repository_root = Path(__file__).resolve().parents[1]
         self.worker = OperatorWorkerProcess(self.repository_root)
         self.project_var = tk.StringVar(value=initial_project or "")
         self.summary_var = tk.StringVar(value="Chọn thư mục dự án để bắt đầu.")
         self.final_var = tk.StringVar(value="")
+        self.task_title_var = tk.StringVar(value="CHƯA CHỌN DỰ ÁN")
+        self.task_stage_var = tk.StringVar(value="Bước: -")
+        self.task_owner_var = tk.StringVar(value="Phụ trách: MOON")
+        self.task_detail_var = tk.StringVar(value="Chọn một thư mục dự án để xem công việc hiện tại.")
         self.debug_visible = False
         self.stage_widgets: dict[str, tuple[ttk.Label, ttk.Label]] = {}
         self._build()
@@ -89,24 +113,40 @@ class OperatorLauncher(tk.Tk):
         ttk.Button(project_card, text="CHỌN THƯ MỤC", command=self._choose_folder).grid(row=1, column=1, pady=(7, 0))
         project_card.columnconfigure(0, weight=1)
 
-        self.start_button = ttk.Button(
-            shell, text="START AI EDIT", style="Primary.TButton", command=self._start
-        )
+        self.start_button = ttk.Button(shell, text="START AI EDIT", style="Primary.TButton", command=self._start)
         self.start_button.pack(fill="x", pady=16)
+
+        self.current_task_frame = ttk.Frame(shell, style="Card.TFrame", padding=18)
+        self.current_task_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(self.current_task_frame, text="CURRENT TASK", style="Stage.TLabel").pack(anchor="w")
+        self.task_title_label = tk.Label(
+            self.current_task_frame,
+            textvariable=self.task_title_var,
+            bg=CARD,
+            fg=BLUE,
+            font=("Segoe UI", 17, "bold"),
+            anchor="w",
+        )
+        self.task_title_label.pack(fill="x", pady=(6, 3))
+        task_meta = ttk.Frame(self.current_task_frame, style="Card.TFrame")
+        task_meta.pack(fill="x")
+        ttk.Label(task_meta, textvariable=self.task_stage_var, style="Card.TLabel").pack(side="left")
+        ttk.Label(task_meta, textvariable=self.task_owner_var, style="Card.TLabel").pack(side="right")
+        ttk.Label(
+            self.current_task_frame,
+            textvariable=self.task_detail_var,
+            style="Card.TLabel",
+            wraplength=810,
+        ).pack(anchor="w", pady=(8, 10))
+        self.task_actions = ttk.Frame(self.current_task_frame, style="Card.TFrame")
+        self.task_actions.pack(fill="x")
 
         progress = ttk.Frame(shell, style="Card.TFrame", padding=16)
         progress.pack(fill="x")
         ttk.Label(progress, text="Tiến trình", style="Stage.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
         for row, (stage, label) in enumerate(
-            (
-                ("proposal", "Proposal"),
-                ("analyze", "Analyze"),
-                ("footage", "Footage"),
-                ("match", "Match"),
-                ("timeline", "Timeline"),
-                ("render", "Render"),
-                ("qc", "QC"),
-            ),
+            (("proposal", "Proposal"), ("analyze", "Analyze"), ("footage", "Footage"),
+             ("match", "Match"), ("timeline", "Timeline"), ("render", "Render"), ("qc", "QC")),
             start=1,
         ):
             stage_label = ttk.Label(progress, text=label, style="Card.TLabel")
@@ -123,71 +163,29 @@ class OperatorLauncher(tk.Tk):
             fg=INK,
             justify="left",
             anchor="w",
-            wraplength=740,
+            wraplength=820,
             font=("Segoe UI", 11),
         )
         self.message.pack(fill="x", pady=(14, 8))
 
-        self.gemini_frame = ttk.Frame(shell, style="Card.TFrame", padding=16)
-        tk.Label(
-            self.gemini_frame,
-            text="Cần phân tích bằng Gemini",
-            bg=CARD,
-            fg=AMBER,
-            font=("Segoe UI", 14, "bold"),
-        ).pack(anchor="w")
-        ttk.Label(
-            self.gemini_frame,
-            text="Mở PDF bên dưới và tải duy nhất file này lên Gemini. Sau đó hệ thống sẽ tự tiếp tục khi nhận được phản hồi.",
-            style="Card.TLabel",
-            wraplength=700,
-        ).pack(anchor="w", pady=(5, 10))
-        self.packet_button = ttk.Button(
-            self.gemini_frame,
-            text="MỞ FILE GỬI GEMINI",
-            style="Action.TButton",
-        )
-        self.packet_button.pack(anchor="w")
-
         self.success_frame = ttk.Frame(shell, style="Card.TFrame", padding=18)
-        tk.Label(
-            self.success_frame,
-            text="VIDEO ĐÃ HOÀN TẤT",
-            bg=CARD,
-            fg=GREEN,
-            font=("Segoe UI", 17, "bold"),
-        ).pack(anchor="w")
-        ttk.Label(
-            self.success_frame,
-            textvariable=self.final_var,
-            style="Card.TLabel",
-            wraplength=700,
-        ).pack(anchor="w", pady=(5, 12))
+        tk.Label(self.success_frame, text="VIDEO ĐÃ HOÀN TẤT", bg=CARD, fg=GREEN,
+                 font=("Segoe UI", 17, "bold")).pack(anchor="w")
+        ttk.Label(self.success_frame, textvariable=self.final_var, style="Card.TLabel",
+                  wraplength=800).pack(anchor="w", pady=(5, 12))
         actions = ttk.Frame(self.success_frame, style="Card.TFrame")
         actions.pack(anchor="w")
-        self.open_video_button = ttk.Button(
-            actions, text="OPEN FINAL VIDEO", style="Action.TButton"
-        )
+        self.open_video_button = ttk.Button(actions, text="OPEN FINAL VIDEO", style="Action.TButton")
         self.open_video_button.pack(side="left", padx=(0, 8))
-        self.open_folder_button = ttk.Button(
-            actions, text="OPEN OUTPUT FOLDER", style="Action.TButton"
-        )
+        self.open_folder_button = ttk.Button(actions, text="OPEN OUTPUT FOLDER", style="Action.TButton")
         self.open_folder_button.pack(side="left")
 
-        self.debug_toggle = ttk.Button(
-            shell, text="Chi tiết kỹ thuật ▸", command=self._toggle_debug
-        )
+        self.debug_toggle = ttk.Button(shell, text="Chi tiết kỹ thuật ▸", command=self._toggle_debug)
         self.debug_toggle.pack(anchor="w", pady=(12, 4))
         self.debug_frame = ttk.Frame(shell, style="Card.TFrame", padding=10)
         self.debug_text = tk.Text(
-            self.debug_frame,
-            height=10,
-            wrap="word",
-            bg="#101828",
-            fg="#e4e7ec",
-            insertbackground="white",
-            font=("Consolas", 9),
-            relief="flat",
+            self.debug_frame, height=10, wrap="word", bg="#101828", fg="#e4e7ec",
+            insertbackground="white", font=("Consolas", 9), relief="flat",
         )
         self.debug_text.pack(fill="both", expand=True)
         self.debug_text.configure(state="disabled")
@@ -234,22 +232,11 @@ class OperatorLauncher(tk.Tk):
             if not widgets:
                 continue
             stage_status = str(item.get("status") or PENDING)
-            widgets[1].configure(
-                text=stage_status, foreground=STATUS_COLORS.get(stage_status, MUTED)
-            )
+            widgets[1].configure(text=stage_status, foreground=STATUS_COLORS.get(stage_status, MUTED))
         self.summary_var.set(str(snapshot.get("message") or ""))
         self.message.configure(fg=RED if status == "failed" else INK)
-        self.start_button.configure(
-            state="normal" if snapshot.get("can_start") else "disabled"
-        )
-
-        packet = snapshot.get("portable_packet")
-        if packet:
-            self.packet_button.configure(command=lambda path=packet: self._open(path))
-            if not self.gemini_frame.winfo_ismapped():
-                self.gemini_frame.pack(fill="x", pady=(5, 8), before=self.debug_toggle)
-        else:
-            self.gemini_frame.pack_forget()
+        self.start_button.configure(state="normal" if snapshot.get("can_start") else "disabled")
+        self._render_current_task(snapshot)
 
         final = Path(str(snapshot.get("final_path") or ""))
         if status == "complete" and final.is_file():
@@ -261,6 +248,53 @@ class OperatorLauncher(tk.Tk):
         else:
             self.success_frame.pack_forget()
         self._render_debug(snapshot.get("debug") or {})
+
+    def _render_current_task(self, snapshot: dict[str, Any]) -> None:
+        task = snapshot.get("current_task") or {}
+        task_state = str(task.get("state") or LOCAL_PROCESSING)
+        self.task_title_var.set(str(task.get("title") or "CURRENT TASK"))
+        self.task_stage_var.set(f"Bước: {task.get('stage_label') or '-'}")
+        self.task_owner_var.set(f"Phụ trách: {task.get('owner') or 'MOON'}")
+        self.task_detail_var.set(str(task.get("detail") or ""))
+        self.task_title_label.configure(fg=TASK_COLORS.get(task_state, BLUE))
+        for child in self.task_actions.winfo_children():
+            child.destroy()
+
+        project = str(snapshot.get("project_root") or "")
+        stage = str(task.get("stage") or "")
+        config = OperatorWebConfig.load(project or None)
+        if task_state == WAITING_GEMINI:
+            packet = snapshot.get("portable_packet")
+            if packet:
+                self._task_button("MỞ FILE GỬI GEMINI", lambda path=packet: self._open(path))
+            self._task_button("MỞ GEMINI", lambda: self._open_url(config.gemini_url))
+            self._task_button("MỞ CHATGPT", lambda: self._open_url(config.chatgpt_url))
+            self._task_button(
+                "COPY HƯỚNG DẪN CHO CHATGPT",
+                lambda: self._copy(chatgpt_handoff_instruction(project, stage, after_gemini=True)),
+            )
+        elif task_state == WAITING_GPT_AFTER_GEMINI:
+            self._task_button("MỞ CHATGPT", lambda: self._open_url(config.chatgpt_url))
+            self._task_button(
+                "COPY HƯỚNG DẪN CHO CHATGPT",
+                lambda: self._copy(chatgpt_handoff_instruction(project, stage, after_gemini=True)),
+            )
+        elif task_state == WAITING_CHATGPT:
+            self._task_button("MỞ CHATGPT", lambda: self._open_url(config.chatgpt_url))
+            self._task_button(
+                "COPY YÊU CẦU",
+                lambda: self._copy(chatgpt_handoff_instruction(project, stage, after_gemini=False)),
+            )
+
+    def _task_button(self, text: str, command: Callable[[], None]) -> None:
+        button = ttk.Button(self.task_actions, text=text, style="Action.TButton", command=command)
+        button.pack(side="left", padx=(0, 8), pady=(0, 4))
+
+    def _copy(self, value: str) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        self.update_idletasks()
+        self.summary_var.set("Đã copy hướng dẫn. Dán nội dung này vào ChatGPT.")
 
     def _toggle_debug(self) -> None:
         self.debug_visible = not self.debug_visible
@@ -274,23 +308,20 @@ class OperatorLauncher(tk.Tk):
     def _render_debug(self, debug: dict[str, Any]) -> None:
         lines = ["MOON COMMANDS"]
         lines.extend(str(item) for item in debug.get("commands") or [])
-        lines.extend(
-            [
-                "",
-                f"REQUEST ID: {debug.get('request_id') or '-'}",
-                f"STAGE INTERNALS: {debug.get('stage_internals') or '-'}",
-                "",
-                "STDOUT",
-                str(debug.get("stdout") or ""),
-                "",
-                "STDERR",
-                str(debug.get("stderr") or ""),
-            ]
-        )
+        lines.extend([
+            "", f"REQUEST ID: {debug.get('request_id') or '-'}",
+            f"STAGE INTERNALS: {debug.get('stage_internals') or '-'}", "", "STDOUT",
+            str(debug.get("stdout") or ""), "", "STDERR", str(debug.get("stderr") or ""),
+        ])
         self.debug_text.configure(state="normal")
         self.debug_text.delete("1.0", "end")
         self.debug_text.insert("1.0", "\n".join(lines))
         self.debug_text.configure(state="disabled")
+
+    @staticmethod
+    def _open_url(url: str) -> None:
+        if not webbrowser.open(url, new=2):
+            messagebox.showerror("Không thể mở", f"Không thể mở trình duyệt: {url}")
 
     @staticmethod
     def _open(path: str | Path) -> None:
