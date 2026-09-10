@@ -11,46 +11,49 @@ Moon Local deliberately does not introduce a web app, cloud database, Drive-back
 For a non-technical operator, double-click `START_AI_EDIT.bat` in the repository.
 The launcher opens without a command workflow. Choose a project folder containing
 `reference.mp4` and a non-empty `footage/` folder, then click **START AI EDIT**.
-The large **CURRENT TASK** card shows the active stage and whether Moon, Gemini,
-or ChatGPT owns the next action. The seven Moon stages are shown below it with
+The large **CURRENT TASK** card shows the active stage and whether Moon or GPT
+owns the next action. The seven Moon stages are shown below it with
 operator-friendly status labels. A stage is only shown as **Running** while its
 worker lock is live; a stopped resumable stage is shown as **Ready**. The launcher
 uses the repository `.venv`, keeps Moon and Drive polling in a background worker,
 and can be closed and reopened while that worker continues.
 
-At an analyze or footage Gemini boundary, the launcher shows **Cần phân tích bằng
-Gemini** and **MỞ FILE GỬI GEMINI**. The operator uploads that one current PDF to
-Gemini; no Moon command, request ID, or JSON editing is required. Other external
-agent boundaries continue through the existing Drive `AGENT` request/response
-contract. When `output/final.mp4` exists and the pipeline is complete, the launcher
-offers **OPEN FINAL VIDEO** and **OPEN OUTPUT FOLDER**.
+At every external semantic boundary, including analyze and footage, the launcher
+shows **CẦN GPT PHÂN TÍCH**. It provides buttons to open ChatGPT, open the current
+Drive `AGENT` folder, and copy one short project-aware instruction. The operator
+does not run Moon commands, copy request IDs, or edit JSON. When
+`output/final.mp4` exists and the pipeline is complete, the launcher offers
+**OPEN FINAL VIDEO** and **OPEN OUTPUT FOLDER**.
 
 Moon polls the existing Drive `AGENT` request/response contract and resumes
 automatically after a valid response. Operator ownership comes from the canonical
-active request route. Before exposing a Gemini PDF, the launcher checks its request
-ID, stage, revision, and SHA-256 binding. GPT-owned requests provide a button to
-open ChatGPT and a short copyable instruction; no Moon command, request ID, or JSON
-editing is required.
+active request route and is always Moon for local processing or GPT while waiting
+for external semantic work. GPT reads `request.json` and the request-scoped JSON
+and image evidence directly from Drive, then writes `response.json` there.
 
-Browser destinations can be configured by an administrator with
-`MOON_OPERATOR_GEMINI_URL` / `MOON_OPERATOR_CHATGPT_URL`, or per project in
-`.moon/operator.json` using `gemini_url` and `chatgpt_url`. The buttons only open
-the configured sites and do not automate browser sessions.
+The ChatGPT destination can be configured by an administrator with
+`MOON_OPERATOR_CHATGPT_URL`, or per project in `.moon/operator.json` using
+`chatgpt_url`. The button only opens the configured site and does not automate a
+browser session.
 
 The install/admin setup must provide `.venv` and the existing per-project
 `.moon/bridge.json` Drive configuration. This one-time machine/configuration work
-is intentionally outside the operator screen. A collapsed **Chi tiết kỹ thuật**
-panel is available for support staff and is hidden by default.
+is intentionally outside the operator screen. **Chi tiết kỹ thuật** opens a
+separate resizable support window with Moon commands, request identity, stage
+internals, stdout, and stderr. Its log view has a vertical scrollbar and does not
+increase the height of the main operator screen. The main screen itself also
+scrolls vertically when Windows resolution or DPI scaling leaves less room.
+
+The operator architecture is deliberately narrow:
 
 ```text
-Antigravity / Claude Desktop / Codex / generic MCP client
-                         |
-               one Moon MCP gateway
-                         |
-       state + evidence + pipeline + local media I/O
+LOCAL PROJECT (canonical media/state) <-> DRIVE EXCHANGE <-> GPT
 ```
 
-Adapters are intentionally thin. Moon Core does not know which model or vendor makes a semantic decision.
+Moon performs all deterministic local work. Drive contains only the active
+request, bounded measured evidence, response, and archive history. GPT is the
+single external semantic agent, reviewer, and semantic-QC owner. The launcher
+does not use an LLM API, browser automation, or another local agent runtime.
 
 ## Persistent project contract
 
@@ -98,7 +101,13 @@ of pipeline truth. The same state is published once as `request.json.route`, so
 a fresh web chat can identify its actor, exact task and inputs, expected output,
 terminal acknowledgement, and next actor without relying on prior chat history.
 
-The Drive API transport writes only those request-scoped JSON, text, and image evidence files, plus Moon's generated analyze handoff PDF, under `MON_EDIT/jobs/<project_id>/AGENT/`. Source video and audio extensions are not eligible for copying or upload. A returned `payload` is untrusted input: Moon checks its envelope, age, job/request/stage identity, duplicate-consumption state, and the existing Moon handoff contract before storing it. No response field is interpreted as a shell command.
+The Drive transport writes only `request.json` plus request-scoped JSON, text,
+and image evidence under `MON_EDIT/jobs/<project_id>/AGENT/`. It does not generate
+or publish a portable PDF. Source video, source audio, rendered video, and final
+output extensions are not eligible for copying or upload. A returned `payload`
+is untrusted input: Moon checks its envelope, age, job/request/stage/revision
+identity, JSON schema, duplicate-consumption state, and the existing Moon handoff
+contract before storing it. No response field is interpreted as a shell command.
 
 ### Google OAuth setup
 
@@ -156,9 +165,9 @@ python -m moon bridge status "D:\path\to\moon-project"
 
 `request.json` contains the exact `job_id`, `request_id`, stage, revision,
 timestamps, evidence references, expected response schema, and canonical `route`
-block. For stages other than analyze, the web agent creates `response.json` in
-the same Drive `AGENT` folder, copying the identity values exactly and placing
-its stage response under `payload`:
+block. GPT creates `response.json` in the same Drive `AGENT` folder for every
+external-agent stage, copying the identity values exactly and placing its stage
+response under `payload`:
 
 ```json
 {
@@ -166,32 +175,21 @@ its stage response under `payload`:
   "job_id": "my-edit-job",
   "request_id": "COPY_FROM_REQUEST",
   "stage": "footage",
+  "revision": 0,
   "status": "COMPLETED",
   "created_at": "2026-09-05T12:00:00Z",
-  "payload": { "clips": [] }
+  "payload": { "clips": [] },
+  "review": { "actor": "gpt", "decision": "APPROVED", "revision": 0 }
 }
 ```
 
 The payload shape above is illustrative; the authoritative requirements are embedded in `request.json`. After successful validation Moon marks both files `CONSUMED`, records an idempotency marker under `.moon/`, and resumes to the next safe boundary. A restart retries only a pending resume and never resubmits an already consumed response.
 
-The analyze stage uses the human-triggered Gemini-to-GPT route embedded in the
-request. Gemini reads the listed Drive evidence, returns the complete
-`semantic_enrichment` in chat, and ends with the exact
-`TASK_COMPLETED ... next_actor=gpt next_action=REVIEW_GEMINI_ANALYSIS` line from
-the route. The user gives that result to GPT. GPT reviews it against the same
-request and evidence, then writes `response.json` with structured review data:
-
-Moon also generates `AGENT/gemini_handoff.pdf` for analyze and footage requests
-and publishes it beside `request.json`. If Gemini Web cannot dereference Drive
-links, upload this one PDF to Gemini. Analyze packets contain the route, response
-rules, canonical analyze artifacts, and every required measured reference frame.
-Footage packets contain the footage scaffold, analysis brief, coverage summary,
-output/refinement contracts, and every current adaptive or refinement frame with
-clip, timestamp, sample-group/window, origin, and evidence-path labels. The
-embedded manifest and `request.json.route.portable_packet_manifest` bind each
-packet to the current request ID, handoff revision, source hashes, and packet
-hash. The PDF is a portable view; canonical truth remains in the Moon artifacts,
-`request.json`, and `.moon/agent-state.json`.
+The analyze and footage stages use the same direct GPT route as proposal, match,
+timeline, render, and QC. GPT reads the listed evidence from Drive, performs the
+semantic work and review, then writes `response.json` with structured review
+data. Canonical project media and pipeline artifacts remain in the local project;
+Drive is only the message and measured-evidence exchange.
 
 ```json
 {
@@ -199,6 +197,7 @@ hash. The PDF is a portable view; canonical truth remains in the Moon artifacts,
   "job_id": "my-edit-job",
   "request_id": "COPY_FROM_REQUEST",
   "stage": "analyze",
+  "revision": 0,
   "status": "COMPLETED",
   "created_at": "2026-09-05T12:00:00Z",
   "payload": { "segments": [] },
@@ -209,14 +208,21 @@ hash. The PDF is a portable view; canonical truth remains in the Moon artifacts,
 `APPROVED` routes the response to Moon for consumption. `REVISION_REQUIRED`
 must include a non-empty `revision_targets` array whose entries each contain a
 `segment_id` and `reason`. Moon keeps the same job, stage, and request identity,
-increments the handoff revision, republishes the explicit targets for Gemini,
-and waits for GPT review again. Gemini never needs to overwrite raw JSON.
+increments the handoff revision, republishes the explicit targets and measured
+evidence, and waits for GPT again.
 
 A pending request is idempotently republished only while its identity matches
 the active bridge request and its expiry is still in the future. Publishing the
 same pending stage after expiry archives any stale `response.json`, issues a new
 request ID and timestamps, rebuilds the route and local agent state, and retains
 the current revision. Responses carrying the replaced request ID remain invalid.
+
+Existing `.moon/bridge.json` files need no manual migration. On the first publish,
+a still-pending legacy Gemini route is archived/replaced with a fresh GPT request
+and identity; a matching fresh GPT request remains idempotent. The reusable
+defaults allow up to 500 evidence files and 512 MiB per request, while response
+payloads retain a 50 MiB safety ceiling. Per-project configuration can still set
+stricter limits.
 
 Minimal credentials/connectivity test (it creates `jobs/<project_id>/AGENT` if absent but does not run video work):
 
@@ -312,6 +318,14 @@ Moon never chooses a footage match, invents timestamps, silently switches render
 
 The `footage` stage now seeds deterministic full-clip frame coverage before asking an external vision agent for semantic segmentation. The default target is roughly one measured frame every 4 seconds, bounded to 120 initial frames per clip and chunked into FFmpeg sampling groups of at most 24 frames.
 
-This is evidence generation only; Moon still does not decide what an action means or where a semantic action starts. Gemini scans the portable coarse coverage. If a boundary remains ambiguous, it returns a strict `footage_refinement_request` with measured `clip_id`, `start_seconds`, `end_seconds`, and `reason` values. GPT records `REQUEST_REFINEMENT`; Moon—not Gemini—runs the deterministic sampler, appends the new measured frames, advances the handoff revision, and republishes a fresh route and packet for `RECHECK_TARGETS`. Registered sampled frames are automatically merged into the `footage_profile_builder` evidence catalog on the enrichment pass, so those refined timestamps can become canonical segment boundaries.
+This is evidence generation only; Moon still does not decide what an action means
+or where a semantic action starts. GPT scans the coarse coverage directly from
+Drive. If a boundary remains ambiguous, GPT returns a strict
+`footage_refinement_request` with measured `clip_id`, `start_seconds`,
+`end_seconds`, and `reason` values. Moon runs the deterministic sampler, appends
+the new measured frames, advances the handoff revision, and republishes the route
+and evidence for `RECHECK_TARGETS`. Registered sampled frames are automatically
+merged into the `footage_profile_builder` evidence catalog on the enrichment pass,
+so those refined timestamps can become canonical segment boundaries.
 
 The quality goal is to avoid the failure mode where a long single-take clip with few hard scene cuts is reduced to a handful of 60–90 second semantic segments, which later forces extreme speed-up and source reuse during matching/rendering.

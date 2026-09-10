@@ -1,3 +1,10 @@
+"""Deprecated standalone Gemini packet builder.
+
+Kept only for backward compatibility with previously generated handoffs. The
+production Drive bridge and Windows operator flow do not import, generate, or
+publish these packets; external semantic work routes directly to GPT.
+"""
+
 from __future__ import annotations
 
 import hashlib

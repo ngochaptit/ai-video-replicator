@@ -24,8 +24,6 @@ from moon.operator import (
     TASK_FAILED,
     WAITING_AGENT,
     WAITING_CHATGPT,
-    WAITING_GEMINI,
-    WAITING_GPT_AFTER_GEMINI,
     DuplicateProjectRun,
     OperatorWebConfig,
     OperatorWorkerProcess,
@@ -53,21 +51,70 @@ STATUS_COLORS = {
 }
 TASK_COLORS = {
     LOCAL_PROCESSING: BLUE,
-    WAITING_GEMINI: AMBER,
     WAITING_CHATGPT: AMBER,
-    WAITING_GPT_AFTER_GEMINI: AMBER,
     RESPONSE_RECEIVED: GREEN,
     TASK_FAILED: RED,
     TASK_COMPLETE: GREEN,
 }
 
 
+def format_debug_text(debug: dict[str, Any]) -> str:
+    lines = ["MOON COMMANDS"]
+    lines.extend(str(item) for item in debug.get("commands") or [])
+    lines.extend(
+        [
+            "",
+            f"REQUEST ID: {debug.get('request_id') or '-'}",
+            f"STAGE: {debug.get('stage') or '-'}",
+            f"REVISION: {debug.get('revision') if debug.get('revision') is not None else '-'}",
+            f"OWNER: {str(debug.get('owner') or '-').upper()}",
+            f"REMOTE DRIVE PATH: {debug.get('remote_path') or '-'}",
+            f"STAGE INTERNALS: {debug.get('stage_internals') or '-'}",
+            "",
+            "STDOUT",
+            str(debug.get("stdout") or ""),
+            "",
+            "STDERR",
+            str(debug.get("stderr") or ""),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def set_clipboard_text(widget: Any, value: str) -> None:
+    widget.clipboard_clear()
+    widget.clipboard_append(value)
+    widget.update_idletasks()
+
+
+def bounded_window_size(
+    screen_width: int,
+    screen_height: int,
+    *,
+    preferred_width: int,
+    preferred_height: int,
+    horizontal_margin: int = 80,
+    vertical_margin: int = 120,
+) -> tuple[int, int]:
+    """Keep initial windows inside the effective DPI-scaled desktop."""
+
+    width = max(320, min(preferred_width, screen_width - horizontal_margin))
+    height = max(320, min(preferred_height, screen_height - vertical_margin))
+    return width, height
+
+
 class OperatorLauncher(tk.Tk):
     def __init__(self, *, initial_project: str | None = None) -> None:
         super().__init__()
         self.title("AI Video Replicator")
-        self.geometry("900x880")
-        self.minsize(760, 700)
+        window_width, window_height = bounded_window_size(
+            self.winfo_screenwidth(),
+            self.winfo_screenheight(),
+            preferred_width=880,
+            preferred_height=720,
+        )
+        self.geometry(f"{window_width}x{window_height}")
+        self.minsize(min(680, window_width), min(560, window_height))
         self.configure(bg=BG)
         self.repository_root = Path(__file__).resolve().parents[1]
         self.worker = OperatorWorkerProcess(self.repository_root)
@@ -78,7 +125,10 @@ class OperatorLauncher(tk.Tk):
         self.task_stage_var = tk.StringVar(value="Bước: -")
         self.task_owner_var = tk.StringVar(value="Phụ trách: MOON")
         self.task_detail_var = tk.StringVar(value="Chọn một thư mục dự án để xem công việc hiện tại.")
-        self.debug_visible = False
+        self.debug_window: tk.Toplevel | None = None
+        self.debug_text: tk.Text | None = None
+        self.latest_debug: dict[str, Any] = {}
+        self.task_action_count = 0
         self.stage_widgets: dict[str, tuple[ttk.Label, ttk.Label]] = {}
         self._build()
         self.after(350, self._refresh)
@@ -96,8 +146,25 @@ class OperatorLauncher(tk.Tk):
         style.configure("Primary.TButton", font=("Segoe UI", 12, "bold"), padding=(16, 12))
         style.configure("Action.TButton", font=("Segoe UI", 10, "bold"), padding=(12, 8))
 
-        shell = ttk.Frame(self, padding=24)
-        shell.pack(fill="both", expand=True)
+        viewport = ttk.Frame(self)
+        viewport.pack(fill="both", expand=True)
+        self.main_canvas = tk.Canvas(
+            viewport, background=BG, highlightthickness=0, borderwidth=0
+        )
+        main_scrollbar = ttk.Scrollbar(
+            viewport, orient="vertical", command=self.main_canvas.yview
+        )
+        self.main_canvas.configure(yscrollcommand=main_scrollbar.set)
+        self.main_canvas.pack(side="left", fill="both", expand=True)
+        main_scrollbar.pack(side="right", fill="y")
+
+        shell = ttk.Frame(self.main_canvas, padding=20)
+        self.main_window = self.main_canvas.create_window(
+            (0, 0), window=shell, anchor="nw"
+        )
+        shell.bind("<Configure>", self._update_main_scrollregion)
+        self.main_canvas.bind("<Configure>", self._resize_main_content)
+        self.bind("<MouseWheel>", self._scroll_main, add="+")
         ttk.Label(shell, text="AI VIDEO REPLICATOR", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             shell,
@@ -180,15 +247,21 @@ class OperatorLauncher(tk.Tk):
         self.open_folder_button = ttk.Button(actions, text="OPEN OUTPUT FOLDER", style="Action.TButton")
         self.open_folder_button.pack(side="left")
 
-        self.debug_toggle = ttk.Button(shell, text="Chi tiết kỹ thuật ▸", command=self._toggle_debug)
-        self.debug_toggle.pack(anchor="w", pady=(12, 4))
-        self.debug_frame = ttk.Frame(shell, style="Card.TFrame", padding=10)
-        self.debug_text = tk.Text(
-            self.debug_frame, height=10, wrap="word", bg="#101828", fg="#e4e7ec",
-            insertbackground="white", font=("Consolas", 9), relief="flat",
+        self.debug_toggle = ttk.Button(
+            shell, text="Chi tiết kỹ thuật", command=self._open_debug_window
         )
-        self.debug_text.pack(fill="both", expand=True)
-        self.debug_text.configure(state="disabled")
+        self.debug_toggle.pack(anchor="w", pady=(12, 4))
+
+    def _update_main_scrollregion(self, _event: tk.Event[Any]) -> None:
+        self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+
+    def _resize_main_content(self, event: tk.Event[Any]) -> None:
+        self.main_canvas.itemconfigure(self.main_window, width=event.width)
+
+    def _scroll_main(self, event: tk.Event[Any]) -> None:
+        delta = int(-event.delta / 120) if event.delta else 0
+        if delta:
+            self.main_canvas.yview_scroll(delta, "units")
 
     def _choose_folder(self) -> None:
         selected = filedialog.askdirectory(title="Chọn thư mục dự án video")
@@ -259,63 +332,95 @@ class OperatorLauncher(tk.Tk):
         self.task_title_label.configure(fg=TASK_COLORS.get(task_state, BLUE))
         for child in self.task_actions.winfo_children():
             child.destroy()
+        self.task_action_count = 0
 
         project = str(snapshot.get("project_root") or "")
         stage = str(task.get("stage") or "")
         config = OperatorWebConfig.load(project or None)
-        if task_state == WAITING_GEMINI:
-            packet = snapshot.get("portable_packet")
-            if packet:
-                self._task_button("MỞ FILE GỬI GEMINI", lambda path=packet: self._open(path))
-            self._task_button("MỞ GEMINI", lambda: self._open_url(config.gemini_url))
+        if task_state == WAITING_CHATGPT:
             self._task_button("MỞ CHATGPT", lambda: self._open_url(config.chatgpt_url))
+            drive_folder = snapshot.get("drive_folder")
             self._task_button(
-                "COPY HƯỚNG DẪN CHO CHATGPT",
-                lambda: self._copy(chatgpt_handoff_instruction(project, stage, after_gemini=True)),
+                "MỞ THƯ MỤC DRIVE",
+                lambda path=drive_folder: self._open(path),
+                enabled=bool(drive_folder),
             )
-        elif task_state == WAITING_GPT_AFTER_GEMINI:
-            self._task_button("MỞ CHATGPT", lambda: self._open_url(config.chatgpt_url))
-            self._task_button(
-                "COPY HƯỚNG DẪN CHO CHATGPT",
-                lambda: self._copy(chatgpt_handoff_instruction(project, stage, after_gemini=True)),
-            )
-        elif task_state == WAITING_CHATGPT:
-            self._task_button("MỞ CHATGPT", lambda: self._open_url(config.chatgpt_url))
             self._task_button(
                 "COPY YÊU CẦU",
-                lambda: self._copy(chatgpt_handoff_instruction(project, stage, after_gemini=False)),
+                lambda: self._copy(chatgpt_handoff_instruction(project, stage)),
             )
 
-    def _task_button(self, text: str, command: Callable[[], None]) -> None:
-        button = ttk.Button(self.task_actions, text=text, style="Action.TButton", command=command)
-        button.pack(side="left", padx=(0, 8), pady=(0, 4))
+    def _task_button(
+        self, text: str, command: Callable[[], None], *, enabled: bool = True
+    ) -> None:
+        button = ttk.Button(
+            self.task_actions,
+            text=text,
+            style="Action.TButton",
+            command=command,
+            state="normal" if enabled else "disabled",
+        )
+        row, column = divmod(self.task_action_count, 2)
+        button.grid(row=row, column=column, sticky="w", padx=(0, 8), pady=(0, 6))
+        self.task_action_count += 1
 
     def _copy(self, value: str) -> None:
-        self.clipboard_clear()
-        self.clipboard_append(value)
-        self.update_idletasks()
+        set_clipboard_text(self, value)
         self.summary_var.set("Đã copy hướng dẫn. Dán nội dung này vào ChatGPT.")
 
-    def _toggle_debug(self) -> None:
-        self.debug_visible = not self.debug_visible
-        if self.debug_visible:
-            self.debug_toggle.configure(text="Chi tiết kỹ thuật ▾")
-            self.debug_frame.pack(fill="both", expand=True, pady=(0, 8))
-        else:
-            self.debug_toggle.configure(text="Chi tiết kỹ thuật ▸")
-            self.debug_frame.pack_forget()
+    def _open_debug_window(self) -> None:
+        if self.debug_window is not None and self.debug_window.winfo_exists():
+            self.debug_window.deiconify()
+            self.debug_window.lift()
+            self.debug_window.focus_force()
+            return
+
+        window = tk.Toplevel(self)
+        window.title("AI Video Replicator - Chi tiết kỹ thuật")
+        window_width, window_height = bounded_window_size(
+            window.winfo_screenwidth(),
+            window.winfo_screenheight(),
+            preferred_width=900,
+            preferred_height=600,
+        )
+        window.geometry(f"{window_width}x{window_height}")
+        window.minsize(min(600, window_width), min(350, window_height))
+        window.resizable(True, True)
+        window.configure(bg=BG)
+        window.protocol("WM_DELETE_WINDOW", self._close_debug_window)
+
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill="both", expand=True)
+        text = tk.Text(
+            frame,
+            wrap="word",
+            bg="#101828",
+            fg="#e4e7ec",
+            insertbackground="white",
+            font=("Consolas", 9),
+            relief="flat",
+        )
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scrollbar.set)
+        text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.debug_window = window
+        self.debug_text = text
+        self._render_debug(self.latest_debug)
+
+    def _close_debug_window(self) -> None:
+        if self.debug_window is not None:
+            self.debug_window.destroy()
+        self.debug_window = None
+        self.debug_text = None
 
     def _render_debug(self, debug: dict[str, Any]) -> None:
-        lines = ["MOON COMMANDS"]
-        lines.extend(str(item) for item in debug.get("commands") or [])
-        lines.extend([
-            "", f"REQUEST ID: {debug.get('request_id') or '-'}",
-            f"STAGE INTERNALS: {debug.get('stage_internals') or '-'}", "", "STDOUT",
-            str(debug.get("stdout") or ""), "", "STDERR", str(debug.get("stderr") or ""),
-        ])
+        self.latest_debug = dict(debug)
+        if self.debug_text is None or not self.debug_text.winfo_exists():
+            return
         self.debug_text.configure(state="normal")
         self.debug_text.delete("1.0", "end")
-        self.debug_text.insert("1.0", "\n".join(lines))
+        self.debug_text.insert("1.0", format_debug_text(debug))
         self.debug_text.configure(state="disabled")
 
     @staticmethod

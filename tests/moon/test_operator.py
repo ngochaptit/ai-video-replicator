@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -19,8 +18,6 @@ from moon.operator import (
     RUNNING,
     WAITING_CHATGPT,
     WAITING_AGENT,
-    WAITING_GEMINI,
-    WAITING_GPT_AFTER_GEMINI,
     DuplicateProjectRun,
     OperatorStatusStore,
     OperatorWebConfig,
@@ -28,11 +25,17 @@ from moon.operator import (
     OperatorWorker,
     ProjectRunLock,
     WorkerLaunchError,
+    chatgpt_handoff_instruction,
     inspect_operator_project,
     stage_status_mapping,
     validate_operator_project,
 )
 from moon.drive_bridge import BridgeTransportError, DriveBridgeConfig
+from moon.operator_launcher import (
+    bounded_window_size,
+    format_debug_text,
+    set_clipboard_text,
+)
 from moon.runner.pipeline import PipelineRunner
 
 
@@ -65,35 +68,21 @@ def write_waiting_route(
     root: Path,
     stage: str,
     *,
-    actor: str,
     request_id: str = "request-current",
     revision: int = 0,
-    packet_bytes: bytes | None = None,
 ) -> dict:
     route = {
         "job_id": root.name,
         "request_id": request_id,
         "stage": stage,
         "revision": revision,
-        "status": "WAITING_GEMINI" if actor == "gemini" else "WAITING_GPT",
-        "current_actor": actor,
-        "next_actor": "gpt" if actor == "gemini" else "moon",
-        "next_action": "REVIEW_GEMINI_ANALYSIS" if actor == "gemini" else "CONSUME_RESPONSE",
+        "status": "WAITING_GPT",
+        "current_actor": "gpt",
+        "next_actor": "moon",
+        "next_action": "CONSUME_RESPONSE",
     }
     agent = root / "AGENT"
     agent.mkdir(exist_ok=True)
-    if packet_bytes is not None:
-        packet = agent / "gemini_handoff.pdf"
-        packet.write_bytes(packet_bytes)
-        route.update(
-            portable_packet="gemini_handoff.pdf",
-            portable_packet_manifest={
-                "request_id": request_id,
-                "stage": stage,
-                "revision": revision,
-                "sha256": hashlib.sha256(packet_bytes).hexdigest(),
-            },
-        )
     request = {
         "job_id": root.name,
         "request_id": request_id,
@@ -117,6 +106,16 @@ def write_waiting_route(
         encoding="utf-8",
     )
     (root / ".moon" / "agent-state.json").write_text(json.dumps(route), encoding="utf-8")
+    (root / ".moon" / "bridge.json").write_text(
+        json.dumps(
+            {
+                "project_id": root.name,
+                "transport": "local_sync",
+                "drive": {"sync_root": str(root.parent / "drive")},
+            }
+        ),
+        encoding="utf-8",
+    )
     return request
 
 
@@ -216,22 +215,20 @@ def test_stage_transition_status_mapping():
     assert running["match"] == PENDING
 
 
-def test_waiting_agent_state_and_current_gemini_packet_are_detected(tmp_path: Path):
+def test_waiting_agent_state_and_current_gpt_route_are_detected(tmp_path: Path):
     root = valid_project(tmp_path)
     advance_to(root, "analyze")
     request_id = "request-current"
-    write_waiting_route(
-        root, "analyze", actor="gemini", request_id=request_id, packet_bytes=b"%PDF"
-    )
+    write_waiting_route(root, "analyze", request_id=request_id)
 
     snapshot = inspect_operator_project(root)
     by_stage = {item["stage"]: item["status"] for item in snapshot["stages"]}
 
     assert snapshot["status"] == "waiting_agent"
     assert snapshot["can_start"] is True  # no live worker; reopening can resume it
-    assert snapshot["portable_packet"] == str(root / "AGENT" / "gemini_handoff.pdf")
-    assert snapshot["current_task"]["state"] == WAITING_GEMINI
-    assert snapshot["current_task"]["owner"] == "GEMINI"
+    assert snapshot["current_task"]["state"] == WAITING_CHATGPT
+    assert snapshot["current_task"]["owner"] == "GPT"
+    assert snapshot["drive_folder"].endswith("MON_EDIT\\jobs\\operator-project\\AGENT")
     assert by_stage["analyze"] == WAITING_AGENT
     assert snapshot["debug"]["request_id"] == request_id
 
@@ -255,60 +252,61 @@ def test_pipeline_running_without_worker_is_ready_not_running(tmp_path: Path):
 
 
 @pytest.mark.parametrize("stage", ["analyze", "footage"])
-def test_visual_stage_ownership_comes_from_current_route(tmp_path: Path, stage: str):
+def test_visual_stage_routes_directly_to_gpt(tmp_path: Path, stage: str):
     root = valid_project(tmp_path)
     advance_to(root, stage)
-    write_waiting_route(root, stage, actor="gemini", packet_bytes=b"current-pdf")
+    write_waiting_route(root, stage)
 
     snapshot = inspect_operator_project(root)
 
-    assert snapshot["current_task"]["state"] == WAITING_GEMINI
-    assert snapshot["current_task"]["owner"] == "GEMINI"
-    assert snapshot["route"]["current_actor"] == "gemini"
+    assert snapshot["current_task"]["state"] == WAITING_CHATGPT
+    assert snapshot["current_task"]["owner"] == "GPT"
+    assert snapshot["route"]["current_actor"] == "gpt"
 
 
-def test_visual_route_waiting_for_gpt_is_explicit(tmp_path: Path):
+def test_analyze_route_waiting_for_gpt_is_explicit(tmp_path: Path):
     root = valid_project(tmp_path)
     advance_to(root, "analyze")
-    write_waiting_route(root, "analyze", actor="gpt")
+    write_waiting_route(root, "analyze")
 
     snapshot = inspect_operator_project(root)
 
-    assert snapshot["current_task"]["state"] == WAITING_GPT_AFTER_GEMINI
-    assert snapshot["current_task"]["owner"] == "CHATGPT"
-    assert snapshot["portable_packet"] is None
+    assert snapshot["current_task"]["state"] == WAITING_CHATGPT
+    assert snapshot["current_task"]["owner"] == "GPT"
 
 
 def test_gpt_only_match_route_is_explicit(tmp_path: Path):
     root = valid_project(tmp_path)
     advance_to(root, "match")
-    write_waiting_route(root, "match", actor="gpt")
+    write_waiting_route(root, "match")
 
     snapshot = inspect_operator_project(root)
 
     assert snapshot["status"] == "waiting_agent"
     assert snapshot["current_task"]["state"] == WAITING_CHATGPT
-    assert snapshot["current_task"]["owner"] == "CHATGPT"
-    assert snapshot["portable_packet"] is None
+    assert snapshot["current_task"]["owner"] == "GPT"
 
 
-def test_changed_or_stale_packet_is_not_exposed(tmp_path: Path):
+def test_legacy_gemini_route_is_not_exposed_as_current_wait(tmp_path: Path):
     root = valid_project(tmp_path)
     advance_to(root, "footage")
-    write_waiting_route(root, "footage", actor="gemini", revision=2, packet_bytes=b"current")
-    (root / "AGENT" / "gemini_handoff.pdf").write_bytes(b"older-or-changed")
+    write_waiting_route(root, "footage", revision=2)
+    request_path = root / "AGENT" / "request.json"
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    request["route"].update(status="WAITING_GEMINI", current_actor="gemini")
+    request_path.write_text(json.dumps(request), encoding="utf-8")
 
     snapshot = inspect_operator_project(root)
 
-    assert snapshot["status"] == "waiting_agent"
-    assert snapshot["current_task"]["state"] == WAITING_GEMINI
-    assert snapshot["portable_packet"] is None
+    assert snapshot["status"] == "ready"
+    assert snapshot["route"] is None
+    assert snapshot["current_task"]["owner"] == "MOON"
 
 
 def test_stale_route_revision_is_not_treated_as_current_wait(tmp_path: Path):
     root = valid_project(tmp_path)
     advance_to(root, "footage")
-    write_waiting_route(root, "footage", actor="gemini", revision=3, packet_bytes=b"r3")
+    write_waiting_route(root, "footage", revision=3)
     request_path = root / "AGENT" / "request.json"
     request = json.loads(request_path.read_text(encoding="utf-8"))
     request["route"]["revision"] = 2
@@ -317,14 +315,13 @@ def test_stale_route_revision_is_not_treated_as_current_wait(tmp_path: Path):
     snapshot = inspect_operator_project(root)
 
     assert snapshot["status"] == "ready"
-    assert snapshot["portable_packet"] is None
     assert snapshot["route"] is None
 
 
 def test_reopening_while_worker_waits_preserves_waiting_owner(tmp_path: Path):
     root = valid_project(tmp_path)
     advance_to(root, "analyze")
-    write_waiting_route(root, "analyze", actor="gemini", packet_bytes=b"current")
+    write_waiting_route(root, "analyze")
     lock = ProjectRunLock(root)
     lock.acquire()
     try:
@@ -335,7 +332,8 @@ def test_reopening_while_worker_waits_preserves_waiting_owner(tmp_path: Path):
     assert snapshot["status"] == "waiting_agent"
     assert snapshot["worker_active"] is True
     assert snapshot["can_start"] is False
-    assert snapshot["current_task"]["state"] == WAITING_GEMINI
+    assert snapshot["current_task"]["state"] == WAITING_CHATGPT
+    assert snapshot["current_task"]["owner"] == "GPT"
 
 
 def test_response_received_is_owned_by_moon(tmp_path: Path):
@@ -364,7 +362,6 @@ def test_operator_browser_urls_are_centrally_configurable(tmp_path: Path, monkey
     (moon / "operator.json").write_text(
         json.dumps(
             {
-                "gemini_url": "https://gemini.example/project",
                 "chatgpt_url": "https://chatgpt.example/project",
             }
         ),
@@ -372,11 +369,95 @@ def test_operator_browser_urls_are_centrally_configurable(tmp_path: Path, monkey
     )
 
     configured = OperatorWebConfig.load(root)
-    assert configured.gemini_url == "https://gemini.example/project"
     assert configured.chatgpt_url == "https://chatgpt.example/project"
 
     monkeypatch.setenv("MOON_OPERATOR_CHATGPT_URL", "https://chatgpt.example/admin")
     assert OperatorWebConfig.load(root).chatgpt_url == "https://chatgpt.example/admin"
+
+
+def test_debug_window_content_formatter_includes_all_required_sections():
+    rendered = format_debug_text(
+        {
+            "commands": ["moon next", "moon bridge watch"],
+            "request_id": "request-current",
+            "stage": "analyze",
+            "revision": 2,
+            "owner": "gpt",
+            "remote_path": "MON_EDIT/jobs/project/AGENT",
+            "stage_internals": "next_stage=analyze; revision=2",
+            "stdout": "worker output",
+            "stderr": "worker error",
+        }
+    )
+
+    assert "MOON COMMANDS\nmoon next\nmoon bridge watch" in rendered
+    assert "REQUEST ID: request-current" in rendered
+    assert "STAGE: analyze" in rendered
+    assert "REVISION: 2" in rendered
+    assert "OWNER: GPT" in rendered
+    assert "REMOTE DRIVE PATH: MON_EDIT/jobs/project/AGENT" in rendered
+    assert "STAGE INTERNALS: next_stage=analyze; revision=2" in rendered
+    assert "STDOUT\nworker output" in rendered
+    assert "STDERR\nworker error" in rendered
+
+
+def test_gpt_handoff_instruction_is_short_project_aware_and_identity_safe(tmp_path: Path):
+    root = tmp_path / "project-9-10"
+    instruction = chatgpt_handoff_instruction(root, "footage")
+
+    assert "project project-9-10" in instruction
+    assert "request.json" in instruction
+    assert "toàn bộ evidence" in instruction
+    assert "stage footage" in instruction
+    assert "raw application/json response.json" in instruction
+    assert "job_id, request_id, stage, revision" in instruction
+    assert "copy/paste JSON thủ công" in instruction
+    assert len(instruction) < 700
+
+
+def test_gpt_handoff_instruction_uses_configured_drive_project_id(tmp_path: Path):
+    root = tmp_path / "local-folder-name"
+    (root / ".moon").mkdir(parents=True)
+    (root / ".moon" / "bridge.json").write_text(
+        json.dumps({"project_id": "drive-job-id"}), encoding="utf-8"
+    )
+
+    instruction = chatgpt_handoff_instruction(root, "analyze")
+
+    assert "project drive-job-id" in instruction
+    assert "project local-folder-name" not in instruction
+
+
+def test_clipboard_helper_replaces_existing_text():
+    calls = []
+
+    class Clipboard:
+        def clipboard_clear(self):
+            calls.append(("clear", None))
+
+        def clipboard_append(self, value):
+            calls.append(("append", value))
+
+        def update_idletasks(self):
+            calls.append(("update", None))
+
+    set_clipboard_text(Clipboard(), "current GPT request")
+
+    assert calls == [
+        ("clear", None),
+        ("append", "current GPT request"),
+        ("update", None),
+    ]
+
+
+def test_launcher_initial_size_fits_effective_125_percent_desktop():
+    # A 1600x900 display commonly presents about 1280x720 logical pixels at 125%.
+    assert bounded_window_size(
+        1280,
+        720,
+        preferred_width=880,
+        preferred_height=720,
+    ) == (880, 600)
 
 
 def test_drive_response_is_detected_and_worker_auto_resumes(tmp_path: Path, monkeypatch):

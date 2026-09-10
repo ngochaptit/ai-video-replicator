@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import subprocess
@@ -21,6 +20,7 @@ from moon.drive_bridge import (
     BridgeTransportError,
     DriveBridgeConfig,
     MoonDriveBridge,
+    REMOTE_ROOT_NAME,
 )
 from moon.media.inspection import VIDEO_EXTENSIONS
 from moon.runner.pipeline import PipelineRunner
@@ -42,15 +42,11 @@ RUNNING = "Running"
 WAITING_AGENT = "Waiting for Agent"
 COMPLETED = "Completed"
 FAILED = "Failed"
-VISUAL_AGENT_STAGES = {"analyze", "footage"}
 LOCAL_PROCESSING = "LOCAL_PROCESSING"
-WAITING_GEMINI = "WAITING_GEMINI"
 WAITING_CHATGPT = "WAITING_CHATGPT"
-WAITING_GPT_AFTER_GEMINI = "WAITING_GPT_AFTER_GEMINI"
 RESPONSE_RECEIVED = "RESPONSE_RECEIVED"
 TASK_FAILED = "FAILED"
 TASK_COMPLETE = "COMPLETE"
-DEFAULT_GEMINI_URL = "https://gemini.google.com/app"
 DEFAULT_CHATGPT_URL = "https://chatgpt.com/"
 
 
@@ -151,7 +147,6 @@ def stage_status_mapping(
 
 @dataclass(frozen=True)
 class OperatorWebConfig:
-    gemini_url: str = DEFAULT_GEMINI_URL
     chatgpt_url: str = DEFAULT_CHATGPT_URL
 
     @classmethod
@@ -162,11 +157,6 @@ class OperatorWebConfig:
                 Path(project_root).expanduser().resolve() / ".moon" / "operator.json"
             )
         return cls(
-            gemini_url=str(
-                os.environ.get("MOON_OPERATOR_GEMINI_URL")
-                or payload.get("gemini_url")
-                or DEFAULT_GEMINI_URL
-            ),
             chatgpt_url=str(
                 os.environ.get("MOON_OPERATOR_CHATGPT_URL")
                 or payload.get("chatgpt_url")
@@ -175,23 +165,21 @@ class OperatorWebConfig:
         )
 
 
-def chatgpt_handoff_instruction(
-    project_root: str | Path, stage: str, *, after_gemini: bool
-) -> str:
-    project = Path(project_root).expanduser().resolve().name
-    if after_gemini:
-        return (
-            f"Tôi đang vận hành AI Video Replicator project {project}. "
-            "Đây là toàn bộ kết quả Gemini cho request hiện tại. Hãy kiểm tra "
-            "theo contract của request trong thư mục Google Drive AGENT, tạo "
-            "response.json hợp lệ tại chính thư mục đó và tiếp tục đúng pipeline. "
-            "Không yêu cầu tôi sửa JSON."
-        )
+def chatgpt_handoff_instruction(project_root: str | Path, stage: str) -> str:
+    root = Path(project_root).expanduser().resolve()
+    project = str(
+        _safe_read_json(root / ".moon" / "bridge.json").get("project_id")
+        or root.name
+    )
     return (
-        f"Tôi đang vận hành AI Video Replicator project {project}. Hãy đọc request "
-        f"hiện tại trong thư mục Google Drive AGENT, thực hiện stage {stage}, rồi "
-        "ghi response.json đúng schema trở lại cùng thư mục. Giữ nguyên request_id, "
-        "stage và revision. Không yêu cầu tôi sửa JSON."
+        f"Tôi đang vận hành AI Video Replicator project {project}.\n"
+        "Hãy đọc request.json hiện tại và toàn bộ evidence được request tham chiếu "
+        "trong thư mục Google Drive AGENT.\n"
+        f"Thực hiện đúng contract của stage {stage}.\n"
+        "Sau khi hoàn thành, ghi raw application/json response.json trở lại đúng "
+        "thư mục AGENT.\n"
+        "Giữ nguyên job_id, request_id, stage, revision.\n"
+        "Không yêu cầu tôi copy/paste JSON thủ công."
     )
 
 
@@ -342,12 +330,20 @@ def _safe_read_json(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _drive_exchange_details(
+    root: Path, *, job_id: str | None = None
+) -> tuple[str | None, str | None]:
+    payload = _safe_read_json(root / ".moon" / "bridge.json")
+    project_id = str(job_id or payload.get("project_id") or root.name)
+    remote_path = f"{REMOTE_ROOT_NAME}/jobs/{project_id}/AGENT"
+    drive = payload.get("drive") or {}
+    if payload.get("transport", "google_drive_api") != "local_sync" or not isinstance(drive, dict):
+        return remote_path, None
+    sync_root = drive.get("sync_root")
+    if not isinstance(sync_root, str) or not sync_root.strip():
+        return remote_path, None
+    folder = Path(os.path.expandvars(sync_root)).expanduser().resolve() / remote_path
+    return remote_path, str(folder)
 
 
 def _identity_matches(
@@ -398,6 +394,8 @@ def _canonical_waiting_route(
         or request.get("status") != "WAITING_AGENT"
         or not _request_identity_matches(request, active, next_stage=next_stage)
         or not _identity_matches(route, active, next_stage=next_stage)
+        or route.get("current_actor") != "gpt"
+        or route.get("status") != "WAITING_GPT"
     ):
         return None
     # agent-state is a reconstructible cache. A stale cache must not override the
@@ -408,36 +406,6 @@ def _canonical_waiting_route(
     ):
         agent_state = {}
     return active, request, route
-
-
-def _current_portable_packet(
-    root: Path,
-    *,
-    active: dict[str, Any],
-    request: dict[str, Any],
-    route: dict[str, Any],
-) -> str | None:
-    if (
-        route.get("current_actor") != "gemini"
-        or route.get("stage") not in VISUAL_AGENT_STAGES
-        or route.get("portable_packet") != "gemini_handoff.pdf"
-    ):
-        return None
-    manifest = route.get("portable_packet_manifest")
-    packet = root / "AGENT" / "gemini_handoff.pdf"
-    if (
-        not isinstance(manifest, dict)
-        or manifest.get("request_id") != active.get("request_id")
-        or manifest.get("request_id") != request.get("request_id")
-        or manifest.get("stage") != active.get("stage")
-        or manifest.get("revision") != active.get("revision")
-        or not packet.is_file()
-    ):
-        return None
-    try:
-        return str(packet) if _sha256(packet) == manifest.get("sha256") else None
-    except OSError:
-        return None
 
 
 def _task_snapshot(
@@ -464,11 +432,16 @@ def inspect_operator_project(project_root: str | Path) -> dict[str, Any]:
     store = OperatorStatusStore(root)
     durable = store.load()
     lock_active = ProjectRunLock(root).active_owner() is not None
+    remote_path, drive_folder = _drive_exchange_details(root)
     debug = {
         "commands": list(durable.get("commands") or []),
         "stdout": store.tail(store.stdout_path),
         "stderr": store.tail(store.stderr_path),
         "request_id": durable.get("request_id"),
+        "stage": durable.get("stage"),
+        "revision": durable.get("revision"),
+        "owner": durable.get("owner") or "moon",
+        "remote_path": durable.get("remote_path") or remote_path,
         "stage_internals": str(durable.get("stage_internals") or ""),
     }
     if not validation.valid:
@@ -481,7 +454,7 @@ def inspect_operator_project(project_root: str | Path) -> dict[str, Any]:
             "stages": stage_status_mapping(state),
             "project_root": str(root),
             "final_path": str(root / "output" / "final.mp4"),
-            "portable_packet": None,
+            "drive_folder": drive_folder,
             "current_task": _task_snapshot(
                 stage=None,
                 task_state=TASK_FAILED,
@@ -517,7 +490,7 @@ def inspect_operator_project(project_root: str | Path) -> dict[str, Any]:
             ),
             "project_root": str(root),
             "final_path": str(final_path),
-            "portable_packet": None,
+            "drive_folder": drive_folder,
             "current_task": _task_snapshot(
                 stage="qc",
                 task_state=TASK_COMPLETE if complete else TASK_FAILED,
@@ -534,8 +507,11 @@ def inspect_operator_project(project_root: str | Path) -> dict[str, Any]:
     next_stage = state.next_stage()
     assert next_stage is not None
     routed = _canonical_waiting_route(root, next_stage=next_stage)
-    active, request, route = routed if routed else ({}, {}, {})
+    active, _request, route = routed if routed else ({}, {}, {})
     waiting = routed is not None
+    remote_path, drive_folder = _drive_exchange_details(
+        root, job_id=str(active.get("job_id") or "") or None
+    )
     durable_status = str(durable.get("status") or "")
     durable_stage = str(durable.get("stage") or "")
     if durable_stage not in DEFAULT_STAGES or durable_stage in state.completed:
@@ -555,32 +531,13 @@ def inspect_operator_project(project_root: str | Path) -> dict[str, Any]:
     elif waiting:
         activity, activity_stage = "waiting_agent", next_stage
         overall = "waiting_agent"
-        actor = str(route.get("current_actor") or "").lower()
-        if actor == "gemini":
-            task_state = WAITING_GEMINI
-            owner = "GEMINI"
-            title = "CẦN PHÂN TÍCH BẰNG GEMINI"
-            detail = (
-                "Mở gói PDF hiện tại và tải duy nhất file này lên Gemini. "
-                "Moon sẽ tiếp tục tự động khi nhận được phản hồi hợp lệ."
-            )
-        elif actor == "gpt":
-            task_state = (
-                WAITING_GPT_AFTER_GEMINI
-                if next_stage in VISUAL_AGENT_STAGES
-                else WAITING_CHATGPT
-            )
-            owner = "CHATGPT"
-            title = "CẦN CHATGPT"
-            detail = (
-                "Mở ChatGPT và dùng hướng dẫn ngắn để xử lý request Drive hiện tại. "
-                "Moon sẽ tự động nhận response.json hợp lệ."
-            )
-        else:
-            task_state = LOCAL_PROCESSING
-            owner = "MOON"
-            title = "ĐANG XỬ LÝ TỰ ĐỘNG"
-            detail = "Moon đang xử lý route hiện tại."
+        task_state = WAITING_CHATGPT
+        owner = "GPT"
+        title = "CẦN GPT PHÂN TÍCH"
+        detail = (
+            "Mở ChatGPT và dùng yêu cầu ngắn để xử lý request cùng evidence "
+            "trong thư mục Drive AGENT. Moon sẽ tự động nhận response.json hợp lệ."
+        )
         if (
             durable.get("transport_error")
             and durable.get("request_id") == active.get("request_id")
@@ -633,11 +590,6 @@ def inspect_operator_project(project_root: str | Path) -> dict[str, Any]:
             detail=message,
         )
 
-    portable_packet = (
-        _current_portable_packet(root, active=active, request=request, route=route)
-        if waiting
-        else None
-    )
     return {
         "status": overall,
         "message": message,
@@ -651,7 +603,7 @@ def inspect_operator_project(project_root: str | Path) -> dict[str, Any]:
         "stage": activity_stage or next_stage,
         "project_root": str(root),
         "final_path": str(final_path),
-        "portable_packet": portable_packet,
+        "drive_folder": drive_folder,
         "current_task": current_task,
         "route": {
             "current_actor": route.get("current_actor"),
@@ -666,6 +618,10 @@ def inspect_operator_project(project_root: str | Path) -> dict[str, Any]:
         "debug": {
             **debug,
             "request_id": active.get("request_id") or debug["request_id"],
+            "stage": activity_stage or next_stage,
+            "revision": route.get("revision") if waiting else state.revision,
+            "owner": route.get("current_actor") if waiting else "moon",
+            "remote_path": remote_path,
             "stage_internals": (
                 f"pipeline_status={state.status}; next_stage={next_stage}; "
                 f"pipeline_revision={state.revision}; worker_active={lock_active}; "
@@ -792,34 +748,25 @@ class OperatorWorker:
                     stage=stage,
                     message="Mất kết nối Google Drive tạm thời. Đang tự động thử lại...",
                     request_id=None,
-                    portable_packet=None,
                     transport_error=str(exc),
+                    owner="moon",
+                    revision=runner.state.revision,
+                    remote_path=config.remote_path,
                 )
                 self.sleep(config.poll_interval_seconds)
         if published is None:
             return
         request = published["request"]
         route = request.get("route") or {}
-        actor = str(route.get("current_actor") or "").lower()
-        packet = self.root / "AGENT" / "gemini_handoff.pdf"
-        portable = (
-            str(packet)
-            if actor == "gemini" and stage in VISUAL_AGENT_STAGES and packet.is_file()
-            else None
-        )
         self._save(
             status="waiting_agent",
             stage=stage,
-            message=(
-                "Cần phân tích bằng Gemini"
-                if portable
-                else f"Cần ChatGPT hoàn tất bước {STAGE_LABELS[stage]}..."
-                if actor == "gpt"
-                else f"Đang chờ trợ lý AI hoàn tất bước {STAGE_LABELS[stage]}..."
-            ),
+            message=f"Cần GPT phân tích bước {STAGE_LABELS[stage]}...",
             request_id=request.get("request_id"),
-            portable_packet=portable,
             transport_error=None,
+            owner="gpt",
+            revision=route.get("revision"),
+            remote_path=config.remote_path,
             stage_internals=(
                 f"bridge_status=WAITING_AGENT; stage={stage}; "
                 f"revision={(request.get('route') or {}).get('revision')}"
@@ -837,8 +784,10 @@ class OperatorWorker:
                     stage=stage,
                     message="Mất kết nối Google Drive tạm thời. Đang tự động thử lại...",
                     request_id=request.get("request_id"),
-                    portable_packet=portable,
                     transport_error=str(exc),
+                    owner="gpt",
+                    revision=route.get("revision"),
+                    remote_path=config.remote_path,
                 )
                 self.sleep(config.poll_interval_seconds)
                 continue
@@ -848,16 +797,12 @@ class OperatorWorker:
                 self._save(
                     status="waiting_agent",
                     stage=stage,
-                    message=(
-                        "Cần phân tích bằng Gemini"
-                        if portable
-                        else f"Cần ChatGPT hoàn tất bước {STAGE_LABELS[stage]}..."
-                        if actor == "gpt"
-                        else f"Đang chờ trợ lý AI hoàn tất bước {STAGE_LABELS[stage]}..."
-                    ),
+                    message=f"Cần GPT phân tích bước {STAGE_LABELS[stage]}...",
                     request_id=request.get("request_id"),
-                    portable_packet=portable,
                     transport_error=None,
+                    owner="gpt",
+                    revision=route.get("revision"),
+                    remote_path=config.remote_path,
                 )
             if consumed is not None:
                 self._save(
@@ -865,8 +810,10 @@ class OperatorWorker:
                     stage=stage,
                     message="Đã nhận phản hồi hợp lệ. Moon đang tự động tiếp tục pipeline...",
                     request_id=request.get("request_id"),
-                    portable_packet=None,
                     transport_error=None,
+                    owner="moon",
+                    revision=route.get("revision"),
+                    remote_path=config.remote_path,
                     stage_internals=(
                         f"bridge_status={consumed.get('status')}; stage={stage}; "
                         f"revision={route.get('revision')}"
@@ -885,7 +832,7 @@ class OperatorWorker:
         if isinstance(exc, BridgeResponseError):
             return (
                 "Phản hồi từ trợ lý AI không hợp lệ hoặc đã cũ. "
-                "Hãy gửi lại đúng gói Gemini hiện tại rồi nhấn START AI EDIT."
+                "Hãy để GPT sửa response.json theo request Drive hiện tại rồi nhấn START AI EDIT."
             )
         if isinstance(exc, BridgeTransportError):
             return "Không thể kết nối Google Drive. Hãy kiểm tra mạng rồi thử lại."
