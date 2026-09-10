@@ -134,8 +134,8 @@ class GeminiHandoffPacketBuilder:
             )
             pages.extend(
                 self._json_pages(
-                    "Sampling coverage summary",
-                    artifacts.get("footage_evidence_catalog", {}).get("content"),
+                    "Compact footage evidence manifest",
+                    artifacts.get("footage_evidence_manifest", {}).get("content"),
                 )
             )
             for name, value in sorted(artifacts.items()):
@@ -218,6 +218,7 @@ class GeminiHandoffPacketBuilder:
                 "reference_blueprint_scaffold",
                 "footage_profiles_scaffold",
                 "footage_evidence_catalog",
+                "footage_evidence_manifest",
             }:
                 content = json.loads(path.read_text(encoding="utf-8"))
                 artifacts[str(artifact)] = {

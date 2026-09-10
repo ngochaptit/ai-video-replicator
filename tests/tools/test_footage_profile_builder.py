@@ -7,10 +7,114 @@ import jsonschema
 import pytest
 
 from tools.analysis.footage_profile_builder import FootageProfileBuilder
+from tools.base_tool import ToolResult
 
 
 ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_PATH = ROOT / "schemas" / "artifacts" / "footage_profiles.schema.json"
+
+
+def _fake_video_analysis(source: str, output_dir: str) -> ToolResult:
+    output = Path(output_dir)
+    keyframes = output / "keyframes"
+    keyframes.mkdir(parents=True, exist_ok=True)
+    frame = keyframes / "frame.jpg"
+    frame.write_bytes(b"jpg")
+    brief_path = output / "video_analysis_brief.json"
+    brief_path.write_text("{}\n", encoding="utf-8")
+    return ToolResult(
+        success=True,
+        data={
+            "source": {"duration_seconds": 4.0, "resolution": "1920x1080", "fps": 30.0},
+            "structure_analysis": {
+                "scenes": [{"scene_index": 0, "start_time": 0.0, "end_time": 4.0}]
+            },
+            "keyframes": [{"timestamp": 1.0, "path": str(frame)}],
+        },
+        artifacts=[str(brief_path)],
+    )
+
+
+def test_preprocessing_cache_hit_skips_video_analysis(tmp_path: Path, monkeypatch) -> None:
+    footage = tmp_path / "footage"
+    footage.mkdir()
+    (footage / "a.mp4").write_bytes(b"source-v1")
+    calls: list[str] = []
+
+    def fake_execute(_self, inputs):
+        calls.append(Path(inputs["source"]).name)
+        return _fake_video_analysis(inputs["source"], inputs["output_dir"])
+
+    monkeypatch.setattr("tools.analysis.video_analyzer.VideoAnalyzer.execute", fake_execute)
+    inputs = {
+        "footage_dir": str(footage),
+        "output_dir": str(tmp_path / "analysis"),
+        "preprocess_checkpoint_path": str(tmp_path / "checkpoint.json"),
+    }
+
+    assert FootageProfileBuilder().execute(inputs).success
+    assert FootageProfileBuilder().execute(inputs).success
+
+    assert calls == ["a.mp4"]
+    checkpoint = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    assert checkpoint["clips"][str((footage / "a.mp4").resolve())]["status"] == "completed"
+
+
+def test_preprocessing_cache_invalidates_when_source_changes(tmp_path: Path, monkeypatch) -> None:
+    footage = tmp_path / "footage"
+    footage.mkdir()
+    source = footage / "a.mp4"
+    source.write_bytes(b"source-v1")
+    calls: list[str] = []
+
+    def fake_execute(_self, inputs):
+        calls.append(Path(inputs["source"]).read_bytes().decode("ascii"))
+        return _fake_video_analysis(inputs["source"], inputs["output_dir"])
+
+    monkeypatch.setattr("tools.analysis.video_analyzer.VideoAnalyzer.execute", fake_execute)
+    inputs = {
+        "footage_dir": str(footage),
+        "output_dir": str(tmp_path / "analysis"),
+        "preprocess_checkpoint_path": str(tmp_path / "checkpoint.json"),
+    }
+    assert FootageProfileBuilder().execute(inputs).success
+    source.write_bytes(b"source-v2")
+    assert FootageProfileBuilder().execute(inputs).success
+
+    assert calls == ["source-v1", "source-v2"]
+
+
+def test_preprocessing_resumes_after_partial_clip_failure(tmp_path: Path, monkeypatch) -> None:
+    footage = tmp_path / "footage"
+    footage.mkdir()
+    (footage / "a.mp4").write_bytes(b"a")
+    (footage / "b.mp4").write_bytes(b"b")
+    calls: list[str] = []
+
+    def fake_execute(_self, inputs):
+        name = Path(inputs["source"]).name
+        calls.append(name)
+        if name == "b.mp4" and calls.count(name) == 1:
+            return ToolResult(success=False, error="interrupted")
+        return _fake_video_analysis(inputs["source"], inputs["output_dir"])
+
+    monkeypatch.setattr("tools.analysis.video_analyzer.VideoAnalyzer.execute", fake_execute)
+    inputs = {
+        "footage_dir": str(footage),
+        "output_dir": str(tmp_path / "analysis"),
+        "preprocess_checkpoint_path": str(tmp_path / "checkpoint.json"),
+    }
+
+    first = FootageProfileBuilder().execute(inputs)
+    partial = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    second = FootageProfileBuilder().execute(inputs)
+
+    assert first.success and len(first.data["clips"]) == 1
+    assert sorted(entry["status"] for entry in partial["clips"].values()) == [
+        "completed", "failed"
+    ]
+    assert second.success and len(second.data["clips"]) == 2
+    assert calls == ["a.mp4", "b.mp4", "b.mp4"]
 
 
 def test_long_footage_scene_is_only_sampling_scaffold() -> None:

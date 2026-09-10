@@ -83,7 +83,7 @@ class StageExecutionService:
         return {"status": "awaiting_agent", "stage": "analyze", "task": task, "pipeline": self.runner.status()}
 
     def _run_footage(self)->dict[str,Any]:
-        self.runner.begin("footage");out=self.runner.project.root/"analysis"/"footage";inputs={"footage_dir":str(self.runner.project.root/"footage"),"analysis_depth":"deep","max_keyframes_per_file":30,"max_analysis_window_seconds":2.0,"output_dir":str(out)};enrichment=None
+        self.runner.begin("footage");out=self.runner.project.root/"analysis"/"footage";inputs={"footage_dir":str(self.runner.project.root/"footage"),"analysis_depth":"deep","max_keyframes_per_file":30,"max_analysis_window_seconds":2.0,"output_dir":str(out),"preprocess_checkpoint_path":str(self.runner.project.cache_dir/"footage-preprocess.json")};enrichment=None
         if self.runner.artifacts.exists("footage_semantic_enrichment"):
             enrichment=self._materialize_footage_enrichment();inputs["semantic_enrichment_path"]=str(enrichment)
         result=self._execute_tool("footage_profile_builder",inputs)

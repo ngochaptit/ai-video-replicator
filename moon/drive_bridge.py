@@ -18,7 +18,6 @@ from typing import Any, Protocol
 
 from moon.agent_bridge import AgentBridgeService
 from moon.agent_state import AgentStateStore, transition, utc_now
-from moon.evidence import SampledFrameEvidenceStore
 from moon.footage_refinement import (
     FOOTAGE_REFINEMENT_REQUEST_SCHEMA,
     FootageRefinementService,
@@ -585,7 +584,15 @@ class MoonDriveBridge:
         request_id = uuid.uuid4().hex
         created = _utc_now()
         expires = created + timedelta(seconds=self.config.stale_after_seconds)
-        evidence = self._stage_evidence(request_id, handoff)
+        preserved_revision = self.runner.state.revision
+        if refreshing_pending:
+            preserved_revision = max(
+                int(active.get("revision", self.runner.state.revision)),
+                self.runner.state.revision,
+            )
+        evidence = self._stage_evidence(
+            request_id, handoff, handoff_revision=preserved_revision
+        )
         request = {
             "version": BRIDGE_VERSION,
             "job_id": self.config.project_id,
@@ -601,12 +608,6 @@ class MoonDriveBridge:
                 handoff["output_contract"], stage=stage
             ),
         }
-        preserved_revision = self.runner.state.revision
-        if refreshing_pending:
-            preserved_revision = max(
-                int(active.get("revision", self.runner.state.revision)),
-                self.runner.state.revision,
-            )
         if isinstance(request.get("task"), dict):
             request["task"]["revision"] = preserved_revision
         request["route"] = self._initial_route(
@@ -1158,7 +1159,9 @@ class MoonDriveBridge:
             raise BridgeResponseError(f"could not satisfy footage refinement: {exc}") from exc
 
         handoff = AgentHandoffService(self.runner).package("footage")
-        evidence = self._stage_evidence(response["request_id"], handoff)
+        evidence = self._stage_evidence(
+            response["request_id"], handoff, handoff_revision=new_revision
+        )
         route["revision"] = new_revision
         route["refinement_targets"] = targets
         route["refinement_sampling"] = sampling
@@ -1559,7 +1562,11 @@ class MoonDriveBridge:
         return paths
 
     def _stage_evidence(
-        self, request_id: str, handoff: dict[str, Any]
+        self,
+        request_id: str,
+        handoff: dict[str, Any],
+        *,
+        handoff_revision: int,
     ) -> list[tuple[Path, str, dict[str, Any]]]:
         candidates: list[tuple[str, Path, dict[str, Any]]] = []
         for name, value in handoff.get("inputs", {}).items():
@@ -1615,6 +1622,26 @@ class MoonDriveBridge:
                 metadata = sampled_metadata.get(source.resolve(), {"role": "stage_evidence"})
                 candidates.append((str(Path("project") / relative), source, metadata))
 
+        if (
+            handoff.get("stage") == "footage"
+            and self.runner.artifacts.exists("footage_profiles_scaffold")
+        ):
+            manifest_path = self._write_footage_evidence_manifest(
+                request_id,
+                handoff_revision,
+                evidence_input if isinstance(evidence_input, dict) else {},
+            )
+            candidates.append(
+                (
+                    "inputs/footage_evidence_manifest.json",
+                    manifest_path,
+                    {
+                        "role": "input_artifact",
+                        "artifact": "footage_evidence_manifest",
+                    },
+                )
+            )
+
         result: list[tuple[Path, str, dict[str, Any]]] = []
         seen: set[Path] = set()
         total_bytes = 0
@@ -1665,12 +1692,15 @@ class MoonDriveBridge:
                     "images covering every reference window are required before publishing"
                 )
         if handoff.get("stage") == "footage":
-            exported = SampledFrameEvidenceStore(
-                self.runner.project, self.runner.state.revision
-            ).exported("footage")
+            scaffold_has_clips = (
+                self.runner.artifacts.exists("footage_profiles_scaffold")
+                and bool(
+                    self.runner.artifacts.read("footage_profiles_scaffold").get("clips")
+                )
+            )
             expected_paths = {
                 Path(str(frame["absolute_path"])).resolve()
-                for group in exported.get("groups") or []
+                for group in (evidence_input.get("sampled_frames") or {}).get("groups") or []
                 for frame in group.get("frames") or []
             }
             expected_hashes = {_sha256(path) for path in expected_paths}
@@ -1682,26 +1712,161 @@ class MoonDriveBridge:
             prepared_hashes = {str(item.get("sha256")) for item in prepared_frames}
             exported_artifacts = {item[2].get("artifact") for item in result}
             if (
-                len(expected_paths) != len(prepared_frames)
+                (scaffold_has_clips and not expected_paths)
+                or len(expected_paths) != len(prepared_frames)
                 or expected_hashes != prepared_hashes
                 or (
                     expected_paths
                     and "footage_profiles_scaffold" not in exported_artifacts
                 )
-                or (
-                    expected_paths
-                    and "footage_evidence_catalog" not in exported_artifacts
-                )
+                or (expected_paths and "footage_evidence_manifest" not in exported_artifacts)
             ):
                 raise BridgeError(
                     "footage evidence is missing or exceeds bridge limits; "
                     f"prepared {len(prepared_frames)} of {len(expected_paths)} sampled frames; "
                     f"prepared artifacts={sorted(str(item) for item in exported_artifacts)}; "
                     f"configured max_evidence_files={self.config.max_evidence_files}, "
-                    f"max_evidence_bytes={self.config.max_evidence_bytes}; all current "
-                    "adaptive and refinement frames are required before publishing"
+                    f"max_evidence_bytes={self.config.max_evidence_bytes}; all selected "
+                    "frames for the current coarse/refinement pass are required before publishing"
                 )
         return result
+
+    def _write_footage_evidence_manifest(
+        self,
+        request_id: str,
+        handoff_revision: int,
+        evidence_input: dict[str, Any],
+    ) -> Path:
+        sampled = evidence_input.get("sampled_frames") or {}
+        groups_by_clip: dict[str, list[dict[str, Any]]] = {}
+        for group in sampled.get("groups") or []:
+            source = group.get("source") or {}
+            clip_id = str(source.get("clip_id") or "")
+            window = group.get("request") or {}
+            frames = []
+            for frame in group.get("frames") or []:
+                absolute = Path(str(frame.get("absolute_path") or "")).resolve()
+                relative = absolute.relative_to(self.runner.project.root.resolve())
+                frames.append(
+                    {
+                        "timestamp_seconds": frame.get("timestamp_seconds"),
+                        "evidence_ref": (
+                            Path("evidence")
+                            / request_id
+                            / "project"
+                            / relative
+                        ).as_posix(),
+                        "sha256": _sha256(absolute),
+                    }
+                )
+            groups_by_clip.setdefault(clip_id, []).append(
+                {
+                    "range_id": group.get("group_id"),
+                    "sample_kind": group.get("sample_kind") or "legacy",
+                    "handoff_revision": group.get("handoff_revision"),
+                    "start_seconds": window.get("start_seconds"),
+                    "end_seconds": window.get("end_seconds"),
+                    "checkpoint_state": group.get("checkpoint_state") or "legacy_available",
+                    "frames": frames,
+                }
+            )
+
+        checkpoint_path = self.runner.project.cache_dir / "footage-preprocess.json"
+        checkpoint: dict[str, Any] = {}
+        if checkpoint_path.is_file():
+            try:
+                loaded = self._read_json(checkpoint_path)
+                if isinstance(loaded, dict):
+                    checkpoint = loaded
+            except (OSError, UnicodeError, json.JSONDecodeError, BridgeError):
+                checkpoint = {}
+        cached_sources = {
+            str(key): value
+            for key, value in (checkpoint.get("clips") or {}).items()
+            if isinstance(value, dict)
+        }
+        scaffold = self.runner.artifacts.read("footage_profiles_scaffold")
+        clips = []
+        for clip in scaffold.get("clips") or []:
+            raw_source = str(clip.get("path") or "")
+            source = Path(raw_source)
+            if not source.is_absolute():
+                source = self.runner.project.root / source
+            source = source.resolve()
+            source_ref = source.relative_to(self.runner.project.root.resolve()).as_posix()
+            cached = cached_sources.get(str(source)) or {}
+            cached_source = cached.get("source") or {}
+            source_sha256 = _sha256(source)
+            preprocess_state = (
+                "completed"
+                if cached.get("status") == "completed"
+                and cached_source.get("sha256") == source_sha256
+                else "legacy_available"
+            )
+            ranges = sorted(
+                groups_by_clip.get(str(clip.get("clip_id") or ""), []),
+                key=lambda item: (
+                    float(item.get("start_seconds") or 0.0),
+                    str(item.get("range_id") or ""),
+                ),
+            )
+            clips.append(
+                {
+                    "clip_id": clip.get("clip_id"),
+                    "source_ref": source_ref,
+                    "source_sha256": source_sha256,
+                    "preprocessing_checkpoint_state": preprocess_state,
+                    "duration_seconds": clip.get("duration_seconds"),
+                    "fps": clip.get("fps"),
+                    "candidate_ranges": ranges,
+                }
+            )
+        range_count = sum(len(clip["candidate_ranges"]) for clip in clips)
+        frame_count = sum(
+            len(item["frames"])
+            for clip in clips
+            for item in clip["candidate_ranges"]
+        )
+        checkpoint_entries = list(cached_sources.values())
+        completed_preprocessing = sum(
+            entry.get("status") == "completed" for entry in checkpoint_entries
+        )
+        if checkpoint_entries and completed_preprocessing == len(checkpoint_entries):
+            preprocessing_state = "completed"
+        elif checkpoint_entries:
+            preprocessing_state = "partial"
+        else:
+            preprocessing_state = "legacy_available"
+        manifest = {
+            "version": "1.0",
+            "artifact": "footage_evidence_manifest",
+            "job_id": self.config.project_id,
+            "request_id": request_id,
+            "stage": "footage",
+            "revision": handoff_revision,
+            "pipeline_revision": self.runner.state.revision,
+            "preprocessing": {
+                "config_fingerprint": checkpoint.get("config_fingerprint"),
+                "checkpoint_state": preprocessing_state,
+                "completed_clip_count": completed_preprocessing,
+                "tracked_clip_count": len(checkpoint_entries),
+            },
+            "completion": {
+                "phase": sampled.get("selection") or "coarse",
+                "checkpoint_state": "completed",
+                "candidate_range_count": range_count,
+                "completed_range_count": range_count,
+                "frame_count": frame_count,
+            },
+            "clips": clips,
+        }
+        output = (
+            self.runner.project.cache_dir
+            / "footage-bundles"
+            / f"{request_id}.json"
+        )
+        _atomic_json(output, manifest)
+        return output
 
     def _validate_response(self, response: dict[str, Any], active: dict[str, Any]) -> None:
         allowed = {

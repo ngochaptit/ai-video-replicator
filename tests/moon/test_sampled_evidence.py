@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from pathlib import Path
 
@@ -109,6 +110,7 @@ def test_sampled_evidence_survives_restart_and_supports_semantic_submission(
     assert sampled["provenance"]["source"] == {
         "clip_id": "clip_001",
         "path": "footage/clip.mp4",
+        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
     }
     assert [item["timestamp_seconds"] for item in sampled["provenance"]["frames"]] == [
         0.0,
@@ -161,7 +163,7 @@ def test_sampled_evidence_survives_restart_and_supports_semantic_submission(
     handoff_samples = handoff["inputs"]["evidence"]["sampled_frames"]
     assert handoff_samples["frame_count"] == 3
     assert handoff_samples["groups"][0]["group_id"] == sampled["sampling_group_id"]
-    assert str(registry.resolve()) in handoff["inputs"]["evidence"]["files"]
+    assert str(registry.resolve()) not in handoff["inputs"]["evidence"]["files"]
     assert all(
         item["absolute_path"] in handoff["inputs"]["evidence"]["files"]
         for item in handoff_samples["groups"][0]["frames"]

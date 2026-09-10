@@ -185,9 +185,11 @@ Moon also generates `AGENT/gemini_handoff.pdf` for analyze and footage requests
 and publishes it beside `request.json`. If Gemini Web cannot dereference Drive
 links, upload this one PDF to Gemini. Analyze packets contain the route, response
 rules, canonical analyze artifacts, and every required measured reference frame.
-Footage packets contain the footage scaffold, analysis brief, coverage summary,
-output/refinement contracts, and every current adaptive or refinement frame with
-clip, timestamp, sample-group/window, origin, and evidence-path labels. The
+Footage packets contain the footage scaffold, compact evidence manifest,
+coverage summary, output/refinement contracts, and only the frames required for
+the current pass: coarse groups for the initial review or dense groups for the
+current refinement revision. Each frame carries clip, timestamp,
+sample-group/window, origin, and evidence-path labels. The
 embedded manifest and `request.json.route.portable_packet_manifest` bind each
 packet to the current request ID, handoff revision, source hashes, and packet
 hash. The PDF is a portable view; canonical truth remains in the Moon artifacts,
@@ -313,5 +315,23 @@ Moon never chooses a footage match, invents timestamps, silently switches render
 The `footage` stage now seeds deterministic full-clip frame coverage before asking an external vision agent for semantic segmentation. The default target is roughly one measured frame every 4 seconds, bounded to 120 initial frames per clip and chunked into FFmpeg sampling groups of at most 24 frames.
 
 This is evidence generation only; Moon still does not decide what an action means or where a semantic action starts. Gemini scans the portable coarse coverage. If a boundary remains ambiguous, it returns a strict `footage_refinement_request` with measured `clip_id`, `start_seconds`, `end_seconds`, and `reason` values. GPT records `REQUEST_REFINEMENT`; Moon—not Gemini—runs the deterministic sampler, appends the new measured frames, advances the handoff revision, and republishes a fresh route and packet for `RECHECK_TARGETS`. Registered sampled frames are automatically merged into the `footage_profile_builder` evidence catalog on the enrichment pass, so those refined timestamps can become canonical segment boundaries.
+
+Before publishing, `footage_profile_builder` probes and analyzes each source
+locally. `.moon/cache/footage-preprocess.json` checkpoints each completed clip
+against the source SHA-256 and preprocessing configuration. A resume reuses a
+completed clip only while its source, config, analysis brief, and extracted
+frames still match; an interrupted later clip resumes without reprocessing
+earlier clips. Sample groups are likewise source-fingerprinted and marked
+complete only after all requested frames have been written.
+
+Each Drive request includes `inputs/footage_evidence_manifest.json`. This
+request-scoped manifest records job/request/revision identity, preprocessing
+checkpoint state, clip probe metadata, source fingerprints, candidate ranges,
+and the exact timestamp/hash/reference of every exported frame. Dense passes
+export only ranges requested in the current handoff revision; earlier coarse
+and refinement evidence remains in the local append-only catalog for final
+contract validation but is not repeatedly sent to the external agent. The
+manifest is a transport view, not a replacement for Moon artifacts or
+`response.json`.
 
 The quality goal is to avoid the failure mode where a long single-take clip with few hard scene cuts is reduced to a handful of 60–90 second semantic segments, which later forces extreme speed-up and source reuse during matching/rendering.

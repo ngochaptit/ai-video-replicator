@@ -934,6 +934,8 @@ def footage_packet_bridge_at(
         },
         group_id=group_id,
         clip_id="clip_001",
+        sample_kind="coarse",
+        handoff_revision=0,
     )
     planner = FootageEvidencePlanner(runner.project, runner.state.revision)
     runner.artifacts.write(
@@ -1047,6 +1049,13 @@ def test_footage_packet_contains_all_coarse_frames_and_request_binding(tmp_path:
     packet = (bridge.agent_dir / "gemini_handoff.pdf").read_bytes()
     frames = [item for item in request["evidence"] if item.get("role") == "sampled_frame"]
     manifest = request["route"]["portable_packet_manifest"]
+    bundle_descriptor = next(
+        item for item in request["evidence"]
+        if item.get("artifact") == "footage_evidence_manifest"
+    )
+    bundle = json.loads(
+        (bridge.agent_dir / bundle_descriptor["path"]).read_text(encoding="utf-8")
+    )
 
     assert request["route"]["status"] == "WAITING_GEMINI"
     assert request["route"]["next_action"] == "REVIEW_GEMINI_FOOTAGE"
@@ -1057,6 +1066,17 @@ def test_footage_packet_contains_all_coarse_frames_and_request_binding(tmp_path:
     assert manifest["revision"] == request["route"]["revision"] == 0
     assert manifest["stage"] == "footage"
     assert manifest["frame_count"] == len(frames) == 3
+    assert bundle["request_id"] == request["request_id"]
+    assert bundle["revision"] == request["route"]["revision"]
+    assert bundle["clips"][0]["source_sha256"]
+    assert bundle["completion"] == {
+        "phase": "coarse",
+        "checkpoint_state": "completed",
+        "candidate_range_count": 1,
+        "completed_range_count": 1,
+        "frame_count": 3,
+    }
+    assert len(bundle["clips"][0]["candidate_ranges"][0]["frames"]) == 3
     jsonschema.validate(
         json.loads(footage_refinement_response(request)),
         request["expected_response_schema"],
@@ -1145,6 +1165,13 @@ def test_moon_samples_refinement_and_regenerates_fresh_footage_packet(
     revised = json.loads(bridge.request_path.read_text(encoding="utf-8"))
     revised_packet = (bridge.agent_dir / "gemini_handoff.pdf").read_bytes()
     frames = [item for item in revised["evidence"] if item.get("role") == "sampled_frame"]
+    bundle_descriptor = next(
+        item for item in revised["evidence"]
+        if item.get("artifact") == "footage_evidence_manifest"
+    )
+    bundle = json.loads(
+        (bridge.agent_dir / bundle_descriptor["path"]).read_text(encoding="utf-8")
+    )
 
     assert result["status"] == "WAITING_GEMINI"
     assert result["next_action"] == "RECHECK_TARGETS"
@@ -1159,8 +1186,15 @@ def test_moon_samples_refinement_and_regenerates_fresh_footage_packet(
     assert revised["created_at"] != request["created_at"]
     assert json.loads(runner.project.agent_state_path.read_text(encoding="utf-8")) == revised["route"]
     assert revised["route"]["portable_packet_manifest"]["revision"] == 1
-    assert revised["route"]["portable_packet_manifest"]["frame_count"] == 12
-    assert len(frames) == 12
+    assert revised["route"]["portable_packet_manifest"]["frame_count"] == 9
+    assert len(frames) == 9
+    assert all(frame["window_start_seconds"] == 4.0 for frame in frames)
+    assert all(frame["window_end_seconds"] == 5.0 for frame in frames)
+    assert bundle["revision"] == 1
+    assert bundle["completion"]["phase"] == "dense_refinement"
+    assert bundle["completion"]["frame_count"] == 9
+    assert bundle["clips"][0]["candidate_ranges"][0]["start_seconds"] == 4.0
+    assert bundle["clips"][0]["candidate_ranges"][0]["end_seconds"] == 5.0
     assert revised_packet != original_packet
     assert b"revision=1" in revised_packet
     assert "revision=1" in revised["route"]["completion_contract"]["terminal_acknowledgement"]
