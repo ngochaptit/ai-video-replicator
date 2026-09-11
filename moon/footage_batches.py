@@ -14,7 +14,7 @@ from moon.runner.pipeline import PipelineRunner
 from moon.semantic_contracts import _validate_footage
 
 
-PROGRESS_VERSION = "1.0"
+PROGRESS_VERSION = "1.1"
 
 
 def _utc_now() -> str:
@@ -64,10 +64,38 @@ class FootageSemanticProgress:
             return None
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                return None
             policy = FootageBatchPolicy(**value["policy"])
-        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            policy.validate()
+            if (
+                value.get("version") != PROGRESS_VERSION
+                or int(value.get("pipeline_revision", -1)) != runner.state.revision
+                or not isinstance(value.get("batches"), list)
+            ):
+                return None
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
             return None
-        return cls(runner, policy)
+
+        progress = cls(runner, policy)
+        if not runner.artifacts.exists("footage_profiles_scaffold"):
+            return None
+        scaffold = runner.artifacts.read("footage_profiles_scaffold")
+        if not scaffold.get("clips"):
+            return None
+        groups = progress._candidate_groups(kinds={"coarse", "manual"})
+        if not groups:
+            return None
+        if value.get("identity_sha256") != progress._identity(scaffold, groups):
+            return None
+        return progress
 
     def ensure(self) -> dict[str, Any] | None:
         if not self.runner.artifacts.exists("footage_profiles_scaffold"):
@@ -75,17 +103,20 @@ class FootageSemanticProgress:
         scaffold = self.runner.artifacts.read("footage_profiles_scaffold")
         if not scaffold.get("clips"):
             return None
-        groups = self._candidate_groups()
+
+        # Bootstrap semantic work from coarse/manual evidence only. Dense refinement
+        # groups may pre-exist in migrated projects, but they are reusable measured
+        # cache, not pre-approved semantic work. They become child batches only after
+        # GPT requests refinement for a specific active parent batch.
+        groups = self._candidate_groups(kinds={"coarse", "manual"})
         if not groups:
             return None
+
         identity = self._identity(scaffold, groups)
         current = self.load()
-        if (
-            current.get("version") == PROGRESS_VERSION
-            and current.get("pipeline_revision") == self.runner.state.revision
-            and current.get("identity_sha256") == identity
-        ):
+        if self._matches_current(current, identity):
             return current
+
         batches = self._pack(groups, start_index=1)
         progress = {
             "version": PROGRESS_VERSION,
@@ -125,6 +156,7 @@ class FootageSemanticProgress:
             if active.get("status") in {"pending", "waiting_agent", "waiting_gpt"}:
                 return active
             progress["active_batch_id"] = None
+
         completed = {
             str(item["batch_id"])
             for item in progress["batches"]
@@ -212,10 +244,16 @@ class FootageSemanticProgress:
             ),
             None,
         )
-        if batch is None or batch.get("status") != "blocked_refinement" or not batch.get("blocked_by"):
+        if (
+            batch is None
+            or batch.get("status") != "blocked_refinement"
+            or not batch.get("blocked_by")
+        ):
             return None
         if batch.get("response_sha256") != response_sha256:
-            raise ValueError("footage refinement request was already checkpointed differently")
+            raise ValueError(
+                "footage refinement request was already checkpointed differently"
+            )
         children = [
             item
             for item in progress.get("batches") or []
@@ -229,6 +267,7 @@ class FootageSemanticProgress:
         }
 
     def selected_evidence(self) -> dict[str, Any] | None:
+        """Return transport evidence for the active batch only."""
         batch = self.active_for_request()
         if batch is None:
             return None
@@ -253,7 +292,8 @@ class FootageSemanticProgress:
         actual = sum(len(item.get("frames") or []) for item in selected)
         if actual != expected:
             raise ValueError(
-                f"footage batch {batch['batch_id']} evidence is incomplete: {actual}/{expected} frames"
+                f"footage batch {batch['batch_id']} evidence is incomplete: "
+                f"{actual}/{expected} frames"
             )
         return {
             **available,
@@ -264,12 +304,65 @@ class FootageSemanticProgress:
             "batch": self.public_batch(batch),
         }
 
+    def validation_evidence(self) -> dict[str, Any] | None:
+        """Return local validation evidence without expanding the transport packet.
+
+        A resumed parent batch may use measured boundaries discovered by completed
+        refinement children. Those child frames stay local here and are never
+        re-exported in the parent's Drive request.
+        """
+        batch = self.active_for_request()
+        selected = self.selected_evidence()
+        if batch is None or selected is None:
+            return selected
+
+        progress = self.load()
+        completed_children = {
+            str(item["batch_id"]): item
+            for item in progress.get("batches") or []
+            if item.get("status") == "completed"
+            and item.get("batch_id") in set(batch.get("blocked_by") or [])
+        }
+        if not completed_children:
+            return selected
+
+        wanted_group_ids = {
+            str(item.get("group_id"))
+            for child in completed_children.values()
+            for item in child.get("ranges") or []
+        }
+        available = SampledFrameEvidenceStore(
+            self.project, self.runner.state.revision
+        ).available("footage")
+        by_id = {
+            str(group.get("group_id")): group
+            for group in available.get("groups") or []
+        }
+        missing = sorted(wanted_group_ids - set(by_id))
+        if missing:
+            raise ValueError(
+                "completed footage refinement evidence is no longer available: "
+                + ", ".join(missing)
+            )
+
+        merged: dict[str, dict[str, Any]] = {
+            str(group.get("group_id")): group
+            for group in selected.get("groups") or []
+        }
+        for group_id in wanted_group_ids:
+            merged[group_id] = by_id[group_id]
+        groups = list(merged.values())
+        return {
+            **selected,
+            "groups": groups,
+            "frame_count": sum(len(group.get("frames") or []) for group in groups),
+        }
+
     def write_active_scaffold(self) -> Path:
         batch = self.active_for_request()
         if batch is None:
             raise ValueError("no active footage semantic batch")
         scaffold = self.runner.artifacts.read("footage_profiles_scaffold")
-        progress = self.load()
         windows: dict[str, list[tuple[float, float]]] = {}
         for item in batch["ranges"]:
             windows.setdefault(str(item["clip_id"]), []).append(
@@ -291,23 +384,15 @@ class FootageSemanticProgress:
                 )
             ]
             clips.append(clip)
-        completed_prerequisites = []
-        blocked_by = set(batch.get("blocked_by") or [])
-        for prerequisite in progress.get("batches") or []:
-            if (
-                prerequisite.get("batch_id") not in blocked_by
-                or prerequisite.get("status") != "completed"
-                or not prerequisite.get("result_artifact")
-            ):
-                continue
-            completed_prerequisites.append(
-                {
-                    "batch_id": prerequisite["batch_id"],
-                    "result": self.runner.artifacts.read(
-                        str(prerequisite["result_artifact"])
-                    ),
-                }
-            )
+
+        completed_prerequisites = [
+            {
+                "batch_id": child["batch_id"],
+                "result": self.runner.artifacts.read(str(child["result_artifact"])),
+            }
+            for child in self._completed_refinement_children(batch)
+            if child.get("result_artifact")
+        ]
         compact = {
             "version": scaffold.get("version", "1.0"),
             "source_dir": scaffold.get("source_dir"),
@@ -339,26 +424,42 @@ class FootageSemanticProgress:
         if batch is None:
             batch = next(
                 (
-                    item for item in progress.get("batches") or []
+                    item
+                    for item in progress.get("batches") or []
                     if item.get("request_id") == request_id
                     and item.get("status") == "completed"
                 ),
                 None,
             )
         if batch is None:
-            raise ValueError("footage response does not match the active semantic batch")
+            raise ValueError(
+                "footage response does not match the active semantic batch"
+            )
         if batch.get("status") == "completed":
             if batch.get("response_sha256") != response_sha256:
-                raise ValueError("completed footage batch received a different response")
+                raise ValueError(
+                    "completed footage batch received a different response"
+                )
             return {
                 "idempotent": True,
                 "batch": self.public_batch(batch),
                 "final_payload": self.assemble_if_complete(),
                 "remaining_batches": self.remaining_count(),
             }
+
         normalized = self._validate_partial(batch, payload)
         artifact_name = f"footage_semantic_batch_{batch['batch_id']}"
         artifact_path = self.runner.artifacts.write(artifact_name, normalized)
+        previous = {
+            key: batch.get(key)
+            for key in (
+                "status",
+                "response_sha256",
+                "result_artifact",
+                "result_path",
+                "completed_at",
+            )
+        }
         batch.update(
             status="completed",
             response_sha256=response_sha256,
@@ -368,7 +469,25 @@ class FootageSemanticProgress:
         )
         progress["active_batch_id"] = None
         self.save(progress)
-        final = self.assemble_if_complete()
+        try:
+            final = self.assemble_if_complete()
+        except Exception:
+            # A final cross-batch invariant can fail even after a single partial
+            # payload passed its local validator. Do not poison durable progress:
+            # restore the waiting batch so GPT can submit a corrected response.
+            for key, value in previous.items():
+                if value is None:
+                    batch.pop(key, None)
+                else:
+                    batch[key] = value
+            progress["active_batch_id"] = batch["batch_id"]
+            self.save(progress)
+            try:
+                artifact_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
         return {
             "idempotent": False,
             "batch": self.public_batch(batch),
@@ -388,12 +507,18 @@ class FootageSemanticProgress:
         if batch is not None and batch.get("request_id") != request_id:
             batch = None
         if batch is None:
-            raise ValueError("refinement response does not match the active semantic batch")
+            raise ValueError(
+                "refinement response does not match the active semantic batch"
+            )
         retry_count = int(batch.get("semantic_retry_count", 0)) + 1
         if retry_count > 3:
-            batch.update(status="failed", error="semantic refinement retry limit reached")
+            batch.update(
+                status="failed", error="semantic refinement retry limit reached"
+            )
             self.save(progress)
-            raise ValueError("semantic refinement retry limit reached for active footage batch")
+            raise ValueError(
+                "semantic refinement retry limit reached for active footage batch"
+            )
         groups = [
             group
             for group in self._candidate_groups(kinds={"dense_refinement"})
@@ -401,6 +526,8 @@ class FootageSemanticProgress:
         ]
         if len(groups) != len(set(group_ids)):
             raise ValueError("not all sampled refinement groups are available")
+        self._assert_groups_within_batch(batch, groups)
+
         new_batches = self._pack(groups, start_index=len(progress["batches"]) + 1)
         batch.update(
             status="blocked_refinement",
@@ -420,13 +547,16 @@ class FootageSemanticProgress:
 
     def remaining_count(self) -> int:
         return sum(
-            item.get("status") != "completed" for item in self.load().get("batches") or []
+            item.get("status") != "completed"
+            for item in self.load().get("batches") or []
         )
 
     def assemble_if_complete(self) -> dict[str, Any] | None:
         progress = self.load()
         batches = progress.get("batches") or []
-        if not batches or any(item.get("status") != "completed" for item in batches):
+        if not batches or any(
+            item.get("status") != "completed" for item in batches
+        ):
             return None
         scaffold = self.runner.artifacts.read("footage_profiles_scaffold")
         results: dict[str, list[dict[str, Any]]] = {}
@@ -437,6 +567,7 @@ class FootageSemanticProgress:
             payload = self.runner.artifacts.read(str(name))
             for clip in payload.get("clips") or []:
                 results.setdefault(str(clip["clip_id"]), []).append(clip)
+
         assembled_clips = []
         for measured in scaffold.get("clips") or []:
             clip_id = str(measured["clip_id"])
@@ -456,7 +587,10 @@ class FootageSemanticProgress:
                     segments[key] = segment
             ordered = sorted(
                 segments.values(),
-                key=lambda item: (float(item["source_in"]), float(item["source_out"])),
+                key=lambda item: (
+                    float(item["source_in"]),
+                    float(item["source_out"]),
+                ),
             )
             clip = {
                 "clip_id": clip_id,
@@ -467,15 +601,20 @@ class FootageSemanticProgress:
                 "segments": ordered,
             }
             assembled_clips.append(clip)
-        planner = FootageEvidencePlanner(self.project, self.runner.state.revision)
+
+        planner = FootageEvidencePlanner(
+            self.project, self.runner.state.revision
+        )
         payload = {
             "clips": assembled_clips,
             "evidence_catalog": planner.evidence_catalog(scaffold),
-            "analysis_notes": ["Deterministically assembled from completed footage semantic batches."],
+            "analysis_notes": [
+                "Deterministically assembled from completed footage semantic batches."
+            ],
         }
         sampled = SampledFrameEvidenceStore(
             self.project, self.runner.state.revision
-        ).active("footage")
+        ).available("footage")
         _validate_footage(scaffold, payload, sampled.get("groups") or [])
         return payload
 
@@ -483,8 +622,15 @@ class FootageSemanticProgress:
         public = {
             key: batch.get(key)
             for key in (
-                "batch_id", "sequence", "batch_type", "status", "revision",
-                "clip_ids", "request_id", "retry_count", "frame_count",
+                "batch_id",
+                "sequence",
+                "batch_type",
+                "status",
+                "revision",
+                "clip_ids",
+                "request_id",
+                "retry_count",
+                "frame_count",
                 "evidence_bytes",
             )
         }
@@ -492,8 +638,12 @@ class FootageSemanticProgress:
             {
                 key: item.get(key)
                 for key in (
-                    "group_id", "clip_id", "start_seconds", "end_seconds",
-                    "frame_count", "evidence_bytes",
+                    "group_id",
+                    "clip_id",
+                    "start_seconds",
+                    "end_seconds",
+                    "frame_count",
+                    "evidence_bytes",
                 )
             }
             for item in batch.get("ranges") or []
@@ -503,25 +653,41 @@ class FootageSemanticProgress:
     def _validate_partial(
         self, batch: dict[str, Any], payload: dict[str, Any]
     ) -> dict[str, Any]:
-        if payload.get("artifact") not in {None, "footage_semantic_batch", "footage_semantic_enrichment"}:
+        if payload.get("artifact") not in {
+            None,
+            "footage_semantic_batch",
+            "footage_semantic_enrichment",
+        }:
             raise ValueError("footage batch payload has an unsupported artifact")
         if payload.get("batch_id") != batch["batch_id"]:
-            raise ValueError("footage batch payload batch_id does not match active batch")
+            raise ValueError(
+                "footage batch payload batch_id does not match active batch"
+            )
         clips = payload.get("clips")
         if not isinstance(clips, list) or not clips:
             raise ValueError("footage semantic batch requires non-empty clips[]")
-        actual = {str(item.get("clip_id") or "") for item in clips if isinstance(item, dict)}
+        actual = {
+            str(item.get("clip_id") or "")
+            for item in clips
+            if isinstance(item, dict)
+        }
         expected = set(batch["clip_ids"])
         if actual != expected or len(clips) != len(actual):
             raise ValueError(
-                f"footage batch clips must exactly match active batch: expected={sorted(expected)}"
+                "footage batch clips must exactly match active batch: "
+                f"expected={sorted(expected)}"
             )
+
         scaffold = self.runner.artifacts.read("footage_profiles_scaffold")
         subset = {
             **scaffold,
-            "clips": [item for item in scaffold["clips"] if str(item["clip_id"]) in expected],
+            "clips": [
+                item
+                for item in scaffold["clips"]
+                if str(item["clip_id"]) in expected
+            ],
         }
-        selected = self.selected_evidence() or {"groups": []}
+        selected = self.validation_evidence() or {"groups": []}
         normalized = {
             "artifact": "footage_semantic_batch",
             "batch_id": batch["batch_id"],
@@ -530,6 +696,7 @@ class FootageSemanticProgress:
             "clips": clips,
         }
         _validate_footage(subset, normalized, selected.get("groups") or [])
+
         windows: dict[str, list[tuple[float, float]]] = {}
         for item in batch["ranges"]:
             windows.setdefault(str(item["clip_id"]), []).append(
@@ -537,24 +704,30 @@ class FootageSemanticProgress:
             )
         for clip in clips:
             for segment in clip.get("segments") or []:
-                start, end = float(segment["source_in"]), float(segment["source_out"])
+                start = float(segment["source_in"])
+                end = float(segment["source_out"])
                 if not any(
                     start >= low - 1e-6 and end <= high + 1e-6
                     for low, high in windows[str(clip["clip_id"])]
                 ):
-                    raise ValueError("footage batch segment is outside active evidence ranges")
+                    raise ValueError(
+                        "footage batch segment is outside active evidence ranges"
+                    )
+
+        self._assert_no_completed_refinement_overlap(batch, clips)
         return normalized
 
-    def _candidate_groups(self, kinds: set[str] | None = None) -> list[dict[str, Any]]:
+    def _candidate_groups(
+        self, kinds: set[str] | None = None
+    ) -> list[dict[str, Any]]:
         groups = SampledFrameEvidenceStore(
             self.project, self.runner.state.revision
         ).available("footage").get("groups") or []
+        allowed = kinds if kinds is not None else {"coarse", "manual"}
         result = []
         for group in groups:
-            kind = str(group.get("sample_kind") or "coarse")
-            if kinds is not None and kind not in kinds:
-                continue
-            if kinds is None and kind not in {"coarse", "manual", "dense_refinement"}:
+            kind = str(group.get("sample_kind") or "manual")
+            if kind not in allowed:
                 continue
             result.append(group)
         return sorted(
@@ -562,17 +735,22 @@ class FootageSemanticProgress:
             key=lambda item: (
                 0 if item.get("sample_kind") == "dense_refinement" else 1,
                 str((item.get("source") or {}).get("clip_id") or ""),
-                float((item.get("request") or {}).get("start_seconds") or 0.0),
+                float(
+                    (item.get("request") or {}).get("start_seconds") or 0.0
+                ),
                 str(item.get("group_id") or ""),
             ),
         )
 
-    def _pack(self, groups: list[dict[str, Any]], *, start_index: int) -> list[dict[str, Any]]:
+    def _pack(
+        self, groups: list[dict[str, Any]], *, start_index: int
+    ) -> list[dict[str, Any]]:
         units: list[dict[str, Any]] = []
         for group in groups:
             frames = list(group.get("frames") or [])
             evidence_bytes = sum(
-                Path(str(frame["absolute_path"])).stat().st_size for frame in frames
+                Path(str(frame["absolute_path"])).stat().st_size
+                for frame in frames
             )
             if (
                 len(frames) > self.policy.max_frames
@@ -582,33 +760,36 @@ class FootageSemanticProgress:
                 raise ValueError(
                     "single footage evidence range exceeds batch budget: "
                     f"group={group.get('group_id')} "
-                    f"window={request.get('start_seconds')}-{request.get('end_seconds')} "
+                    f"window={request.get('start_seconds')}-"
+                    f"{request.get('end_seconds')} "
                     f"frames={len(frames)}/{self.policy.max_frames} "
                     f"bytes={evidence_bytes}/{self.policy.max_evidence_bytes}"
                 )
             if frames:
                 units.append(self._unit(group, frames, evidence_bytes))
+
         batches: list[dict[str, Any]] = []
         current: list[dict[str, Any]] = []
         clips: set[str] = set()
         frames = total_bytes = 0
         for unit in units:
             next_clips = clips | {unit["clip_id"]}
-            range_limit = (
-                self.policy.max_refinement_ranges
-                if unit["batch_type"] == "refinement"
-                else self.policy.max_frames
+            incompatible = (
+                bool(current)
+                and current[0]["batch_type"] != unit["batch_type"]
             )
-            incompatible = current and current[0]["batch_type"] != unit["batch_type"]
-            exceeds = current and (
+            exceeds = bool(current) and (
                 incompatible
                 or len(next_clips) > self.policy.max_clips
-                or len(current) >= range_limit
+                or len(current) >= self.policy.max_refinement_ranges
                 or frames + unit["frame_count"] > self.policy.max_frames
-                or total_bytes + unit["evidence_bytes"] > self.policy.max_evidence_bytes
+                or total_bytes + unit["evidence_bytes"]
+                > self.policy.max_evidence_bytes
             )
             if exceeds:
-                batches.append(self._batch(current, start_index + len(batches)))
+                batches.append(
+                    self._batch(current, start_index + len(batches))
+                )
                 current, clips, frames, total_bytes = [], set(), 0, 0
             current.append(unit)
             clips.add(unit["clip_id"])
@@ -619,13 +800,17 @@ class FootageSemanticProgress:
         return batches
 
     @staticmethod
-    def _unit(group: dict[str, Any], frames: list[dict[str, Any]], size: int) -> dict[str, Any]:
+    def _unit(
+        group: dict[str, Any], frames: list[dict[str, Any]], size: int
+    ) -> dict[str, Any]:
         window = group.get("request") or {}
         return {
             "group_id": str(group["group_id"]),
             "clip_id": str((group.get("source") or {}).get("clip_id") or ""),
             "batch_type": (
-                "refinement" if group.get("sample_kind") == "dense_refinement" else "coarse"
+                "refinement"
+                if group.get("sample_kind") == "dense_refinement"
+                else "coarse"
             ),
             "start_seconds": float(window.get("start_seconds") or 0.0),
             "end_seconds": float(window.get("end_seconds") or 0.0),
@@ -635,10 +820,26 @@ class FootageSemanticProgress:
         }
 
     @staticmethod
-    def _batch(units: list[dict[str, Any]], sequence: int) -> dict[str, Any]:
-        identity = [{key: item[key] for key in ("group_id", "clip_id", "start_seconds", "end_seconds", "frame_paths")} for item in units]
+    def _batch(
+        units: list[dict[str, Any]], sequence: int
+    ) -> dict[str, Any]:
+        identity = [
+            {
+                key: item[key]
+                for key in (
+                    "group_id",
+                    "clip_id",
+                    "start_seconds",
+                    "end_seconds",
+                    "frame_paths",
+                )
+            }
+            for item in units
+        ]
         batch_type = units[0]["batch_type"]
-        batch_id = f"{batch_type}_{sequence:03d}_{_canonical_hash(identity)[:10]}"
+        batch_id = (
+            f"{batch_type}_{sequence:03d}_{_canonical_hash(identity)[:10]}"
+        )
         return {
             "batch_id": batch_id,
             "sequence": sequence,
@@ -653,7 +854,9 @@ class FootageSemanticProgress:
             "retry_count": 0,
         }
 
-    def _identity(self, scaffold: dict[str, Any], groups: list[dict[str, Any]]) -> str:
+    def _identity(
+        self, scaffold: dict[str, Any], groups: list[dict[str, Any]]
+    ) -> str:
         return _canonical_hash(
             {
                 "pipeline_revision": self.runner.state.revision,
@@ -662,7 +865,9 @@ class FootageSemanticProgress:
                 "coarse_groups": [
                     {
                         "group_id": group.get("group_id"),
-                        "source_sha256": (group.get("source") or {}).get("sha256"),
+                        "source_sha256": (group.get("source") or {}).get(
+                            "sha256"
+                        ),
                     }
                     for group in groups
                     if group.get("sample_kind") != "dense_refinement"
@@ -670,8 +875,98 @@ class FootageSemanticProgress:
             }
         )
 
+    def _matches_current(
+        self, current: dict[str, Any], identity: str
+    ) -> bool:
+        return (
+            current.get("version") == PROGRESS_VERSION
+            and current.get("pipeline_revision") == self.runner.state.revision
+            and current.get("identity_sha256") == identity
+            and current.get("policy") == asdict(self.policy)
+            and isinstance(current.get("batches"), list)
+        )
+
+    def _completed_refinement_children(
+        self, batch: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        blocked_by = set(batch.get("blocked_by") or [])
+        if not blocked_by:
+            return []
+        return [
+            item
+            for item in self.load().get("batches") or []
+            if item.get("batch_id") in blocked_by
+            and item.get("batch_type") == "refinement"
+            and item.get("status") == "completed"
+        ]
+
+    def _assert_no_completed_refinement_overlap(
+        self,
+        batch: dict[str, Any],
+        clips: list[dict[str, Any]],
+    ) -> None:
+        children = self._completed_refinement_children(batch)
+        if not children:
+            return
+        child_segments: dict[str, list[tuple[float, float]]] = {}
+        for child in children:
+            artifact = child.get("result_artifact")
+            if not artifact:
+                continue
+            result = self.runner.artifacts.read(str(artifact))
+            for clip in result.get("clips") or []:
+                clip_id = str(clip.get("clip_id") or "")
+                for segment in clip.get("segments") or []:
+                    child_segments.setdefault(clip_id, []).append(
+                        (
+                            float(segment["source_in"]),
+                            float(segment["source_out"]),
+                        )
+                    )
+        for clip in clips:
+            clip_id = str(clip.get("clip_id") or "")
+            for segment in clip.get("segments") or []:
+                start = float(segment["source_in"])
+                end = float(segment["source_out"])
+                for child_start, child_end in child_segments.get(
+                    clip_id, []
+                ):
+                    if (
+                        start < child_end - 1e-6
+                        and end > child_start + 1e-6
+                    ):
+                        raise ValueError(
+                            "footage parent batch overlaps completed "
+                            "refinement semantics"
+                        )
+
+    def _assert_groups_within_batch(
+        self,
+        batch: dict[str, Any],
+        groups: list[dict[str, Any]],
+    ) -> None:
+        windows: dict[str, list[tuple[float, float]]] = {}
+        for item in batch.get("ranges") or []:
+            windows.setdefault(str(item["clip_id"]), []).append(
+                (float(item["start_seconds"]), float(item["end_seconds"]))
+            )
+        for group in groups:
+            clip_id = str((group.get("source") or {}).get("clip_id") or "")
+            request = group.get("request") or {}
+            start = float(request.get("start_seconds") or 0.0)
+            end = float(request.get("end_seconds") or 0.0)
+            if not any(
+                start >= low - 1e-6 and end <= high + 1e-6
+                for low, high in windows.get(clip_id, [])
+            ):
+                raise ValueError(
+                    "footage refinement evidence is outside the active batch"
+                )
+
     @staticmethod
-    def _by_id(progress: dict[str, Any], batch_id: str) -> dict[str, Any]:
+    def _by_id(
+        progress: dict[str, Any], batch_id: str
+    ) -> dict[str, Any]:
         for batch in progress.get("batches") or []:
             if batch.get("batch_id") == batch_id:
                 return batch

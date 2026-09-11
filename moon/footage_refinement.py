@@ -29,7 +29,12 @@ FOOTAGE_REFINEMENT_REQUEST_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["clip_id", "start_seconds", "end_seconds", "reason"],
+                "required": [
+                    "clip_id",
+                    "start_seconds",
+                    "end_seconds",
+                    "reason",
+                ],
                 "properties": {
                     "clip_id": {"type": "string", "minLength": 1},
                     "start_seconds": {"type": "number", "minimum": 0},
@@ -48,13 +53,17 @@ class FootageRefinementService:
     def __init__(self, runner: PipelineRunner) -> None:
         self.runner = runner
         self.scaffold = runner.artifacts.read("footage_profiles_scaffold")
-        self.store = SampledFrameEvidenceStore(runner.project, runner.state.revision)
+        self.store = SampledFrameEvidenceStore(
+            runner.project, runner.state.revision
+        )
 
     def validate(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         try:
             validate(payload, FOOTAGE_REFINEMENT_REQUEST_SCHEMA)
         except ValidationError as exc:
-            raise ValueError(f"invalid footage_refinement_request: {exc.message}") from exc
+            raise ValueError(
+                f"invalid footage_refinement_request: {exc.message}"
+            ) from exc
 
         clips = {
             str(clip.get("clip_id") or ""): clip
@@ -66,26 +75,37 @@ class FootageRefinementService:
         for item in payload["requests"]:
             clip_id = str(item["clip_id"]).strip()
             if clip_id not in clips:
-                raise ValueError(f"refinement clip_id {clip_id!r} is not in footage_profiles_scaffold")
+                raise ValueError(
+                    f"refinement clip_id {clip_id!r} is not in "
+                    "footage_profiles_scaffold"
+                )
             start = round(float(item["start_seconds"]), 6)
             end = round(float(item["end_seconds"]), 6)
             duration = float(clips[clip_id].get("duration_seconds") or 0.0)
             if end <= start:
-                raise ValueError("each refinement window requires end_seconds > start_seconds")
+                raise ValueError(
+                    "each refinement window requires end_seconds > start_seconds"
+                )
             if end - start > MAX_REFINEMENT_WINDOW_SECONDS:
                 raise ValueError(
-                    f"refinement windows must be at most {MAX_REFINEMENT_WINDOW_SECONDS:g} seconds"
+                    "refinement windows must be at most "
+                    f"{MAX_REFINEMENT_WINDOW_SECONDS:g} seconds"
                 )
             if end > duration + 1e-6:
                 raise ValueError(
-                    f"refinement window for {clip_id!r} exceeds measured duration {duration}"
+                    f"refinement window for {clip_id!r} exceeds measured "
+                    f"duration {duration}"
                 )
             reason = str(item["reason"]).strip()
             if not reason:
-                raise ValueError("each refinement window requires a non-empty reason")
+                raise ValueError(
+                    "each refinement window requires a non-empty reason"
+                )
             identity = (clip_id, start, end)
             if identity in identities:
-                raise ValueError("duplicate footage refinement windows are not allowed")
+                raise ValueError(
+                    "duplicate footage refinement windows are not allowed"
+                )
             identities.add(identity)
             normalized.append(
                 {
@@ -95,10 +115,47 @@ class FootageRefinementService:
                     "reason": reason,
                 }
             )
+
+        self._validate_active_batch_scope(normalized)
         return normalized
 
+    def _validate_active_batch_scope(
+        self, requests: list[dict[str, Any]]
+    ) -> None:
+        # Validate scope before sampling so an untrusted response cannot make Moon
+        # inspect clips/ranges that were not part of the active GPT batch.
+        from moon.footage_batches import FootageSemanticProgress
+
+        progress = FootageSemanticProgress.open_existing(self.runner)
+        active = progress.active_for_request() if progress else None
+        if not active:
+            return
+
+        windows: dict[str, list[tuple[float, float]]] = {}
+        for item in active.get("ranges") or []:
+            windows.setdefault(str(item["clip_id"]), []).append(
+                (
+                    float(item["start_seconds"]),
+                    float(item["end_seconds"]),
+                )
+            )
+        for item in requests:
+            start = float(item["start_seconds"])
+            end = float(item["end_seconds"])
+            if not any(
+                start >= low - 1e-6 and end <= high + 1e-6
+                for low, high in windows.get(str(item["clip_id"]), [])
+            ):
+                raise ValueError(
+                    "footage refinement request is outside the active "
+                    "semantic batch"
+                )
+
     def sample(
-        self, requests: list[dict[str, Any]], *, handoff_revision: int
+        self,
+        requests: list[dict[str, Any]],
+        *,
+        handoff_revision: int,
     ) -> dict[str, Any]:
         self.store.clear_fingerprint_cache()
         clips = {
@@ -173,7 +230,9 @@ class FootageRefinementService:
             "version": "1.0",
             "entries": planner.evidence_catalog(self.scaffold),
             "coverage": planner.coverage_summary(self.scaffold),
-            "policy": str(previous.get("policy") or "adaptive_uniform_seed_v1"),
+            "policy": str(
+                previous.get("policy") or "adaptive_uniform_seed_v1"
+            ),
             "refinements": refinements,
         }
         self.runner.artifacts.write("footage_evidence_catalog", catalog)
