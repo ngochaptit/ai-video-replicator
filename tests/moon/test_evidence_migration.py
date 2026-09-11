@@ -116,7 +116,7 @@ def test_migrated_legacy_refinement_is_not_bootstrapped_as_coarse_and_duplicate_
             start=0.0,
             end=8.0,
             count=3,
-            width=320,
+            width=640,
         ),
         _event(
             group_id="typed-coarse",
@@ -140,6 +140,7 @@ def test_migrated_legacy_refinement_is_not_bootstrapped_as_coarse_and_duplicate_
             end=10.0,
             count=3,
             width=640,
+            sample_kind="manual",
         ),
     ]
     registry.write_text(
@@ -164,3 +165,67 @@ def test_migrated_legacy_refinement_is_not_bootstrapped_as_coarse_and_duplicate_
     assert batch["batch_type"] == "coarse"
     assert batch["frame_count"] == 3
     assert [item["group_id"] for item in batch["ranges"]] == ["typed-coarse"]
+
+
+def test_same_timestamps_with_different_frame_content_are_not_deduped(
+    tmp_path: Path,
+) -> None:
+    runner = PipelineRunner(MoonProject.open(tmp_path, create=True))
+    source = tmp_path / "footage" / "clip.mp4"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"source")
+
+    root = tmp_path / ".moon" / "cache" / "connector-frames" / "footage" / "revision_000"
+    first_root = root / "first"
+    second_root = root / "second"
+    first_root.mkdir(parents=True)
+    second_root.mkdir(parents=True)
+
+    timestamps = [0.0, 4.0, 8.0]
+    first_frames = []
+    second_frames = []
+    for index, timestamp in enumerate(timestamps, start=1):
+        first = first_root / f"frame_{index}.jpg"
+        second = second_root / f"frame_{index}.jpg"
+        first.write_bytes(f"first-{timestamp}".encode())
+        second.write_bytes(f"second-{timestamp}".encode())
+        first_frames.append(first)
+        second_frames.append(second)
+
+    store = SampledFrameEvidenceStore(runner.project, 0)
+    registry = store.registry_path("footage")
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    events = [
+        _event(
+            group_id="first",
+            source=source,
+            clip_id="clip_001",
+            frame_paths=first_frames,
+            timestamps=timestamps,
+            start=0.0,
+            end=8.0,
+            count=3,
+            width=320,
+            sample_kind="coarse",
+        ),
+        _event(
+            group_id="second",
+            source=source,
+            clip_id="clip_001",
+            frame_paths=second_frames,
+            timestamps=timestamps,
+            start=0.0,
+            end=8.0,
+            count=3,
+            width=640,
+            sample_kind="coarse",
+        ),
+    ]
+    registry.write_text(
+        "".join(json.dumps(item, sort_keys=True) + "\n" for item in events),
+        encoding="utf-8",
+    )
+
+    available = store.available("footage")
+    assert {group["group_id"] for group in available["groups"]} == {"first", "second"}
+    assert available["frame_count"] == 6
