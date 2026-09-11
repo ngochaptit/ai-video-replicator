@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from moon.atomic import atomic_write_json
+
 
 AGENT_STATE_VERSION = "1.0"
 REQUIRED_AGENT_STATE_FIELDS = {
@@ -54,12 +56,7 @@ class AgentStateStore:
         missing = sorted(REQUIRED_AGENT_STATE_FIELDS - set(state))
         if missing:
             raise ValueError(f"agent state is missing required fields: {', '.join(missing)}")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-        temporary.replace(self.path)
+        atomic_write_json(self.path, state)
         return state
 
 

@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from moon.atomic import atomic_write_json
+
 
 class CheckpointStore:
     def __init__(self, root: Path) -> None:
@@ -15,9 +17,7 @@ class CheckpointStore:
 
     def write(self, stage: str, payload: dict[str, Any]) -> Path:
         path = self.path_for(stage)
-        temp = path.with_suffix(".json.tmp")
-        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temp.replace(path)
+        atomic_write_json(path, payload)
         return path
 
     def read(self, stage: str) -> dict[str, Any]:

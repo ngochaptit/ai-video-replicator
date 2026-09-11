@@ -20,7 +20,9 @@ from jsonschema import Draft202012Validator
 
 from moon.agent_bridge import AgentBridgeService
 from moon.agent_state import AgentStateStore, transition, utc_now
+from moon.atomic import atomic_write_json
 from moon.evidence import SampledFrameEvidenceStore
+from moon.footage_batches import FootageBatchPolicy, FootageSemanticProgress
 from moon.footage_refinement import (
     FOOTAGE_REFINEMENT_REQUEST_SCHEMA,
     FootageRefinementService,
@@ -80,10 +82,7 @@ def _expand_path(value: str | None) -> Path | None:
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temp.replace(path)
+    atomic_write_json(path, payload)
 
 
 def _sha256(path: Path) -> str:
@@ -142,6 +141,10 @@ class DriveBridgeConfig:
     sync_root: Path | None = None
     max_evidence_files: int = 500
     max_evidence_bytes: int = 512 * 1024 * 1024
+    max_footage_batch_clips: int = 3
+    max_footage_batch_ranges: int = 3
+    max_footage_batch_frames: int = 60
+    max_footage_batch_bytes: int = 24 * 1024 * 1024
 
     @classmethod
     def load(cls, project_root: Path) -> DriveBridgeConfig:
@@ -170,6 +173,12 @@ class DriveBridgeConfig:
             sync_root=_expand_path(drive.get("sync_root")),
             max_evidence_files=int(payload.get("max_evidence_files", 500)),
             max_evidence_bytes=int(payload.get("max_evidence_bytes", 512 * 1024 * 1024)),
+            max_footage_batch_clips=int(payload.get("max_footage_batch_clips", 3)),
+            max_footage_batch_ranges=int(payload.get("max_footage_batch_ranges", 3)),
+            max_footage_batch_frames=int(payload.get("max_footage_batch_frames", 60)),
+            max_footage_batch_bytes=int(
+                payload.get("max_footage_batch_bytes", 24 * 1024 * 1024)
+            ),
         )
         config.validate(project_root)
         return config
@@ -185,6 +194,13 @@ class DriveBridgeConfig:
             raise ValueError("stale_after_seconds must be greater than zero")
         if self.max_evidence_files < 0 or self.max_evidence_bytes < 0:
             raise ValueError("evidence limits must not be negative")
+        if min(
+            self.max_footage_batch_clips,
+            self.max_footage_batch_ranges,
+            self.max_footage_batch_frames,
+            self.max_footage_batch_bytes,
+        ) <= 0:
+            raise ValueError("footage batch limits must be positive")
         if self.transport == "google_drive_api":
             if not self.drive_root_folder_id:
                 raise ValueError("drive.root_folder_id is required for Google Drive API transport")
@@ -565,9 +581,27 @@ class MoonDriveBridge:
         self._sleep = sleeper
 
     def publish(self, stage: str) -> dict[str, Any]:
+        footage_progress = self._footage_progress() if stage == "footage" else None
+        footage_batch = footage_progress.activate() if footage_progress else None
+        if (
+            footage_progress
+            and footage_batch is None
+            and footage_progress.remaining_count() > 0
+        ):
+            raise BridgeError(
+                "footage semantic batching has unfinished work but no eligible batch; "
+                "inspect .moon/footage-semantic-progress.json"
+            )
         state = self._read_state()
         active = state.get("active_request") or {}
-        if active.get("stage") == stage and active.get("status") == "CONSUMED":
+        if (
+            active.get("stage") == stage
+            and active.get("status") == "CONSUMED"
+            and (
+                footage_batch is None
+                or footage_batch.get("request_id") == active.get("request_id")
+            )
+        ):
             request_id = str(active.get("request_id") or "")
             resume = self._resume_pending(state, request_id)
             return {
@@ -598,6 +632,11 @@ class MoonDriveBridge:
             and pending_request is not None
             and self._request_matches_active(pending_request, active)
             and self._request_uses_gpt_route(pending_request)
+            and (
+                footage_batch is None
+                or (pending_request.get("task") or {}).get("batch_id")
+                == footage_batch.get("batch_id")
+            )
         )
         if reusable_pending:
             self._ensure_agent_state(state, pending_request)
@@ -613,12 +652,31 @@ class MoonDriveBridge:
         refreshing_pending = pending_same_stage and not reusable_pending
         if refreshing_pending:
             self._archive_remote_response(active)
+        elif (
+            footage_batch
+            and active.get("stage") == stage
+            and active.get("status") == "CONSUMED"
+            and footage_batch.get("request_id") != active.get("request_id")
+        ):
+            self._archive_remote_response(active)
 
         handoff = AgentHandoffService(self.runner).package(stage)
         request_id = uuid.uuid4().hex
         created = _utc_now()
         expires = created + timedelta(seconds=self.config.stale_after_seconds)
-        evidence = self._stage_evidence(request_id, handoff)
+        preserved_revision = int(
+            footage_batch.get("revision", self.runner.state.revision)
+            if footage_batch
+            else self.runner.state.revision
+        )
+        if refreshing_pending:
+            preserved_revision = max(
+                int(active.get("revision", self.runner.state.revision)),
+                self.runner.state.revision,
+            )
+        evidence = self._stage_evidence(
+            request_id, handoff, handoff_revision=preserved_revision
+        )
         request = {
             "version": BRIDGE_VERSION,
             "job_id": self.config.project_id,
@@ -631,20 +689,30 @@ class MoonDriveBridge:
             "task": self._compact_task(handoff["task"]),
             "evidence": [descriptor for _, _, descriptor in evidence],
             "expected_response_schema": self._response_schema(
-                handoff["output_contract"], stage=stage
+                handoff["output_contract"], stage=stage,
+                footage_batch=footage_batch is not None,
             ),
         }
-        preserved_revision = self.runner.state.revision
-        if refreshing_pending:
-            preserved_revision = max(
-                int(active.get("revision", self.runner.state.revision)),
-                self.runner.state.revision,
-            )
         if isinstance(request.get("task"), dict):
             request["task"]["revision"] = preserved_revision
+            if footage_batch:
+                public_batch = footage_progress.public_batch(footage_batch)
+                public_batch.update(
+                    request_id=request_id,
+                    revision=preserved_revision,
+                    status="waiting_gpt",
+                )
+                request["task"].update(
+                    batch_id=footage_batch["batch_id"],
+                    batch_type=footage_batch["batch_type"],
+                    batch_clip_ids=footage_batch["clip_ids"],
+                    batch_ranges=public_batch["ranges"],
+                )
         request["route"] = self._initial_route(
             request, handoff, revision=preserved_revision
         )
+        if footage_batch:
+            request["route"]["batch"] = public_batch
         self.agent_dir.mkdir(parents=True, exist_ok=True)
         self._archive_previous_response(state)
         _atomic_json(self.request_path, request)
@@ -669,7 +737,15 @@ class MoonDriveBridge:
             "created_at": request["created_at"],
             "expires_at": request["expires_at"],
             "revision": request["route"]["revision"],
+            "batch_id": footage_batch.get("batch_id") if footage_batch else None,
         }
+        if footage_batch:
+            footage_progress.bind_request(
+                footage_batch["batch_id"],
+                request_id,
+                preserved_revision,
+                [str(item[2].get("sha256") or "") for item in evidence],
+            )
         self._write_state(state)
         self.agent_state.save(request["route"])
         remote = self.transport.publish(self.request_path, self._publish_paths(request))
@@ -716,6 +792,11 @@ class MoonDriveBridge:
         if response["stage"] == "footage" and review:
             self._validate_footage_review(response, review, active)
             if review["decision"] == "REQUEST_REFINEMENT":
+                progress = FootageSemanticProgress.open_existing(self.runner)
+                if progress and progress.batch_for_request(str(request_id)):
+                    return self._route_footage_batch_refinement(
+                        response, raw, state, active, progress
+                    )
                 return self._route_footage_refinement(
                     response, raw, state, active
                 )
@@ -729,7 +810,61 @@ class MoonDriveBridge:
                 "revision": int(active.get("revision", self.runner.state.revision)),
             }
         response_hash = _sha256_bytes(raw)
-        submission = AgentHandoffService(self.runner).submit(response["stage"], response["payload"])
+        footage_progress = (
+            FootageSemanticProgress.open_existing(self.runner)
+            if response["stage"] == "footage"
+            else None
+        )
+        footage_batch = (
+            footage_progress.batch_for_request(str(request_id))
+            if footage_progress
+            else None
+        )
+        if footage_batch:
+            try:
+                outcome = footage_progress.complete(
+                    str(request_id), response["payload"], response_hash
+                )
+            except ValueError as exc:
+                raise BridgeResponseError(str(exc)) from exc
+            final_payload = outcome.get("final_payload")
+            if final_payload is not None:
+                submission = AgentHandoffService(self.runner).submit(
+                    "footage", final_payload
+                )
+                submission["assembled_batches"] = True
+            else:
+                submission = {
+                    "accepted": True,
+                    "stage": "footage",
+                    "artifact": "footage_semantic_batch",
+                    "batch": outcome["batch"],
+                    "remaining_batches": outcome["remaining_batches"],
+                }
+        else:
+            submission = AgentHandoffService(self.runner).submit(
+                response["stage"], response["payload"]
+            )
+        return self._finalize_consumed_response(
+            response,
+            response_hash=response_hash,
+            state=state,
+            active=active,
+            routing_review=routing_review,
+            submission=submission,
+        )
+
+    def _finalize_consumed_response(
+        self,
+        response: dict[str, Any],
+        *,
+        response_hash: str,
+        state: dict[str, Any],
+        active: dict[str, Any],
+        routing_review: dict[str, Any] | None,
+        submission: dict[str, Any],
+    ) -> dict[str, Any]:
+        request_id = str(response["request_id"])
         consumed_at = _iso(_utc_now())
         consumed_response = dict(response)
         consumed_response["status"] = "CONSUMED"
@@ -743,6 +878,7 @@ class MoonDriveBridge:
         request["updated_at"] = consumed_at
         _atomic_json(self.request_path, request)
         self.agent_state.save(route)
+        consumed = state.get("consumed") or {}
         consumed[request_id] = {
             "response_sha256": response_hash,
             "stage": response["stage"],
@@ -769,7 +905,7 @@ class MoonDriveBridge:
                 self.transport.upload_request(self.request_path)
             except BridgeTransportError as exc:
                 sync_warnings.append(str(exc))
-        return {
+        result = {
             "status": "CONSUMED" if resume and resume.get("status") != "resume_pending" else "CONSUMED_RESUME_PENDING",
             "request_id": request_id,
             "stage": response["stage"],
@@ -777,6 +913,9 @@ class MoonDriveBridge:
             "resume": resume,
             "warnings": sync_warnings,
         }
+        if "remaining_batches" in submission:
+            result["remaining_batches"] = submission["remaining_batches"]
+        return result
 
     def watch(self, *, timeout_seconds: float | None = None) -> dict[str, Any]:
         deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
@@ -829,6 +968,23 @@ class MoonDriveBridge:
             "next_action": route.get("next_action") if route else None,
             "agent_state": route,
         }
+
+    def _footage_progress(self) -> FootageSemanticProgress:
+        return FootageSemanticProgress(
+            self.runner,
+            FootageBatchPolicy(
+                max_clips=self.config.max_footage_batch_clips,
+                max_refinement_ranges=self.config.max_footage_batch_ranges,
+                max_frames=min(
+                    self.config.max_footage_batch_frames,
+                    max(1, self.config.max_evidence_files - 2),
+                ),
+                max_evidence_bytes=min(
+                    self.config.max_footage_batch_bytes,
+                    self.config.max_evidence_bytes,
+                ),
+            ),
+        )
 
     def _resume_pending(self, state: dict[str, Any], request_id: str) -> dict[str, Any] | None:
         entry = (state.get("consumed") or {}).get(request_id)
@@ -935,6 +1091,9 @@ class MoonDriveBridge:
                 next_action="CONSUME_RESPONSE",
             )
         if stage == "footage":
+            batch = (request.get("task") or {}).get("batch_id")
+            if batch:
+                artifact = "footage_semantic_batch"
             completed_ack = self._acknowledgement(
                 request, actor="gpt", decision="APPROVED", output="response.json",
                 next_actor="moon", next_action="CONSUME_RESPONSE",
@@ -967,7 +1126,7 @@ class MoonDriveBridge:
                     "terminal_acknowledgement": completed_ack,
                     "gpt_response": {
                         "required": [
-                            "footage_semantic_enrichment or footage_refinement_request",
+                            "footage_semantic_batch or footage_refinement_request",
                             "terminal_acknowledgement",
                         ],
                         "input": "The current Drive request and every referenced evidence file.",
@@ -991,7 +1150,7 @@ class MoonDriveBridge:
                     },
                 },
                 "actor_instructions": {
-                    "gpt": "Read request.json and every referenced sampled frame directly from Drive. Review coarse-to-fine. Write response.json with review.decision APPROVED for a valid enrichment, or REQUEST_REFINEMENT with the strict footage_refinement_request payload. Moon performs all local sampling commands.",
+                    "gpt": "Read only the active batch inputs and sampled frames referenced by request.json directly from Drive. Return semantic segments only for the listed batch clips/ranges; do not scan other Drive evidence. When the compact scaffold lists completed_refinement_results, treat those as accepted partial semantics and do not duplicate or overlap their segments. Write response.json with review.decision APPROVED for a valid footage_semantic_batch, or REQUEST_REFINEMENT with the strict footage_refinement_request payload. Moon performs all local sampling commands.",
                 },
                 "updated_at": utc_now(),
                 "transition_history": [],
@@ -1131,6 +1290,86 @@ class MoonDriveBridge:
                 "footage_refinement_request requires review.decision=REQUEST_REFINEMENT"
             )
 
+    def _route_footage_batch_refinement(
+        self,
+        response: dict[str, Any],
+        raw: bytes,
+        bridge_state: dict[str, Any],
+        active: dict[str, Any],
+        progress: FootageSemanticProgress,
+    ) -> dict[str, Any]:
+        service = FootageRefinementService(self.runner)
+        response_hash = _sha256_bytes(raw)
+        try:
+            targets = service.validate(response["payload"])
+            replayed = progress.replayed_refinement(
+                str(response["request_id"]), response_hash
+            )
+            if replayed is not None:
+                submission = {
+                    "accepted": True,
+                    "stage": "footage",
+                    "artifact": "footage_refinement_request",
+                    "targets": targets,
+                    "sampling": {
+                        "sampled_groups": 0,
+                        "skipped_existing_groups": len(replayed["group_ids"]),
+                        "groups": replayed["group_ids"],
+                        "checkpoint_replay": True,
+                    },
+                    **replayed,
+                }
+                result = self._finalize_consumed_response(
+                    response,
+                    response_hash=response_hash,
+                    state=bridge_state,
+                    active=active,
+                    routing_review=response.get("review"),
+                    submission=submission,
+                )
+                result.update(
+                    next_action="NEXT_FOOTAGE_BATCH",
+                    remaining_batches=progress.remaining_count(),
+                )
+                return result
+            progress_value = progress.load()
+            sampling_revision = int(
+                progress_value.get(
+                    "next_revision", int(active.get("revision", 0)) + 1
+                )
+            )
+            sampling = service.sample(
+                targets, handoff_revision=sampling_revision
+            )
+            deferred = progress.defer_for_refinement(
+                str(response["request_id"]),
+                [str(item["group_id"]) for item in sampling["groups"]],
+                response_hash,
+            )
+        except (OSError, ValueError) as exc:
+            raise BridgeResponseError(f"could not satisfy footage refinement: {exc}") from exc
+        submission = {
+            "accepted": True,
+            "stage": "footage",
+            "artifact": "footage_refinement_request",
+            "targets": targets,
+            "sampling": sampling,
+            **deferred,
+        }
+        result = self._finalize_consumed_response(
+            response,
+            response_hash=response_hash,
+            state=bridge_state,
+            active=active,
+            routing_review=response.get("review"),
+            submission=submission,
+        )
+        result.update(
+            next_action="NEXT_FOOTAGE_BATCH",
+            remaining_batches=progress.remaining_count(),
+        )
+        return result
+
     def _route_footage_refinement(
         self,
         response: dict[str, Any],
@@ -1158,7 +1397,9 @@ class MoonDriveBridge:
             raise BridgeResponseError(f"could not satisfy footage refinement: {exc}") from exc
 
         handoff = AgentHandoffService(self.runner).package("footage")
-        evidence = self._stage_evidence(response["request_id"], handoff)
+        evidence = self._stage_evidence(
+            response["request_id"], handoff, handoff_revision=new_revision
+        )
         route["revision"] = new_revision
         route["refinement_targets"] = targets
         route["refinement_sampling"] = sampling
@@ -1341,10 +1582,19 @@ class MoonDriveBridge:
     ) -> dict[str, Any]:
         route = dict(route_value) if isinstance(route_value, dict) else {}
         if route.get("stage") in {"analyze", "footage"} and review:
-            route = transition(
-                route, "GPT_APPROVED", current_actor="gpt", next_actor="moon",
-                next_action="CONSUME_RESPONSE",
-            )
+            if (
+                route.get("stage") == "footage"
+                and review.get("decision") == "REQUEST_REFINEMENT"
+            ):
+                route = transition(
+                    route, "REQUEST_REFINEMENT", current_actor="gpt",
+                    next_actor="moon", next_action="REQUEST_REFINEMENT",
+                )
+            else:
+                route = transition(
+                    route, "GPT_APPROVED", current_actor="gpt", next_actor="moon",
+                    next_action="CONSUME_RESPONSE",
+                )
         return transition(
             route, "WAITING_MOON", current_actor="moon", next_actor="moon",
             next_action="CONSUME_RESPONSE",
@@ -1470,7 +1720,11 @@ class MoonDriveBridge:
         return self._evidence_paths(request)
 
     def _stage_evidence(
-        self, request_id: str, handoff: dict[str, Any]
+        self,
+        request_id: str,
+        handoff: dict[str, Any],
+        *,
+        handoff_revision: int,
     ) -> list[tuple[Path, str, dict[str, Any]]]:
         candidates: list[tuple[str, Path, dict[str, Any]]] = []
         for name, value in handoff.get("inputs", {}).items():
@@ -1526,6 +1780,26 @@ class MoonDriveBridge:
                 metadata = sampled_metadata.get(source.resolve(), {"role": "stage_evidence"})
                 candidates.append((str(Path("project") / relative), source, metadata))
 
+        if (
+            handoff.get("stage") == "footage"
+            and self.runner.artifacts.exists("footage_profiles_scaffold")
+        ):
+            manifest_path = self._write_footage_evidence_manifest(
+                request_id,
+                handoff_revision,
+                evidence_input if isinstance(evidence_input, dict) else {},
+            )
+            candidates.append(
+                (
+                    "inputs/footage_evidence_manifest.json",
+                    manifest_path,
+                    {
+                        "role": "input_artifact",
+                        "artifact": "footage_evidence_manifest",
+                    },
+                )
+            )
+
         result: list[tuple[Path, str, dict[str, Any]]] = []
         seen: set[Path] = set()
         total_bytes = 0
@@ -1576,12 +1850,15 @@ class MoonDriveBridge:
                     "images covering every reference window are required before publishing"
                 )
         if handoff.get("stage") == "footage":
-            exported = SampledFrameEvidenceStore(
-                self.runner.project, self.runner.state.revision
-            ).exported("footage")
+            scaffold_has_clips = (
+                self.runner.artifacts.exists("footage_profiles_scaffold")
+                and bool(
+                    self.runner.artifacts.read("footage_profiles_scaffold").get("clips")
+                )
+            )
             expected_paths = {
                 Path(str(frame["absolute_path"])).resolve()
-                for group in exported.get("groups") or []
+                for group in (evidence_input.get("sampled_frames") or {}).get("groups") or []
                 for frame in group.get("frames") or []
             }
             expected_hashes = {_sha256(path) for path in expected_paths}
@@ -1593,7 +1870,8 @@ class MoonDriveBridge:
             prepared_hashes = {str(item.get("sha256")) for item in prepared_frames}
             exported_artifacts = {item[2].get("artifact") for item in result}
             if (
-                len(expected_paths) != len(prepared_frames)
+                (scaffold_has_clips and not expected_paths)
+                or len(expected_paths) != len(prepared_frames)
                 or expected_hashes != prepared_hashes
                 or (
                     expected_paths
@@ -1601,7 +1879,7 @@ class MoonDriveBridge:
                 )
                 or (
                     expected_paths
-                    and "footage_evidence_catalog" not in exported_artifacts
+                    and "footage_evidence_manifest" not in exported_artifacts
                 )
             ):
                 raise BridgeError(
@@ -1609,10 +1887,146 @@ class MoonDriveBridge:
                     f"prepared {len(prepared_frames)} of {len(expected_paths)} sampled frames; "
                     f"prepared artifacts={sorted(str(item) for item in exported_artifacts)}; "
                     f"configured max_evidence_files={self.config.max_evidence_files}, "
-                    f"max_evidence_bytes={self.config.max_evidence_bytes}; all current "
-                    "adaptive and refinement frames are required before publishing"
+                    f"max_evidence_bytes={self.config.max_evidence_bytes}; all selected "
+                    "frames for the active footage batch are required before publishing"
                 )
         return result
+
+    def _write_footage_evidence_manifest(
+        self,
+        request_id: str,
+        handoff_revision: int,
+        evidence_input: dict[str, Any],
+    ) -> Path:
+        sampled = evidence_input.get("sampled_frames") or {}
+        groups_by_clip: dict[str, list[dict[str, Any]]] = {}
+        for group in sampled.get("groups") or []:
+            source = group.get("source") or {}
+            clip_id = str(source.get("clip_id") or "")
+            window = group.get("request") or {}
+            frames = []
+            for frame in group.get("frames") or []:
+                absolute = Path(str(frame.get("absolute_path") or "")).resolve()
+                relative = absolute.relative_to(self.runner.project.root.resolve())
+                frames.append(
+                    {
+                        "timestamp_seconds": frame.get("timestamp_seconds"),
+                        "evidence_ref": (
+                            Path("evidence") / request_id / "project" / relative
+                        ).as_posix(),
+                        "sha256": _sha256(absolute),
+                    }
+                )
+            groups_by_clip.setdefault(clip_id, []).append(
+                {
+                    "range_id": group.get("group_id"),
+                    "sample_kind": group.get("sample_kind") or "legacy",
+                    "handoff_revision": group.get("handoff_revision"),
+                    "start_seconds": window.get("start_seconds"),
+                    "end_seconds": window.get("end_seconds"),
+                    "checkpoint_state": group.get("checkpoint_state") or "legacy_available",
+                    "frames": frames,
+                }
+            )
+
+        checkpoint_path = self.runner.project.cache_dir / "footage-preprocess.json"
+        checkpoint: dict[str, Any] = {}
+        if checkpoint_path.is_file():
+            try:
+                checkpoint = self._read_json(checkpoint_path)
+            except (OSError, UnicodeError, json.JSONDecodeError, BridgeError):
+                checkpoint = {}
+        cached_sources = {
+            str(key): value
+            for key, value in (checkpoint.get("clips") or {}).items()
+            if isinstance(value, dict)
+        }
+        scaffold = self.runner.artifacts.read("footage_profiles_scaffold")
+        batch_metadata = sampled.get("batch") or {}
+        active_clip_ids = {
+            str(item) for item in batch_metadata.get("clip_ids") or []
+        }
+        clips = []
+        for clip in scaffold.get("clips") or []:
+            clip_id = str(clip.get("clip_id") or "")
+            if active_clip_ids and clip_id not in active_clip_ids:
+                continue
+            raw_source = str(clip.get("path") or "")
+            source = Path(raw_source)
+            if not source.is_absolute():
+                source = self.runner.project.root / source
+            source = source.resolve()
+            source_ref = source.relative_to(self.runner.project.root.resolve()).as_posix()
+            cached = cached_sources.get(str(source)) or {}
+            cached_source = cached.get("source") or {}
+            source_sha256 = _sha256(source)
+            preprocess_state = (
+                "completed"
+                if cached.get("status") == "completed"
+                and cached_source.get("sha256") == source_sha256
+                else "legacy_available"
+            )
+            ranges = sorted(
+                groups_by_clip.get(clip_id, []),
+                key=lambda item: (
+                    float(item.get("start_seconds") or 0.0),
+                    str(item.get("range_id") or ""),
+                ),
+            )
+            clips.append(
+                {
+                    "clip_id": clip.get("clip_id"),
+                    "source_ref": source_ref,
+                    "source_sha256": source_sha256,
+                    "preprocessing_checkpoint_state": preprocess_state,
+                    "duration_seconds": clip.get("duration_seconds"),
+                    "fps": clip.get("fps"),
+                    "candidate_ranges": ranges,
+                }
+            )
+        range_count = sum(len(clip["candidate_ranges"]) for clip in clips)
+        frame_count = sum(
+            len(item["frames"])
+            for clip in clips
+            for item in clip["candidate_ranges"]
+        )
+        checkpoint_entries = list(cached_sources.values())
+        completed_preprocessing = sum(
+            entry.get("status") == "completed" for entry in checkpoint_entries
+        )
+        if checkpoint_entries and completed_preprocessing == len(checkpoint_entries):
+            preprocessing_state = "completed"
+        elif checkpoint_entries:
+            preprocessing_state = "partial"
+        else:
+            preprocessing_state = "legacy_available"
+        manifest = {
+            "version": "1.0",
+            "artifact": "footage_evidence_manifest",
+            "job_id": self.config.project_id,
+            "request_id": request_id,
+            "stage": "footage",
+            "revision": handoff_revision,
+            "pipeline_revision": self.runner.state.revision,
+            "batch": batch_metadata or None,
+            "preprocessing": {
+                "config_fingerprint": checkpoint.get("config_fingerprint"),
+                "checkpoint_state": preprocessing_state,
+                "completed_clip_count": completed_preprocessing,
+                "tracked_clip_count": len(checkpoint_entries),
+            },
+            "completion": {
+                "phase": sampled.get("selection") or "coarse",
+                "checkpoint_state": "completed",
+                "candidate_range_count": range_count,
+                "completed_range_count": range_count,
+                "frame_count": frame_count,
+            },
+            "clips": clips,
+        }
+        output = self.runner.project.cache_dir / "footage-bundles" / f"{request_id}.json"
+        _atomic_json(output, manifest)
+        return output
 
     def _validate_response(self, response: dict[str, Any], active: dict[str, Any]) -> None:
         allowed = {
@@ -1683,7 +2097,8 @@ class MoonDriveBridge:
 
     @staticmethod
     def _response_schema(
-        output_contract: dict[str, Any], *, stage: str | None = None
+        output_contract: dict[str, Any], *, stage: str | None = None,
+        footage_batch: bool = False,
     ) -> dict[str, Any]:
         payload_schema = output_contract
         decisions = ["APPROVED", "REVISION_REQUIRED"]
@@ -1698,7 +2113,11 @@ class MoonDriveBridge:
         if stage == "footage":
             payload_schema = {
                 "type": "object",
-                "artifact": output_contract.get("artifact"),
+                "artifact": (
+                    "footage_semantic_batch"
+                    if footage_batch
+                    else output_contract.get("artifact")
+                ),
                 "rules": output_contract.get("rules") or [],
                 "anyOf": [output_contract, FOOTAGE_REFINEMENT_REQUEST_SCHEMA],
                 "refinement_schema": FOOTAGE_REFINEMENT_REQUEST_SCHEMA,

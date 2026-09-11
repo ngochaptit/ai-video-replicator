@@ -67,7 +67,8 @@ class FootageEvidencePlanner:
         }
 
     def seed(self, scaffold: dict[str, Any]) -> dict[str, Any]:
-        active_ids = {str(group["group_id"]) for group in self.store.active("footage")["groups"]}
+        self.store.clear_fingerprint_cache()
+        active_ids = self.store.reusable_group_ids("footage")
         seeded_groups = 0
         skipped_groups = 0
         errors: list[str] = []
@@ -115,7 +116,14 @@ class FootageEvidencePlanner:
                         count=int(group["count"]),
                         width=DEFAULT_WIDTH,
                     )
-                    self.store.register("footage", result, group_id=group_id, clip_id=clip_id)
+                    self.store.register(
+                        "footage",
+                        result,
+                        group_id=group_id,
+                        clip_id=clip_id,
+                        sample_kind="coarse",
+                        handoff_revision=0,
+                    )
                     active_ids.add(group_id)
                     seeded_groups += 1
                 except Exception as exc:  # evidence boost must not destroy the base scaffold
@@ -135,10 +143,38 @@ class FootageEvidencePlanner:
             "errors": errors,
         }
 
+    def handoff_evidence(self, handoff_revision: int = 0) -> dict[str, Any]:
+        """Return only evidence relevant to the current coarse/refinement pass."""
+        available = self.store.available("footage")
+        groups = available["groups"]
+        if handoff_revision > 0:
+            selected = [
+                group
+                for group in groups
+                if group.get("sample_kind") == "dense_refinement"
+                and group.get("handoff_revision") == handoff_revision
+            ]
+        else:
+            selected = [group for group in groups if group.get("sample_kind") == "coarse"]
+            if not selected:
+                # Existing projects created before typed sample groups remain publishable.
+                selected = [
+                    group
+                    for group in groups
+                    if group.get("sample_kind") in {None, "manual"}
+                ]
+        return {
+            **available,
+            "groups": selected,
+            "frame_count": sum(len(group.get("frames") or []) for group in selected),
+            "handoff_revision": handoff_revision,
+            "selection": "dense_refinement" if handoff_revision > 0 else "coarse",
+        }
+
     def evidence_catalog(self, scaffold: dict[str, Any]) -> list[dict[str, Any]]:
         valid_clip_ids = {str(clip.get("clip_id") or "") for clip in scaffold.get("clips") or []}
         entries: list[dict[str, Any]] = []
-        for group in self.store.active("footage")["groups"]:
+        for group in self.store.available("footage")["groups"]:
             source = group.get("source") or {}
             clip_id = str(source.get("clip_id") or "")
             if clip_id not in valid_clip_ids:

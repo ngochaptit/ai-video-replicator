@@ -8,10 +8,13 @@ footage are useful.
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 from numbers import Real
 from pathlib import Path
 from typing import Any
+
+from moon.atomic import atomic_write_json
 
 from tools.base_tool import (
     BaseTool,
@@ -63,6 +66,10 @@ class FootageProfileBuilder(BaseTool):
             "analysis_depth": {"type": "string", "enum": ["standard", "deep"], "default": "deep"},
             "max_keyframes_per_file": {"type": "integer", "minimum": 1, "maximum": 50, "default": 30},
             "max_analysis_window_seconds": {"type": "number", "minimum": 0.25, "maximum": 10.0, "default": 2.0},
+            "preprocess_checkpoint_path": {
+                "type": "string",
+                "description": "Optional durable per-clip deterministic preprocessing checkpoint.",
+            },
             "semantic_enrichment_path": {
                 "type": "string",
                 "description": "Optional UTF-8 agent enrichment containing measured usable action segments.",
@@ -108,6 +115,19 @@ class FootageProfileBuilder(BaseTool):
         depth = inputs.get("analysis_depth", "deep")
         max_keyframes = int(inputs.get("max_keyframes_per_file", 30))
         max_window = float(inputs.get("max_analysis_window_seconds", 2.0))
+        checkpoint_path = (
+            Path(str(inputs["preprocess_checkpoint_path"]))
+            if inputs.get("preprocess_checkpoint_path")
+            else output_dir / "footage_preprocess_checkpoint.json"
+        )
+        config = {
+            "builder_version": self.version,
+            "analysis_depth": depth,
+            "max_keyframes_per_file": max_keyframes,
+            "max_analysis_window_seconds": max_window,
+        }
+        config_fingerprint = self._json_fingerprint(config)
+        checkpoint = self._load_checkpoint(checkpoint_path, config, config_fingerprint)
 
         from tools.analysis.video_analyzer import VideoAnalyzer
 
@@ -117,6 +137,21 @@ class FootageProfileBuilder(BaseTool):
         for index, path in enumerate(video_files, start=1):
             clip_id = f"clip_{index:03d}"
             clip_analysis_dir = source_analysis_dir / clip_id
+            source_fingerprint = self._source_fingerprint(path)
+            source_key = str(path.resolve())
+            cached = (checkpoint.get("clips") or {}).get(source_key)
+            if self._cache_entry_valid(cached, clip_id, source_fingerprint):
+                clips.append(deepcopy(cached["clip"]))
+                artifacts.extend(str(item) for item in cached.get("artifacts") or [])
+                continue
+            checkpoint.setdefault("clips", {})[source_key] = {
+                "status": "pending",
+                "clip_id": clip_id,
+                "source": source_fingerprint,
+                "clip": None,
+                "artifacts": [],
+            }
+            self._write_checkpoint(checkpoint_path, checkpoint)
             result = VideoAnalyzer().execute(
                 {
                     "source": str(path),
@@ -127,6 +162,10 @@ class FootageProfileBuilder(BaseTool):
             )
             if not result.success:
                 notes.append(f"Skipped {path.name}: video_analyzer failed: {result.error}")
+                checkpoint["clips"][source_key].update(
+                    status="failed", error=str(result.error or "video_analyzer failed")
+                )
+                self._write_checkpoint(checkpoint_path, checkpoint)
                 continue
 
             clip = self._build_clip_scaffold(
@@ -138,9 +177,21 @@ class FootageProfileBuilder(BaseTool):
             )
             if clip["duration_seconds"] <= 0:
                 notes.append(f"Skipped {path.name}: measured duration was not positive")
+                checkpoint["clips"][source_key].update(
+                    status="failed", error="measured duration was not positive"
+                )
+                self._write_checkpoint(checkpoint_path, checkpoint)
                 continue
             clips.append(clip)
             artifacts.extend(result.artifacts or [])
+            checkpoint.setdefault("clips", {})[source_key] = {
+                "status": "completed",
+                "clip_id": clip_id,
+                "source": source_fingerprint,
+                "clip": deepcopy(clip),
+                "artifacts": list(result.artifacts or []),
+            }
+            self._write_checkpoint(checkpoint_path, checkpoint)
 
         if not clips:
             return ToolResult(success=False, error="No footage files could be analyzed successfully")
@@ -179,7 +230,84 @@ class FootageProfileBuilder(BaseTool):
         out_path = output_dir / "footage_profiles.json"
         self._write_json_utf8(out_path, profiles)
         artifacts.insert(0, str(out_path))
+        artifacts.append(str(checkpoint_path))
         return ToolResult(success=True, data=profiles, artifacts=artifacts)
+
+    def _load_checkpoint(
+        self, path: Path, config: dict[str, Any], config_fingerprint: str
+    ) -> dict[str, Any]:
+        checkpoint: dict[str, Any] = {}
+        if path.is_file():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8-sig"))
+                if isinstance(loaded, dict):
+                    checkpoint = loaded
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                checkpoint = {}
+        if (
+            checkpoint.get("version") != "1.0"
+            or checkpoint.get("config_fingerprint") != config_fingerprint
+        ):
+            checkpoint = {
+                "version": "1.0",
+                "artifact": "footage_preprocess_checkpoint",
+                "config": config,
+                "config_fingerprint": config_fingerprint,
+                "clips": {},
+            }
+        return checkpoint
+
+    def _cache_entry_valid(
+        self,
+        entry: Any,
+        clip_id: str,
+        source_fingerprint: dict[str, Any],
+    ) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        if (
+            entry.get("status") != "completed"
+            or entry.get("clip_id") != clip_id
+            or not isinstance(entry.get("clip"), dict)
+        ):
+            return False
+        cached_source = entry.get("source") or {}
+        for field in ("path", "bytes", "sha256"):
+            if cached_source.get(field) != source_fingerprint.get(field):
+                return False
+        clip = entry["clip"]
+        required = [Path(str(clip.get("_analysis_path") or ""))]
+        for segment in clip.get("segments") or []:
+            required.extend(
+                Path(str(item))
+                for item in (segment.get("evidence") or {}).get("frame_paths") or []
+            )
+        required.extend(Path(str(item)) for item in entry.get("artifacts") or [])
+        return all(str(path) and path.is_file() for path in required)
+
+    @staticmethod
+    def _source_fingerprint(path: Path) -> dict[str, Any]:
+        resolved = path.resolve(strict=True)
+        digest = hashlib.sha256()
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        stat = resolved.stat()
+        return {
+            "path": str(resolved),
+            "bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "sha256": digest.hexdigest(),
+        }
+
+    @staticmethod
+    def _json_fingerprint(payload: dict[str, Any]) -> str:
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    @staticmethod
+    def _write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
+        atomic_write_json(path, payload)
 
     def _discover_videos(self, footage_dir: Path) -> list[Path]:
         return sorted(

@@ -651,3 +651,50 @@ def test_stale_run_lock_is_recovered(tmp_path: Path, monkeypatch):
     finally:
         lock.release()
     assert not lock.path.exists()
+
+
+def test_worker_auto_advances_gpt_footage_batches_then_moves_to_match(
+    tmp_path: Path, monkeypatch
+):
+    root = valid_project(tmp_path)
+    runner = PipelineRunner(MoonProject.open(root, create=True))
+    runner.state.completed = ["proposal", "analyze"]
+    runner.state.status = "idle"
+    runner.state.save(runner.project.state_path)
+    next_calls = []
+
+    class AgentBridge:
+        def __init__(self, current_runner):
+            self.runner = current_runner
+
+        def next(self):
+            stage = self.runner.state.next_stage()
+            next_calls.append(stage)
+            if stage == "match":
+                self.runner.state.completed = list(DEFAULT_STAGES)
+                self.runner.state.status = "complete"
+                self.runner.state.current_stage = None
+                self.runner.state.save(self.runner.project.state_path)
+                final = root / "output" / "final.mp4"
+                final.parent.mkdir(parents=True, exist_ok=True)
+                final.write_bytes(b"final")
+                return {"status": "complete"}
+            return {"status": "awaiting_agent", "stage": "footage"}
+
+    monkeypatch.setattr(operator_module, "AgentBridgeService", AgentBridge)
+    worker = OperatorWorker(root, sleep=lambda _seconds: None)
+    waits = []
+
+    def wait_for_batch(current_runner, stage):
+        waits.append(stage)
+        if len(waits) == 2:
+            current_runner.state.completed = ["proposal", "analyze", "footage"]
+            current_runner.state.status = "idle"
+            current_runner.state.current_stage = None
+            current_runner.state.save(current_runner.project.state_path)
+
+    worker._wait_for_agent = wait_for_batch
+
+    assert worker._run_locked() == 0
+    assert waits == ["footage", "footage"]
+    assert next_calls == ["footage", "footage", "match"]

@@ -100,15 +100,13 @@ class FootageRefinementService:
     def sample(
         self, requests: list[dict[str, Any]], *, handoff_revision: int
     ) -> dict[str, Any]:
+        self.store.clear_fingerprint_cache()
         clips = {
             str(clip.get("clip_id") or ""): clip
             for clip in self.scaffold.get("clips") or []
             if isinstance(clip, dict) and clip.get("clip_id")
         }
-        active_ids = {
-            str(group["group_id"])
-            for group in self.store.active("footage").get("groups") or []
-        }
+        active_ids = self.store.reusable_group_ids("footage")
         groups: list[dict[str, Any]] = []
         sampled = 0
         skipped = 0
@@ -145,7 +143,12 @@ class FootageRefinementService:
                     width=REFINEMENT_FRAME_WIDTH,
                 )
                 self.store.register(
-                    "footage", result, group_id=group_id, clip_id=item["clip_id"]
+                    "footage",
+                    result,
+                    group_id=group_id,
+                    clip_id=item["clip_id"],
+                    sample_kind="dense_refinement",
+                    handoff_revision=handoff_revision,
                 )
                 active_ids.add(group_id)
                 sampled += 1

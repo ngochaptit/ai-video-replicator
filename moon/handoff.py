@@ -46,17 +46,41 @@ class AgentHandoffService:
         return all(self.runner.artifacts.exists(name) for name in required)
 
     def _inputs(self, stage: str) -> dict[str, Any]:
-        names={"footage":["footage_profiles_scaffold","footage_evidence_catalog"],"match":["reference_blueprint","footage_profiles","candidate_rankings"],"render":["timeline"],"qc":["draft_render","timeline","match_decisions","replication_quality_report"]}.get(stage,[]); result={}
+        names={"footage":["footage_profiles_scaffold"],"match":["reference_blueprint","footage_profiles","candidate_rankings"],"render":["timeline"],"qc":["draft_render","timeline","match_decisions","replication_quality_report"]}.get(stage,[]); result={}
         if stage == "proposal": names = ["research_brief", "brief"]
         if stage == "analyze": names = ["reference_blueprint_scaffold", "video_analysis_brief", "proposal_packet"]
         for name in names:
             if self.runner.artifacts.exists(name):
                 path=self.runner.artifacts.path_for(name); result[name]={"path":str(path),"sha256":self._sha256(path)}
         task=self.runner.artifacts.read(f"{stage}_agent_task"); evidence_root=task.get("evidence_root")
-        sampled_store=SampledFrameEvidenceStore(self.runner.project,self.runner.state.revision); sampled=sampled_store.exported(stage)
+        sampled_store=SampledFrameEvidenceStore(self.runner.project,self.runner.state.revision)
+        if stage == "footage":
+            from moon.footage_batches import FootageSemanticProgress
+            from moon.footage_evidence import FootageEvidencePlanner
+            progress = FootageSemanticProgress.open_existing(self.runner)
+            sampled = progress.selected_evidence() if progress else None
+            if progress and sampled is not None:
+                path = progress.write_active_scaffold()
+                result["footage_profiles_scaffold"] = {
+                    "path": str(path), "sha256": self._sha256(path)
+                }
+            if sampled is None:
+                handoff_revision = 0
+                if self.runner.artifacts.exists("footage_evidence_catalog"):
+                    catalog = self.runner.artifacts.read("footage_evidence_catalog")
+                    refinements = catalog.get("refinements") or []
+                    if refinements:
+                        handoff_revision = max(int(item.get("handoff_revision", 0)) for item in refinements)
+                sampled = FootageEvidencePlanner(
+                    self.runner.project, self.runner.state.revision
+                ).handoff_evidence(handoff_revision)
+        else:
+            sampled = sampled_store.exported(stage)
         files=[]
         if evidence_root:
-            root=Path(evidence_root); files=[str(p) for p in sorted(root.rglob("*")) if p.is_file()][:500] if root.is_dir() else []
+            root=Path(evidence_root)
+            if stage != "footage" or not sampled["groups"]:
+                files=[str(p) for p in sorted(root.rglob("*")) if p.is_file()][:500] if root.is_dir() else []
         else: root=self.runner.project.evidence_dir
         reference_frames = []
         if stage == "analyze" and self.runner.artifacts.exists("reference_blueprint_scaffold"):
@@ -64,7 +88,6 @@ class AgentHandoffService:
             reference_frames = ensure_reference_coverage(self.runner)
             files = list(dict.fromkeys(frame["path"] for frame in reference_frames))
         if sampled["groups"]:
-            files.append(sampled["registry_path"])
             files.extend(str(frame["absolute_path"]) for group in sampled["groups"] for frame in group.get("frames") or [])
         if evidence_root or sampled["groups"]:
             result["evidence"]={"root":str(root),"sampled_root":str(self.runner.project.evidence_dir),"files":list(dict.fromkeys(files)),"sampled_frames":sampled}

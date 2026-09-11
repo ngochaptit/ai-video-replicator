@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
+
+from moon.atomic import atomic_write_json
 
 
 MOON_DIR = ".moon"
@@ -71,6 +72,4 @@ class MoonProject:
 
     @staticmethod
     def _write_json(path: Path, payload: dict) -> None:
-        temp = path.with_suffix(path.suffix + ".tmp")
-        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temp.replace(path)
+        atomic_write_json(path, payload)

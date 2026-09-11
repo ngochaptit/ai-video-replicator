@@ -1031,6 +1031,8 @@ def footage_bridge_at(
         },
         group_id=group_id,
         clip_id="clip_001",
+        sample_kind="coarse",
+        handoff_revision=0,
     )
     planner = FootageEvidencePlanner(runner.project, runner.state.revision)
     runner.artifacts.write(
@@ -1106,6 +1108,8 @@ def footage_approval_response(request: dict) -> bytes:
     response = json.loads(completed_response(request))
     response["revision"] = request["route"]["revision"]
     response["payload"] = {
+        "artifact": "footage_semantic_batch",
+        "batch_id": request["task"]["batch_id"],
         "clips": [
             {
                 "clip_id": "clip_001",
@@ -1149,10 +1153,16 @@ def test_footage_request_contains_all_coarse_frames_and_identity_binding(tmp_pat
     assert request["route"]["next_action"] == "CONSUME_RESPONSE"
     assert request["route"]["request_id"] == request["request_id"]
     assert request["route"]["revision"] == 0
+    assert request["route"]["batch"]["request_id"] == request["request_id"]
+    assert request["task"]["batch_type"] == "coarse"
     assert "portable_packet" not in request["route"]
     assert "gemini_handoff.pdf" not in transport.published
     assert all(not path.lower().endswith((".mp4", ".wav", ".pdf")) for path in transport.published)
     assert len(frames) == 3
+    assert any(
+        item.get("artifact") == "footage_evidence_manifest"
+        for item in request["evidence"]
+    )
     jsonschema.validate(
         json.loads(footage_refinement_response(request)),
         request["expected_response_schema"],
@@ -1179,6 +1189,19 @@ def test_footage_republish_is_idempotent_without_packet(tmp_path: Path):
     assert transport.published == original_paths
     assert "gemini_handoff.pdf" not in transport.published
     assert not (bridge.agent_dir / "gemini_handoff.pdf").exists()
+
+
+def test_footage_batch_response_with_wrong_batch_id_is_rejected(tmp_path: Path):
+    bridge, transport, runner = footage_bridge_at(tmp_path)
+    request = bridge.publish("footage")["request"]
+    response = json.loads(footage_approval_response(request))
+    response["payload"]["batch_id"] = "coarse_wrong_batch"
+    transport.response = json.dumps(response).encode("utf-8")
+
+    with pytest.raises(BridgeResponseError, match="batch_id does not match"):
+        bridge.poll_once()
+
+    assert not runner.artifacts.exists("footage_semantic_enrichment")
 
 
 def test_invalid_gpt_footage_refinement_request_exposes_schema_path(tmp_path: Path):
@@ -1237,22 +1260,21 @@ def test_moon_samples_refinement_and_republishes_fresh_gpt_evidence(
     transport.response = footage_refinement_response(request)
 
     result = bridge.poll_once()
-    revised = json.loads(bridge.request_path.read_text(encoding="utf-8"))
+    revised = bridge.publish("footage")["request"]
     frames = [item for item in revised["evidence"] if item.get("role") == "sampled_frame"]
 
-    assert result["status"] == "WAITING_GPT"
-    assert result["next_action"] == "RECHECK_TARGETS"
-    assert result["revision"] == 1
+    assert result["status"] == "CONSUMED"
+    assert result["next_action"] == "NEXT_FOOTAGE_BATCH"
     assert len(calls) == 1
     assert calls[0]["start_seconds"] == 4.0
     assert calls[0]["end_seconds"] == 5.0
     assert calls[0]["count"] == 9
     assert calls[0]["width"] == 640
-    assert revised["request_id"] == request["request_id"]
+    assert revised["request_id"] != request["request_id"]
     assert revised["route"]["revision"] == revised["task"]["revision"] == 1
     assert revised["created_at"] != request["created_at"]
     assert json.loads(runner.project.agent_state_path.read_text(encoding="utf-8")) == revised["route"]
-    assert len(frames) == 12
+    assert len(frames) == 9
     assert "revision=1" in revised["route"]["completion_contract"]["terminal_acknowledgement"]
     assert revised["route"]["current_actor"] == "gpt"
     assert "portable_packet" not in revised["route"]
@@ -1260,22 +1282,26 @@ def test_moon_samples_refinement_and_republishes_fresh_gpt_evidence(
     assert all(frame["path"] in transport.published for frame in frames)
     assert transport.response is None
     assert not runner.artifacts.exists("footage_semantic_enrichment")
-    assert [item["status"] for item in revised["route"]["transition_history"]][-4:] == [
-        "GPT_REQUESTED_REFINEMENT",
-        "REQUEST_REFINEMENT",
-        "RECHECK_TARGETS",
-        "WAITING_GPT",
-    ]
+    assert revised["task"]["batch_type"] == "refinement"
 
-    stale = footage_refinement_response(revised, revision=0)
+    stale = footage_refinement_response(request, revision=0)
     transport.response = stale
-    with pytest.raises(BridgeResponseError, match="revision does not match"):
+    with pytest.raises(BridgeResponseError, match="request_id"):
         bridge.poll_once()
     assert json.loads(bridge.request_path.read_text(encoding="utf-8")) == revised
 
-    transport.response = footage_approval_response(revised)
-    consumed = bridge.poll_once()
-    assert consumed["status"] == "CONSUMED"
+    partial = json.loads(footage_approval_response(revised))
+    partial["payload"] = {
+        "artifact": "footage_semantic_batch",
+        "batch_id": revised["task"]["batch_id"],
+        "clips": [{"clip_id": "clip_001", "usable": False}],
+    }
+    transport.response = json.dumps(partial).encode("utf-8")
+    assert bridge.poll_once()["status"] == "CONSUMED"
+
+    final_request = bridge.publish("footage")["request"]
+    transport.response = footage_approval_response(final_request)
+    assert bridge.poll_once()["status"] == "CONSUMED"
     assert runner.artifacts.read("footage_semantic_enrichment")["clips"][0]["clip_id"] == "clip_001"
 
 
@@ -1295,3 +1321,133 @@ def test_expired_footage_request_republishes_evidence_with_fresh_identity(tmp_pa
     assert "gemini_handoff.pdf" not in transport.published
     assert not (bridge.agent_dir / "gemini_handoff.pdf").exists()
     assert transport.response is None
+
+
+def test_gpt_coarse_batches_use_fresh_requests_and_assemble_after_restart(
+    tmp_path: Path,
+):
+    from PIL import Image
+
+    bridge, transport, runner = footage_bridge_at(tmp_path)
+    scaffold = runner.artifacts.read("footage_profiles_scaffold")
+    store = SampledFrameEvidenceStore(runner.project, runner.state.revision)
+    for index in range(2, 5):
+        clip_id = f"clip_{index:03d}"
+        source = runner.project.root / "footage" / f"clip-{index}.mp4"
+        source.write_bytes(f"source-{index}".encode())
+        scaffold["clips"].append(
+            {
+                "clip_id": clip_id,
+                "path": str(source),
+                "duration_seconds": 12.0,
+                "segments": [],
+            }
+        )
+        frames = []
+        for frame_index, timestamp in enumerate((0.0, 6.0, 12.0)):
+            path = (
+                runner.project.cache_dir
+                / "fixture-frames"
+                / f"{clip_id}-{frame_index}.jpg"
+            )
+            Image.new(
+                "RGB", (320, 180), (index * 30, frame_index * 30, 90)
+            ).save(path, "JPEG")
+            frames.append({"timestamp_seconds": timestamp, "path": str(path)})
+        group_id = store.group_id(
+            "footage",
+            source,
+            start_seconds=0.0,
+            end_seconds=12.0,
+            count=3,
+            width=320,
+        )
+        store.register(
+            "footage",
+            {
+                "source": str(source),
+                "start_seconds": 0.0,
+                "end_seconds": 12.0,
+                "count": 3,
+                "width": 320,
+                "frames": frames,
+            },
+            group_id=group_id,
+            clip_id=clip_id,
+            sample_kind="coarse",
+            handoff_revision=0,
+        )
+    runner.artifacts.write("footage_profiles_scaffold", scaffold)
+
+    first = bridge.publish("footage")["request"]
+    first_clips = set(first["task"]["batch_clip_ids"])
+    first_frames = [
+        item for item in first["evidence"] if item.get("role") == "sampled_frame"
+    ]
+    assert len(first_clips) == 3
+    assert len(first_frames) <= bridge.config.max_footage_batch_frames
+    assert sum(item["bytes"] for item in first_frames) <= bridge.config.max_footage_batch_bytes
+    assert first["route"]["status"] == "WAITING_GPT"
+    assert first["route"]["batch"]["request_id"] == first["request_id"]
+    assert {
+        item["clip_id"]
+        for item in first["evidence"]
+        if item.get("role") == "sampled_frame"
+    } == first_clips
+    assert all(
+        not item["path"].lower().endswith((".mp4", ".wav", ".pdf"))
+        for item in first["evidence"]
+    )
+    first_response = json.loads(footage_approval_response(first))
+    first_response["payload"]["clips"] = [
+        {
+            **first_response["payload"]["clips"][0],
+            "clip_id": clip_id,
+            "path": next(
+                clip["path"] for clip in scaffold["clips"]
+                if clip["clip_id"] == clip_id
+            ),
+            "segments": [
+                {
+                    **first_response["payload"]["clips"][0]["segments"][0],
+                    "id": f"{clip_id}_seg_001",
+                }
+            ],
+        }
+        for clip_id in sorted(first_clips)
+    ]
+    transport.response = json.dumps(first_response).encode()
+    assert bridge.poll_once()["remaining_batches"] == 1
+    assert not runner.artifacts.exists("footage_semantic_enrichment")
+
+    restarted = MoonDriveBridge(
+        runner,
+        bridge.config,
+        transport=transport,
+        resume=lambda: {"status": "resumed"},
+    )
+    second = restarted.publish("footage")["request"]
+    second_clips = set(second["task"]["batch_clip_ids"])
+    assert second["request_id"] != first["request_id"]
+    assert first_clips.isdisjoint(second_clips)
+    assert second["route"]["current_actor"] == "gpt"
+    transport.response = json.dumps(first_response).encode()
+    with pytest.raises(DuplicateResponseError):
+        restarted.poll_once()
+
+    second_response = json.loads(footage_approval_response(second))
+    clip_id = next(iter(second_clips))
+    second_response["payload"]["clips"][0]["clip_id"] = clip_id
+    second_response["payload"]["clips"][0]["path"] = next(
+        clip["path"] for clip in scaffold["clips"] if clip["clip_id"] == clip_id
+    )
+    second_response["payload"]["clips"][0]["segments"][0]["id"] = (
+        f"{clip_id}_seg_001"
+    )
+    transport.response = json.dumps(second_response).encode()
+    assert restarted.poll_once()["status"] == "CONSUMED"
+
+    final = runner.artifacts.read("footage_semantic_enrichment")
+    assert {clip["clip_id"] for clip in final["clips"]} == {
+        "clip_001", "clip_002", "clip_003", "clip_004"
+    }

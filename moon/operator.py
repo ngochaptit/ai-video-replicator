@@ -13,6 +13,7 @@ from threading import Event
 from typing import Any, Callable
 
 from moon.agent_bridge import AgentBridgeService
+from moon.atomic import atomic_write_json
 from moon.core.project import MoonProject
 from moon.core.state import DEFAULT_STAGES, PipelineState
 from moon.drive_bridge import (
@@ -52,15 +53,6 @@ DEFAULT_CHATGPT_URL = "https://chatgpt.com/"
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    temporary.replace(path)
 
 
 @dataclass(frozen=True)
@@ -207,7 +199,7 @@ class OperatorStatusStore:
             updated_at=_utc_now(),
             **fields,
         )
-        _atomic_json(self.path, current)
+        atomic_write_json(self.path, current)
         return current
 
     @staticmethod
@@ -758,6 +750,7 @@ class OperatorWorker:
             return
         request = published["request"]
         route = request.get("route") or {}
+        batch = route.get("batch") or {}
         self._save(
             status="waiting_agent",
             stage=stage,
@@ -769,7 +762,8 @@ class OperatorWorker:
             remote_path=config.remote_path,
             stage_internals=(
                 f"bridge_status=WAITING_AGENT; stage={stage}; "
-                f"revision={(request.get('route') or {}).get('revision')}"
+                f"revision={(request.get('route') or {}).get('revision')}; "
+                f"batch_id={batch.get('batch_id') or '-'}"
             ),
         )
         self._command(
@@ -816,7 +810,9 @@ class OperatorWorker:
                     remote_path=config.remote_path,
                     stage_internals=(
                         f"bridge_status={consumed.get('status')}; stage={stage}; "
-                        f"revision={route.get('revision')}"
+                        f"revision={route.get('revision')}; "
+                        f"batch_id={batch.get('batch_id') or '-'}; "
+                        f"remaining_batches={consumed.get('remaining_batches', '-')}"
                     ),
                 )
                 return

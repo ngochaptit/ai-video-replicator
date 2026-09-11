@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from moon.atomic import atomic_write_json
+
 
 DEFAULT_STAGES = ("proposal", "analyze", "footage", "match", "timeline", "render", "qc")
 
@@ -53,9 +55,7 @@ class PipelineState:
             "updated_at": self.updated_at,
             "metadata": self.metadata,
         }
-        temp = path.with_suffix(path.suffix + ".tmp")
-        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temp.replace(path)
+        atomic_write_json(path, payload)
 
     def next_stage(self) -> str | None:
         for stage in self.stages:

@@ -20,6 +20,7 @@ class SampledFrameEvidenceStore:
     def __init__(self, project: MoonProject, pipeline_revision: int) -> None:
         self.project = project
         self.pipeline_revision = int(pipeline_revision)
+        self._fingerprints: dict[Path, str] = {}
 
     def registry_path(self, stage: str) -> Path:
         self._validate_stage(stage)
@@ -46,6 +47,7 @@ class SampledFrameEvidenceStore:
             "stage": stage,
             "pipeline_revision": self.pipeline_revision,
             "source_path": self._relative(source),
+            "source_sha256": self.source_fingerprint(source),
             "request": {
                 "start_seconds": round(float(start_seconds), 6),
                 "end_seconds": round(float(end_seconds), 6),
@@ -63,6 +65,8 @@ class SampledFrameEvidenceStore:
         *,
         group_id: str,
         clip_id: str | None,
+        sample_kind: str = "manual",
+        handoff_revision: int | None = None,
     ) -> dict[str, Any]:
         source = Path(str(result["source"])).resolve()
         frames = []
@@ -79,9 +83,13 @@ class SampledFrameEvidenceStore:
             "pipeline_revision": self.pipeline_revision,
             "group_id": group_id,
             "sampling_method": "ffmpeg_single_frame_seek_v1",
+            "sample_kind": sample_kind,
+            "handoff_revision": handoff_revision,
+            "checkpoint_state": "completed",
             "source": {
                 "clip_id": clip_id,
                 "path": self._relative(source),
+                "sha256": self.source_fingerprint(source),
             },
             "request": {
                 "start_seconds": round(float(result["start_seconds"]), 6),
@@ -93,6 +101,25 @@ class SampledFrameEvidenceStore:
         }
         self._append(stage, event)
         return event
+
+    def reusable_group_ids(self, stage: str) -> set[str]:
+        """Return completed groups whose source and materialized frames still match."""
+        return {
+            str(group["group_id"])
+            for group in self.active(stage)["groups"]
+            if self._is_reusable(group)
+        }
+
+    def available(self, stage: str) -> dict[str, Any]:
+        """Export readable evidence, accepting legacy groups for backward compatibility."""
+        active = self.active(stage)
+        groups = [group for group in active["groups"] if self._is_available(group)]
+        exported = self._export_groups(groups)
+        return {
+            **active,
+            "groups": exported,
+            "frame_count": sum(len(group.get("frames") or []) for group in exported),
+        }
 
     def active(self, stage: str) -> dict[str, Any]:
         groups: dict[str, dict[str, Any]] = {}
@@ -144,8 +171,28 @@ class SampledFrameEvidenceStore:
 
     def exported(self, stage: str) -> dict[str, Any]:
         active = self.active(stage)
+        return {**active, "groups": self._export_groups(active["groups"])}
+
+    def source_fingerprint(self, source: Path) -> str:
+        resolved = source.expanduser().resolve(strict=True)
+        self._assert_inside_project(resolved)
+        cached = self._fingerprints.get(resolved)
+        if cached is not None:
+            return cached
+        digest = hashlib.sha256()
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        value = digest.hexdigest()
+        self._fingerprints[resolved] = value
+        return value
+
+    def clear_fingerprint_cache(self) -> None:
+        self._fingerprints.clear()
+
+    def _export_groups(self, stored_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
         groups = []
-        for stored in active["groups"]:
+        for stored in stored_groups:
             group = dict(stored)
             source = dict(group["source"])
             source["absolute_path"] = str(self.absolute_path(str(source["path"])))
@@ -158,7 +205,38 @@ class SampledFrameEvidenceStore:
                 for frame in group.get("frames") or []
             ]
             groups.append(group)
-        return {**active, "groups": groups}
+        return groups
+
+    def _frames_exist(self, group: dict[str, Any]) -> bool:
+        frames = group.get("frames") or []
+        return bool(frames) and all(
+            self.absolute_path(str(frame.get("path") or "")).is_file()
+            for frame in frames
+        )
+
+    def _is_reusable(self, group: dict[str, Any]) -> bool:
+        if group.get("checkpoint_state") != "completed" or not self._frames_exist(group):
+            return False
+        source = group.get("source") or {}
+        expected = str(source.get("sha256") or "")
+        if not expected:
+            return False
+        try:
+            return self.source_fingerprint(self.absolute_path(str(source.get("path") or ""))) == expected
+        except (OSError, ValueError):
+            return False
+
+    def _is_available(self, group: dict[str, Any]) -> bool:
+        if not self._frames_exist(group):
+            return False
+        source = group.get("source") or {}
+        expected = str(source.get("sha256") or "")
+        if not expected:
+            return True
+        try:
+            return self.source_fingerprint(self.absolute_path(str(source.get("path") or ""))) == expected
+        except (OSError, ValueError):
+            return False
 
     def _events(self, stage: str) -> list[dict[str, Any]]:
         registry = self.registry_path(stage)

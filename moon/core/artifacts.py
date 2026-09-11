@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from moon.atomic import atomic_write_json
+
 
 class ArtifactStore:
     def __init__(self, root: Path) -> None:
@@ -18,9 +20,7 @@ class ArtifactStore:
 
     def write(self, name: str, payload: dict[str, Any]) -> Path:
         path = self.path_for(name)
-        temp = path.with_suffix(".json.tmp")
-        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temp.replace(path)
+        atomic_write_json(path, payload)
         return path
 
     def read(self, name: str) -> dict[str, Any]:

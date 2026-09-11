@@ -83,14 +83,30 @@ class StageExecutionService:
         return {"status": "awaiting_agent", "stage": "analyze", "task": task, "pipeline": self.runner.status()}
 
     def _run_footage(self)->dict[str,Any]:
-        self.runner.begin("footage");out=self.runner.project.root/"analysis"/"footage";inputs={"footage_dir":str(self.runner.project.root/"footage"),"analysis_depth":"deep","max_keyframes_per_file":30,"max_analysis_window_seconds":2.0,"output_dir":str(out)};enrichment=None
+        from moon.footage_batches import FootageSemanticProgress
+
+        self.runner.begin("footage")
+        progress = FootageSemanticProgress.open_existing(self.runner)
+        if progress and not self.runner.artifacts.exists("footage_semantic_enrichment"):
+            recovered = progress.assemble_if_complete()
+            if recovered is not None:
+                self.runner.artifacts.write("footage_semantic_enrichment", recovered)
+        out=self.runner.project.root/"analysis"/"footage";inputs={"footage_dir":str(self.runner.project.root/"footage"),"analysis_depth":"deep","max_keyframes_per_file":30,"max_analysis_window_seconds":2.0,"output_dir":str(out),"preprocess_checkpoint_path":str(self.runner.project.cache_dir/"footage-preprocess.json")};enrichment=None
         if self.runner.artifacts.exists("footage_semantic_enrichment"):
             enrichment=self._materialize_footage_enrichment();inputs["semantic_enrichment_path"]=str(enrichment)
         result=self._execute_tool("footage_profile_builder",inputs)
         if not result["success"]:self.runner.fail("footage",result["error"]);return {"status":"blocked","stage":"footage",**result}
         if not enrichment:
-            scaffold=result["data"];self.runner.artifacts.write("footage_profiles_scaffold",scaffold);planner=FootageEvidencePlanner(self.runner.project,self.runner.state.revision);sampling=planner.seed(scaffold);catalog=planner.evidence_catalog(scaffold);self.runner.artifacts.write("footage_evidence_catalog",{"version":"1.0","entries":catalog,"coverage":sampling["coverage"],"policy":sampling["policy"]})
-            task={"stage":"footage","revision":self.runner.state.revision,"decision_owner":"external_agent","required_output_artifact":"footage_semantic_enrichment","evidence_root":str(out),"sampling":sampling,"instruction":"Inspect the adaptive sampled evidence, not analyzer keyframes alone. Treat fixed windows/keyframes as scaffolding only. Review long clips coarse-to-fine. If an action or interaction boundary remains ambiguous, return a structured footage_refinement_request; Moon will sample the requested narrower windows and publish a fresh revision. GPT must not execute Moon or local sampling commands. Submit measured semantic action segments only when the evidence is sufficient."};self.runner.artifacts.write("footage_agent_task",task);return {"status":"awaiting_agent","stage":"footage","task":task,"pipeline":self.runner.status()}
+            scaffold=result["data"]
+            self.runner.artifacts.write("footage_profiles_scaffold",scaffold)
+            planner=FootageEvidencePlanner(self.runner.project,self.runner.state.revision)
+            sampling=planner.seed(scaffold)
+            previous = self.runner.artifacts.read("footage_evidence_catalog") if self.runner.artifacts.exists("footage_evidence_catalog") else {}
+            catalog={"version":"1.0","entries":planner.evidence_catalog(scaffold),"coverage":sampling["coverage"],"policy":sampling["policy"],"refinements":list(previous.get("refinements") or [])}
+            self.runner.artifacts.write("footage_evidence_catalog",catalog)
+            task={"stage":"footage","revision":self.runner.state.revision,"decision_owner":"external_agent","required_output_artifact":"footage_semantic_enrichment","evidence_root":str(out),"sampling":sampling,"instruction":"Review only the active bounded footage semantic batch and its compact evidence manifest. Return semantic segments only for the listed batch clips/ranges, without duplicating completed refinement results included in the compact scaffold. If a boundary remains ambiguous, return a structured footage_refinement_request; Moon will sample and batch the narrower windows locally. GPT must not execute Moon or local sampling commands."}
+            self.runner.artifacts.write("footage_agent_task",task)
+            return {"status":"awaiting_agent","stage":"footage","task":task,"pipeline":self.runner.status()}
         self.runner.artifacts.write("footage_profiles",result["data"]);return {"status":"completed","stage":"footage","pipeline":self.runner.complete("footage",{"source":"stage_execution_adapter","tool":"footage_profile_builder"})}
     def _run_match(self)->dict[str,Any]:
         self.runner.begin("match");bp=self._require_artifact("reference_blueprint");profiles=self._require_artifact("footage_profiles");rankings=self.runner.project.cache_dir/"candidate_rankings.json";rank=self._execute_tool("reference_candidate_ranker",{"reference_blueprint_path":str(bp),"footage_profiles_path":str(profiles),"top_k":10,"output_path":str(rankings)})
