@@ -72,10 +72,12 @@ class SampledFrameEvidenceStore:
         frames = []
         for item in result.get("frames") or []:
             timestamp = float(item["timestamp_seconds"])
-            frames.append({
-                "timestamp_seconds": round(timestamp, 6),
-                "path": self._relative(Path(str(item["path"]))),
-            })
+            frames.append(
+                {
+                    "timestamp_seconds": round(timestamp, 6),
+                    "path": self._relative(Path(str(item["path"]))),
+                }
+            )
         event = {
             "schema_version": SAMPLED_EVIDENCE_SCHEMA_VERSION,
             "event_type": "sampled_frame_group",
@@ -147,7 +149,10 @@ class SampledFrameEvidenceStore:
         active = self.active(stage)
         group_ids = [str(group["group_id"]) for group in active["groups"]]
         registry = self.registry_path(stage)
-        marker_source = f"{stage}:{self.pipeline_revision}:{registry.stat().st_size if registry.exists() else 0}"
+        marker_source = (
+            f"{stage}:{self.pipeline_revision}:"
+            f"{registry.stat().st_size if registry.exists() else 0}"
+        )
         clear_id = hashlib.sha256(marker_source.encode("utf-8")).hexdigest()[:20]
         event = {
             "schema_version": SAMPLED_EVIDENCE_SCHEMA_VERSION,
@@ -166,7 +171,9 @@ class SampledFrameEvidenceStore:
             "cleared_frames": int(active["frame_count"]),
             "images_deleted": False,
             "registry_path": str(registry),
-            "next_action": "Call moon.frames.sample to start a new sampled evidence set for this stage.",
+            "next_action": (
+                "Call moon.frames.sample to start a new sampled evidence set for this stage."
+            ),
         }
 
     def absolute_path(self, stored_path: str) -> Path:
@@ -179,7 +186,10 @@ class SampledFrameEvidenceStore:
         return {**active, "groups": self._export_groups(active["groups"])}
 
     def source_fingerprint(self, source: Path) -> str:
-        resolved = source.expanduser().resolve(strict=True)
+        return self._file_fingerprint(source)
+
+    def _file_fingerprint(self, path: Path) -> str:
+        resolved = path.expanduser().resolve(strict=True)
         self._assert_inside_project(resolved)
         cached = self._fingerprints.get(resolved)
         if cached is not None:
@@ -197,8 +207,10 @@ class SampledFrameEvidenceStore:
 
     def _normalize_legacy_group(self, stored: dict[str, Any]) -> dict[str, Any]:
         group = dict(stored)
-        if group.get("sample_kind"):
+        sample_kind = str(group.get("sample_kind") or "").strip().lower()
+        if sample_kind in {"coarse", "dense_refinement"}:
             return group
+
         handoff_revision = group.get("handoff_revision")
         frame_paths = [
             str(frame.get("path") or "").replace("\\", "/")
@@ -212,25 +224,25 @@ class SampledFrameEvidenceStore:
             )
             or any("/refinement_" in f"/{path}" for path in frame_paths)
         )
-        group["sample_kind"] = (
-            "dense_refinement" if legacy_refinement else "manual"
-        )
+        if legacy_refinement:
+            group["sample_kind"] = "dense_refinement"
+        elif sample_kind:
+            group["sample_kind"] = sample_kind
+        else:
+            group["sample_kind"] = "manual"
         return group
 
     def _dedupe_equivalent_groups(
         self, groups: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Collapse duplicate migrated sampling groups deterministically.
-
-        Older runtimes can leave an untyped/manual copy of the same coarse sample
-        beside a newly typed coarse group. They represent identical measured
-        evidence and must not consume the active semantic batch twice.
-        """
+        """Collapse duplicate migrated sampling groups by measured frame content."""
         chosen: dict[str, dict[str, Any]] = {}
         for group in groups:
             signature = self._equivalent_group_signature(group)
             current = chosen.get(signature)
-            if current is None or self._group_preference(group) < self._group_preference(current):
+            if current is None or self._group_preference(group) < self._group_preference(
+                current
+            ):
                 chosen[signature] = group
         return list(chosen.values())
 
@@ -244,12 +256,22 @@ class SampledFrameEvidenceStore:
         }.get(kind, 2)
         return rank, str(group.get("group_id") or "")
 
-    @staticmethod
-    def _equivalent_group_signature(group: dict[str, Any]) -> str:
+    def _equivalent_group_signature(self, group: dict[str, Any]) -> str:
         source = group.get("source") or {}
         request = group.get("request") or {}
         kind = str(group.get("sample_kind") or "manual")
         family = "refinement" if kind == "dense_refinement" else "coarse"
+        frames = []
+        for frame in group.get("frames") or []:
+            frame_path = self.absolute_path(str(frame.get("path") or ""))
+            frames.append(
+                {
+                    "timestamp_seconds": round(
+                        float(frame.get("timestamp_seconds") or 0.0), 6
+                    ),
+                    "sha256": self._file_fingerprint(frame_path),
+                }
+            )
         canonical = {
             "family": family,
             "source": {
@@ -257,16 +279,11 @@ class SampledFrameEvidenceStore:
                 "path": source.get("path"),
                 "sha256": source.get("sha256"),
             },
-            "request": {
+            "window": {
                 "start_seconds": request.get("start_seconds"),
                 "end_seconds": request.get("end_seconds"),
-                "count": request.get("count"),
-                "width": request.get("width"),
             },
-            "timestamps": [
-                frame.get("timestamp_seconds")
-                for frame in group.get("frames") or []
-            ],
+            "frames": frames,
         }
         raw = json.dumps(
             canonical, sort_keys=True, separators=(",", ":")
@@ -305,7 +322,12 @@ class SampledFrameEvidenceStore:
         if not expected:
             return False
         try:
-            return self.source_fingerprint(self.absolute_path(str(source.get("path") or ""))) == expected
+            return (
+                self.source_fingerprint(
+                    self.absolute_path(str(source.get("path") or ""))
+                )
+                == expected
+            )
         except (OSError, ValueError):
             return False
 
@@ -317,7 +339,12 @@ class SampledFrameEvidenceStore:
         if not expected:
             return True
         try:
-            return self.source_fingerprint(self.absolute_path(str(source.get("path") or ""))) == expected
+            return (
+                self.source_fingerprint(
+                    self.absolute_path(str(source.get("path") or ""))
+                )
+                == expected
+            )
         except (OSError, ValueError):
             return False
 
@@ -326,22 +353,37 @@ class SampledFrameEvidenceStore:
         if not registry.is_file():
             return []
         events = []
-        for line_number, raw in enumerate(registry.read_text(encoding="utf-8").splitlines(), start=1):
+        for line_number, raw in enumerate(
+            registry.read_text(encoding="utf-8").splitlines(), start=1
+        ):
             if not raw.strip():
                 continue
             try:
                 event = json.loads(raw)
             except json.JSONDecodeError as exc:
-                raise ValueError(f"invalid sampled evidence event at {registry}:{line_number}") from exc
+                raise ValueError(
+                    f"invalid sampled evidence event at {registry}:{line_number}"
+                ) from exc
             if not isinstance(event, dict):
-                raise ValueError(f"sampled evidence event must be an object at {registry}:{line_number}")
+                raise ValueError(
+                    f"sampled evidence event must be an object at {registry}:{line_number}"
+                )
             if event.get("schema_version") != SAMPLED_EVIDENCE_SCHEMA_VERSION:
-                raise ValueError(f"unsupported sampled evidence schema at {registry}:{line_number}")
-            if event.get("stage") != stage or event.get("pipeline_revision") != self.pipeline_revision:
-                raise ValueError(f"sampled evidence scope mismatch at {registry}:{line_number}")
+                raise ValueError(
+                    f"unsupported sampled evidence schema at {registry}:{line_number}"
+                )
+            if (
+                event.get("stage") != stage
+                or event.get("pipeline_revision") != self.pipeline_revision
+            ):
+                raise ValueError(
+                    f"sampled evidence scope mismatch at {registry}:{line_number}"
+                )
             event_type = event.get("event_type")
             if event_type not in {"sampled_frame_group", "clear_sampled_frames"}:
-                raise ValueError(f"unknown sampled evidence event at {registry}:{line_number}")
+                raise ValueError(
+                    f"unknown sampled evidence event at {registry}:{line_number}"
+                )
             if event_type == "sampled_frame_group":
                 self.absolute_path(str(event["source"]["path"]))
                 for frame in event.get("frames") or []:
@@ -352,7 +394,15 @@ class SampledFrameEvidenceStore:
     def _append(self, stage: str, event: dict[str, Any]) -> None:
         registry = self.registry_path(stage)
         registry.parent.mkdir(parents=True, exist_ok=True)
-        encoded = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        encoded = (
+            json.dumps(
+                event,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
         with registry.open("a", encoding="utf-8", newline="") as handle:
             handle.write(encoded)
             handle.flush()
@@ -372,4 +422,6 @@ class SampledFrameEvidenceStore:
     @staticmethod
     def _validate_stage(stage: str) -> None:
         if not isinstance(stage, str) or _SAFE_STAGE.fullmatch(stage) is None:
-            raise ValueError("sampled evidence stage must use letters, numbers, '-' or '_'")
+            raise ValueError(
+                "sampled evidence stage must use letters, numbers, '-' or '_'"
+            )
