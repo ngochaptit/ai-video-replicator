@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from pathlib import Path
 
@@ -106,10 +107,10 @@ def test_sampled_evidence_survives_restart_and_supports_semantic_submission(
     assert sampled["evidence_registered"] is True
     assert sampled["stage"] == "footage"
     assert sampled["pipeline_revision"] == 0
-    assert sampled["provenance"]["source"] == {
-        "clip_id": "clip_001",
-        "path": "footage/clip.mp4",
-    }
+    provenance_source = sampled["provenance"]["source"]
+    assert provenance_source["clip_id"] == "clip_001"
+    assert provenance_source["path"] == "footage/clip.mp4"
+    assert provenance_source["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
     assert [item["timestamp_seconds"] for item in sampled["provenance"]["frames"]] == [
         0.0,
         2.0,
@@ -126,6 +127,7 @@ def test_sampled_evidence_survives_restart_and_supports_semantic_submission(
         "width": 320,
     }
     assert event["sampling_method"] == "ffmpeg_single_frame_seek_v1"
+    assert event["source"]["sha256"] == provenance_source["sha256"]
     assert "base64" not in raw_registry.lower()
     assert not Path(event["source"]["path"]).is_absolute()
     assert all(not Path(item["path"]).is_absolute() for item in event["frames"])
@@ -140,6 +142,7 @@ def test_sampled_evidence_survives_restart_and_supports_semantic_submission(
         sampled["sampling_group_id"]
     }
     assert all(item["source"]["clip_id"] == "clip_001" for item in sampled_files)
+    assert all(item["source"]["sha256"] == provenance_source["sha256"] for item in sampled_files)
 
     frame = sampled_files[1]
     mcp_result = MoonMCPServer(restarted).handle(
@@ -161,6 +164,7 @@ def test_sampled_evidence_survives_restart_and_supports_semantic_submission(
     handoff_samples = handoff["inputs"]["evidence"]["sampled_frames"]
     assert handoff_samples["frame_count"] == 3
     assert handoff_samples["groups"][0]["group_id"] == sampled["sampling_group_id"]
+    assert handoff_samples["groups"][0]["source"]["sha256"] == provenance_source["sha256"]
     assert str(registry.resolve()) in handoff["inputs"]["evidence"]["files"]
     assert all(
         item["absolute_path"] in handoff["inputs"]["evidence"]["files"]
