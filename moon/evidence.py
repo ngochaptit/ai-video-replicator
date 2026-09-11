@@ -111,9 +111,14 @@ class SampledFrameEvidenceStore:
         }
 
     def available(self, stage: str) -> dict[str, Any]:
-        """Export readable evidence, accepting legacy groups for backward compatibility."""
+        """Export readable evidence, normalizing legacy groups without mutating history."""
         active = self.active(stage)
-        groups = [group for group in active["groups"] if self._is_available(group)]
+        normalized = [
+            self._normalize_legacy_group(group)
+            for group in active["groups"]
+            if self._is_available(group)
+        ]
+        groups = self._dedupe_equivalent_groups(normalized)
         exported = self._export_groups(groups)
         return {
             **active,
@@ -189,6 +194,84 @@ class SampledFrameEvidenceStore:
 
     def clear_fingerprint_cache(self) -> None:
         self._fingerprints.clear()
+
+    def _normalize_legacy_group(self, stored: dict[str, Any]) -> dict[str, Any]:
+        group = dict(stored)
+        if group.get("sample_kind"):
+            return group
+        handoff_revision = group.get("handoff_revision")
+        frame_paths = [
+            str(frame.get("path") or "").replace("\\", "/")
+            for frame in group.get("frames") or []
+        ]
+        legacy_refinement = (
+            (
+                isinstance(handoff_revision, int)
+                and not isinstance(handoff_revision, bool)
+                and handoff_revision > 0
+            )
+            or any("/refinement_" in f"/{path}" for path in frame_paths)
+        )
+        group["sample_kind"] = (
+            "dense_refinement" if legacy_refinement else "manual"
+        )
+        return group
+
+    def _dedupe_equivalent_groups(
+        self, groups: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Collapse duplicate migrated sampling groups deterministically.
+
+        Older runtimes can leave an untyped/manual copy of the same coarse sample
+        beside a newly typed coarse group. They represent identical measured
+        evidence and must not consume the active semantic batch twice.
+        """
+        chosen: dict[str, dict[str, Any]] = {}
+        for group in groups:
+            signature = self._equivalent_group_signature(group)
+            current = chosen.get(signature)
+            if current is None or self._group_preference(group) < self._group_preference(current):
+                chosen[signature] = group
+        return list(chosen.values())
+
+    @staticmethod
+    def _group_preference(group: dict[str, Any]) -> tuple[int, str]:
+        kind = str(group.get("sample_kind") or "manual")
+        rank = {
+            "coarse": 0,
+            "dense_refinement": 0,
+            "manual": 1,
+        }.get(kind, 2)
+        return rank, str(group.get("group_id") or "")
+
+    @staticmethod
+    def _equivalent_group_signature(group: dict[str, Any]) -> str:
+        source = group.get("source") or {}
+        request = group.get("request") or {}
+        kind = str(group.get("sample_kind") or "manual")
+        family = "refinement" if kind == "dense_refinement" else "coarse"
+        canonical = {
+            "family": family,
+            "source": {
+                "clip_id": source.get("clip_id"),
+                "path": source.get("path"),
+                "sha256": source.get("sha256"),
+            },
+            "request": {
+                "start_seconds": request.get("start_seconds"),
+                "end_seconds": request.get("end_seconds"),
+                "count": request.get("count"),
+                "width": request.get("width"),
+            },
+            "timestamps": [
+                frame.get("timestamp_seconds")
+                for frame in group.get("frames") or []
+            ],
+        }
+        raw = json.dumps(
+            canonical, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
 
     def _export_groups(self, stored_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
         groups = []
