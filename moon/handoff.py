@@ -55,16 +55,25 @@ class AgentHandoffService:
         task=self.runner.artifacts.read(f"{stage}_agent_task"); evidence_root=task.get("evidence_root")
         sampled_store=SampledFrameEvidenceStore(self.runner.project,self.runner.state.revision)
         if stage == "footage":
+            from moon.footage_batches import FootageSemanticProgress
             from moon.footage_evidence import FootageEvidencePlanner
-            handoff_revision = 0
-            if self.runner.artifacts.exists("footage_evidence_catalog"):
-                catalog = self.runner.artifacts.read("footage_evidence_catalog")
-                refinements = catalog.get("refinements") or []
-                if refinements:
-                    handoff_revision = max(int(item.get("handoff_revision", 0)) for item in refinements)
-            sampled = FootageEvidencePlanner(
-                self.runner.project, self.runner.state.revision
-            ).handoff_evidence(handoff_revision)
+            progress = FootageSemanticProgress.open_existing(self.runner)
+            sampled = progress.selected_evidence() if progress else None
+            if progress and sampled is not None:
+                path = progress.write_active_scaffold()
+                result["footage_profiles_scaffold"] = {
+                    "path": str(path), "sha256": self._sha256(path)
+                }
+            if sampled is None:
+                handoff_revision = 0
+                if self.runner.artifacts.exists("footage_evidence_catalog"):
+                    catalog = self.runner.artifacts.read("footage_evidence_catalog")
+                    refinements = catalog.get("refinements") or []
+                    if refinements:
+                        handoff_revision = max(int(item.get("handoff_revision", 0)) for item in refinements)
+                sampled = FootageEvidencePlanner(
+                    self.runner.project, self.runner.state.revision
+                ).handoff_evidence(handoff_revision)
         else:
             sampled = sampled_store.exported(stage)
         files=[]

@@ -121,6 +121,10 @@ Move-Item .\client_secret_*.json "$env:APPDATA\Moon\google-drive\client-secret.j
   "transport": "google_drive_api",
   "poll_interval_seconds": 10,
   "stale_after_seconds": 86400,
+  "max_footage_batch_clips": 3,
+  "max_footage_batch_ranges": 3,
+  "max_footage_batch_frames": 60,
+  "max_footage_batch_bytes": 25165824,
   "drive": {
     "root_folder_id": "PASTE_MON_EDIT_FOLDER_ID",
     "credentials_path": "%APPDATA%\\Moon\\google-drive\\client-secret.json",
@@ -185,10 +189,11 @@ Moon also generates `AGENT/gemini_handoff.pdf` for analyze and footage requests
 and publishes it beside `request.json`. If Gemini Web cannot dereference Drive
 links, upload this one PDF to Gemini. Analyze packets contain the route, response
 rules, canonical analyze artifacts, and every required measured reference frame.
-Footage packets contain the footage scaffold, compact evidence manifest,
-coverage summary, output/refinement contracts, and only the frames required for
-the current pass: coarse groups for the initial review or dense groups for the
-current refinement revision. Each frame carries clip, timestamp,
+Footage packets contain a request-scoped subset of the footage scaffold, compact
+evidence manifest, coverage summary, output/refinement contracts, and only the
+frames assigned to the active semantic batch. Coarse and dense-refinement
+evidence are split deterministically by configured clip, range, frame, and byte
+budgets. Each frame carries clip, timestamp,
 sample-group/window, origin, and evidence-path labels. The
 embedded manifest and `request.json.route.portable_packet_manifest` bind each
 packet to the current request ID, handoff revision, source hashes, and packet
@@ -314,7 +319,7 @@ Moon never chooses a footage match, invents timestamps, silently switches render
 
 The `footage` stage now seeds deterministic full-clip frame coverage before asking an external vision agent for semantic segmentation. The default target is roughly one measured frame every 4 seconds, bounded to 120 initial frames per clip and chunked into FFmpeg sampling groups of at most 24 frames.
 
-This is evidence generation only; Moon still does not decide what an action means or where a semantic action starts. Gemini scans the portable coarse coverage. If a boundary remains ambiguous, it returns a strict `footage_refinement_request` with measured `clip_id`, `start_seconds`, `end_seconds`, and `reason` values. GPT records `REQUEST_REFINEMENT`; Moon—not Gemini—runs the deterministic sampler, appends the new measured frames, advances the handoff revision, and republishes a fresh route and packet for `RECHECK_TARGETS`. Registered sampled frames are automatically merged into the `footage_profile_builder` evidence catalog on the enrichment pass, so those refined timestamps can become canonical segment boundaries.
+This is evidence generation only; Moon still does not decide what an action means or where a semantic action starts. The external vision agent scans one portable coarse batch at a time. If a boundary remains ambiguous, it returns a strict `footage_refinement_request` with measured `clip_id`, `start_seconds`, `end_seconds`, and `reason` values. GPT records `REQUEST_REFINEMENT`; Moon—not Gemini—runs the deterministic sampler, appends the new measured frames, splits those ranges into bounded refinement batches, advances the handoff revision, and republishes a fresh route and packet for `RECHECK_TARGETS`. Registered sampled frames are automatically merged into the `footage_profile_builder` evidence catalog on the enrichment pass, so those refined timestamps can become canonical segment boundaries.
 
 Before publishing, `footage_profile_builder` probes and analyzes each source
 locally. `.moon/cache/footage-preprocess.json` checkpoints each completed clip
@@ -325,13 +330,42 @@ earlier clips. Sample groups are likewise source-fingerprinted and marked
 complete only after all requested frames have been written.
 
 Each Drive request includes `inputs/footage_evidence_manifest.json`. This
-request-scoped manifest records job/request/revision identity, preprocessing
-checkpoint state, clip probe metadata, source fingerprints, candidate ranges,
-and the exact timestamp/hash/reference of every exported frame. Dense passes
-export only ranges requested in the current handoff revision; earlier coarse
-and refinement evidence remains in the local append-only catalog for final
-contract validation but is not repeatedly sent to the external agent. The
-manifest is a transport view, not a replacement for Moon artifacts or
-`response.json`.
+request-scoped manifest records job/request/revision and batch identity,
+preprocessing checkpoint state, clip probe metadata, source fingerprints,
+candidate ranges, and the exact timestamp/hash/reference of every exported
+frame. The request and PDF contain only the active batch; completed batches and
+unrelated clips/ranges are not recopied. Earlier coarse and refinement evidence
+remains in the local append-only catalog for final contract validation but is
+not repeatedly sent to the external agent. The manifest is a transport view,
+not a replacement for Moon artifacts or `response.json`.
+
+### Footage semantic batching and resume
+
+Moon persists batch lifecycle in
+`<project>/.moon/footage-semantic-progress.json`. The default hard limits are
+three clips, three dense-refinement ranges, 60 frames, and 24 MiB of measured
+frame evidence per request. They can be lowered with
+`max_footage_batch_clips`, `max_footage_batch_ranges`,
+`max_footage_batch_frames`, and `max_footage_batch_bytes` in `bridge.json`.
+The existing bridge-wide evidence file/byte limits remain authoritative as an
+additional safety ceiling.
+
+Every batch gets a monotonically assigned handoff revision and a fresh request
+ID. Its partial, validated result is stored as
+`footage_semantic_batch_<batch_id>.json`; its response hash, status, request
+lineage, and evidence hashes are checkpointed before the launcher advances.
+Restarting the launcher resumes the current waiting batch idempotently or
+publishes the next incomplete batch. A response from an older request/revision
+is still rejected by the normal bridge staleness checks.
+
+Refinement batches are prioritized and block their originating coarse batch
+until the requested windows have been reviewed. When all batches are complete,
+Moon merges clips and segments in measured clip/time order, de-duplicates exact
+segment payloads, rebuilds the complete evidence catalog, and runs the existing
+`footage_semantic_enrichment` validator once more before advancing to `match`.
+The Operator Launcher performs each publish/watch/advance cycle automatically;
+there is no new operator command or manual migration step. Existing projects
+without a progress file create it deterministically from their current valid
+coarse/dense evidence on the next footage publish.
 
 The quality goal is to avoid the failure mode where a long single-take clip with few hard scene cuts is reduced to a handful of 60–90 second semantic segments, which later forces extreme speed-up and source reuse during matching/rendering.
