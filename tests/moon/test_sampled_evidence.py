@@ -165,7 +165,9 @@ def test_sampled_evidence_survives_restart_and_supports_semantic_submission(
     assert handoff_samples["frame_count"] == 3
     assert handoff_samples["groups"][0]["group_id"] == sampled["sampling_group_id"]
     assert handoff_samples["groups"][0]["source"]["sha256"] == provenance_source["sha256"]
-    assert str(registry.resolve()) in handoff["inputs"]["evidence"]["files"]
+    # The append-only provenance registry remains local. Shipping it would expose
+    # unrelated/completed sampling history and defeat request-scoped evidence isolation.
+    assert str(registry.resolve()) not in handoff["inputs"]["evidence"]["files"]
     assert all(
         item["absolute_path"] in handoff["inputs"]["evidence"]["files"]
         for item in handoff_samples["groups"][0]["frames"]
