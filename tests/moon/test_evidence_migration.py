@@ -143,6 +143,10 @@ def test_migrated_legacy_refinement_is_not_bootstrapped_as_coarse_and_duplicate_
             sample_kind="manual",
         ),
     ]
+    # Real migrated registries may have one legacy coarse group without a stored
+    # source hash even though its materialized frames are byte-identical to the
+    # newer typed coarse group. Dedupe must use the current source fingerprint.
+    events[0]["source"].pop("sha256")
     registry.write_text(
         "".join(json.dumps(item, sort_keys=True) + "\n" for item in events),
         encoding="utf-8",
