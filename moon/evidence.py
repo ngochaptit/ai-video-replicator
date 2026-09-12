@@ -261,6 +261,13 @@ class SampledFrameEvidenceStore:
         request = group.get("request") or {}
         kind = str(group.get("sample_kind") or "manual")
         family = "refinement" if kind == "dense_refinement" else "coarse"
+        source_path = str(source.get("path") or "")
+        try:
+            source_sha256 = self.source_fingerprint(
+                self.absolute_path(source_path)
+            )
+        except (OSError, ValueError):
+            source_sha256 = str(source.get("sha256") or "")
         frames = []
         for frame in group.get("frames") or []:
             frame_path = self.absolute_path(str(frame.get("path") or ""))
@@ -276,8 +283,8 @@ class SampledFrameEvidenceStore:
             "family": family,
             "source": {
                 "clip_id": source.get("clip_id"),
-                "path": source.get("path"),
-                "sha256": source.get("sha256"),
+                "path": source_path,
+                "sha256": source_sha256,
             },
             "window": {
                 "start_seconds": request.get("start_seconds"),
