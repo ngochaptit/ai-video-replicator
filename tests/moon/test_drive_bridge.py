@@ -594,6 +594,7 @@ def test_cli_bridge_publish_uses_project_positional_argument(tmp_path: Path, cap
             {
                 "project_id": "job-123",
                 "transport": "local_sync",
+                "exchange_protocol": "legacy",
                 "drive": {"sync_root": str(tmp_path / "drive")},
             }
         ),

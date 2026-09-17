@@ -228,7 +228,9 @@ def test_waiting_agent_state_and_current_gpt_route_are_detected(tmp_path: Path):
     assert snapshot["can_start"] is True  # no live worker; reopening can resume it
     assert snapshot["current_task"]["state"] == WAITING_CHATGPT
     assert snapshot["current_task"]["owner"] == "GPT"
-    assert snapshot["drive_folder"].endswith("MON_EDIT\\jobs\\operator-project\\AGENT")
+    assert Path(snapshot["drive_folder"]).parts[-4:] == (
+        "MON_EDIT", "jobs", "operator-project", "AGENT"
+    )
     assert by_stage["analyze"] == WAITING_AGENT
     assert snapshot["debug"]["request_id"] == request_id
 

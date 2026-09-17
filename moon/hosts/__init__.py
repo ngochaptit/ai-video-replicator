@@ -29,7 +29,12 @@ def profiles(
 ) -> dict[str, HostProfile]:
     selected_home = Path(home).expanduser().resolve() if home else Path.home().resolve()
     selected_appdata = appdata if appdata is not None else os.environ.get("APPDATA")
-    selected_codex_home = codex_home if codex_home is not None else os.environ.get("CODEX_HOME")
+    if codex_home is not None:
+        selected_codex_home = codex_home
+    elif home is None:
+        selected_codex_home = os.environ.get("CODEX_HOME")
+    else:
+        selected_codex_home = None
     values = (
         antigravity.profile(project, home=selected_home, python_command=python_command),
         claude_desktop.profile(
