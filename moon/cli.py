@@ -114,10 +114,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2) if args.output_json else format_doctor_report(result))
         return int(result["exit_code"])
     if args.command == "bridge":
-        from moon.drive_bridge import DriveBridgeConfig, MoonDriveBridge
+        from moon.drive_bridge import DriveBridgeConfig
+        from moon.project_mirror_bridge import bridge_for
 
         bridge_runner = _runner(str(args.bridge_project))
-        service = MoonDriveBridge(
+        service = bridge_for(
             bridge_runner,
             DriveBridgeConfig.load(bridge_runner.project.root),
         )

@@ -133,6 +133,7 @@ def _most_specific_schema_error(errors: list[Any]) -> Any:
 class DriveBridgeConfig:
     project_id: str
     transport: str = "google_drive_api"
+    exchange_protocol: str = "legacy"
     poll_interval_seconds: float = 10.0
     stale_after_seconds: int = 86400
     drive_root_folder_id: str | None = None
@@ -159,9 +160,14 @@ class DriveBridgeConfig:
         drive = payload.get("drive") or {}
         if not isinstance(drive, dict):
             raise TypeError("bridge config drive must be an object")
+        transport_name = str(payload.get("transport") or "google_drive_api")
         config = cls(
             project_id=str(payload.get("project_id") or project_root.name),
-            transport=str(payload.get("transport") or "google_drive_api"),
+            transport=transport_name,
+            exchange_protocol=str(
+                payload.get("exchange_protocol")
+                or ("project_mirror_v2" if transport_name == "local_sync" else "legacy")
+            ),
             poll_interval_seconds=float(payload.get("poll_interval_seconds", 10.0)),
             stale_after_seconds=int(payload.get("stale_after_seconds", 86400)),
             drive_root_folder_id=os.environ.get("MOON_DRIVE_ROOT_FOLDER_ID")
@@ -188,6 +194,10 @@ class DriveBridgeConfig:
             raise ValueError("bridge project_id must use only letters, numbers, '.', '_' or '-'")
         if self.transport not in {"google_drive_api", "local_sync"}:
             raise ValueError("bridge transport must be google_drive_api or local_sync")
+        if self.exchange_protocol not in {"legacy", "project_mirror_v2"}:
+            raise ValueError("exchange_protocol must be legacy or project_mirror_v2")
+        if self.exchange_protocol == "project_mirror_v2" and self.transport != "local_sync":
+            raise ValueError("project_mirror_v2 requires local_sync transport")
         if not math.isfinite(self.poll_interval_seconds) or self.poll_interval_seconds <= 0:
             raise ValueError("poll_interval_seconds must be greater than zero")
         if self.stale_after_seconds <= 0:
@@ -222,6 +232,14 @@ class DriveBridgeConfig:
     @property
     def remote_path(self) -> str:
         return f"{REMOTE_ROOT_NAME}/jobs/{self.project_id}/AGENT"
+
+    @property
+    def v2_remote_path(self) -> str:
+        return f"{REMOTE_ROOT_NAME}/projects/{self.project_id}"
+
+    @property
+    def active_remote_path(self) -> str:
+        return self.v2_remote_path if self.exchange_protocol == "project_mirror_v2" else self.remote_path
 
 
 class BridgeTransport(Protocol):
@@ -2111,6 +2129,12 @@ class MoonDriveBridge:
         }]
         root_conditions: list[dict[str, Any]] = []
         if stage == "footage":
+            semantic_contract = output_contract
+            if not footage_batch and "batch_id" in (output_contract.get("required") or []):
+                semantic_contract = dict(output_contract)
+                semantic_contract["required"] = [
+                    item for item in output_contract["required"] if item != "batch_id"
+                ]
             payload_schema = {
                 "type": "object",
                 "artifact": (
@@ -2119,7 +2143,7 @@ class MoonDriveBridge:
                     else output_contract.get("artifact")
                 ),
                 "rules": output_contract.get("rules") or [],
-                "anyOf": [output_contract, FOOTAGE_REFINEMENT_REQUEST_SCHEMA],
+                "anyOf": [semantic_contract, FOOTAGE_REFINEMENT_REQUEST_SCHEMA],
                 "refinement_schema": FOOTAGE_REFINEMENT_REQUEST_SCHEMA,
             }
             decisions = ["APPROVED", "REQUEST_REFINEMENT"]
@@ -2155,7 +2179,7 @@ class MoonDriveBridge:
                             }
                         },
                     },
-                    "then": {"properties": {"payload": output_contract}},
+                    "then": {"properties": {"payload": semantic_contract}},
                 },
             ]
         review_schema: dict[str, Any] = {

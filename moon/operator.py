@@ -24,6 +24,7 @@ from moon.drive_bridge import (
     REMOTE_ROOT_NAME,
 )
 from moon.media.inspection import VIDEO_EXTENSIONS
+from moon.project_mirror_bridge import bridge_for
 from moon.runner.pipeline import PipelineRunner
 
 
@@ -725,7 +726,7 @@ class OperatorWorker:
 
     def _wait_for_agent(self, runner: PipelineRunner, stage: str) -> None:
         config = DriveBridgeConfig.load(self.root)
-        bridge = MoonDriveBridge(runner, config)
+        bridge = bridge_for(runner, config)
         self._command(
             f'"{sys.executable}" -m moon bridge publish "{self.root}" {stage}'
         )
@@ -743,7 +744,7 @@ class OperatorWorker:
                     transport_error=str(exc),
                     owner="moon",
                     revision=runner.state.revision,
-                    remote_path=config.remote_path,
+                    remote_path=config.active_remote_path,
                 )
                 self.sleep(config.poll_interval_seconds)
         if published is None:
@@ -759,7 +760,7 @@ class OperatorWorker:
             transport_error=None,
             owner="gpt",
             revision=route.get("revision"),
-            remote_path=config.remote_path,
+            remote_path=config.active_remote_path,
             stage_internals=(
                 f"bridge_status=WAITING_AGENT; stage={stage}; "
                 f"revision={(request.get('route') or {}).get('revision')}; "
@@ -781,7 +782,7 @@ class OperatorWorker:
                     transport_error=str(exc),
                     owner="gpt",
                     revision=route.get("revision"),
-                    remote_path=config.remote_path,
+                    remote_path=config.active_remote_path,
                 )
                 self.sleep(config.poll_interval_seconds)
                 continue
@@ -796,9 +797,23 @@ class OperatorWorker:
                     transport_error=None,
                     owner="gpt",
                     revision=route.get("revision"),
-                    remote_path=config.remote_path,
+                    remote_path=config.active_remote_path,
                 )
             if consumed is not None:
+                if consumed.get("status") == "WAITING_GPT_CORRECTION":
+                    self._save(
+                        status="waiting_agent",
+                        stage=stage,
+                        message="Phản hồi chưa hợp lệ. GPT cần sửa response.json theo correction.json...",
+                        request_id=request.get("request_id") or request.get("task_id"),
+                        transport_error=None,
+                        owner="gpt",
+                        revision=route.get("revision") or request.get("revision"),
+                        remote_path=config.active_remote_path,
+                        stage_internals=f"bridge_status=WAITING_GPT_CORRECTION; stage={stage}",
+                    )
+                    self.sleep(config.poll_interval_seconds)
+                    continue
                 self._save(
                     status="response_received",
                     stage=stage,
@@ -807,7 +822,7 @@ class OperatorWorker:
                     transport_error=None,
                     owner="moon",
                     revision=route.get("revision"),
-                    remote_path=config.remote_path,
+                    remote_path=config.active_remote_path,
                     stage_internals=(
                         f"bridge_status={consumed.get('status')}; stage={stage}; "
                         f"revision={route.get('revision')}; "
