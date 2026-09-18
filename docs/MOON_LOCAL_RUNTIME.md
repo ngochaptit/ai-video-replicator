@@ -344,14 +344,18 @@ Each request has an immutable folder:
 
 ```text
 MON_EDIT/projects/<project_id>/
-  manifest.json
+  project.json
+  project_manifest.json
+  GPT_INSTRUCTIONS.md
   proxies/
   artifacts/
-  evidence/
+  analysis/evidence/
+  analysis/index.json
   analysis/invalidation.json
-  tasks/<task_id>/request.json
-  tasks/<task_id>/response.json
-  tasks/<task_id>/receipt.json
+  agent/current.json
+  agent/tasks/<task_id>/request.json
+  agent/tasks/<task_id>/response.json
+  agent/tasks/<task_id>/receipt.json
 ```
 
 GPT must echo the task identity, revision, project generation, and asset hashes.
