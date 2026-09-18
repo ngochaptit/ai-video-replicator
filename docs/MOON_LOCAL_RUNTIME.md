@@ -329,3 +329,37 @@ merged into the `footage_profile_builder` evidence catalog on the enrichment pas
 so those refined timestamps can become canonical segment boundaries.
 
 The quality goal is to avoid the failure mode where a long single-take clip with few hard scene cuts is reduced to a handful of 60–90 second semantic segments, which later forces extreme speed-up and source reuse during matching/rendering.
+
+## Project Mirror V2 (local sync)
+
+Project Mirror V2 is enabled explicitly with
+`exchange_protocol: "project_mirror_v2"`. Configurations that omit this key stay
+on `legacy`, including existing local-sync projects. Moon mirrors only stable
+asset identities, metadata, bounded proxies, artifacts, and
+evidence beneath `MON_EDIT/projects/<project_id>`. Original local paths never
+appear in the public manifest. Existing Google Drive API projects continue to use
+the legacy bridge unless explicitly migrated.
+
+Each request has an immutable folder:
+
+```text
+MON_EDIT/projects/<project_id>/
+  project.json
+  project_manifest.json
+  GPT_INSTRUCTIONS.md
+  proxies/
+  artifacts/
+  analysis/evidence/
+  analysis/index.json
+  analysis/invalidation.json
+  agent/current.json
+  agent/tasks/<task_id>/request.json
+  agent/tasks/<task_id>/response.json
+  agent/tasks/<task_id>/receipt.json
+```
+
+GPT must echo the task identity, revision, project generation, and asset hashes.
+Invalid or stale responses produce `correction.json` and remain waiting; they are
+never consumed. Applying an accepted response writes durable `APPLYING.json` and
+`APPLIED.json` markers. Roll back immediately by setting
+`exchange_protocol: "legacy"`; no V1 file is moved or deleted.

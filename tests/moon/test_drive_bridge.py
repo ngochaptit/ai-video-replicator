@@ -594,6 +594,7 @@ def test_cli_bridge_publish_uses_project_positional_argument(tmp_path: Path, cap
             {
                 "project_id": "job-123",
                 "transport": "local_sync",
+                "exchange_protocol": "legacy",
                 "drive": {"sync_root": str(tmp_path / "drive")},
             }
         ),
@@ -609,6 +610,22 @@ def test_cli_bridge_publish_uses_project_positional_argument(tmp_path: Path, cap
     assert (remote / "request.json").is_file()
     assert not (remote / "gemini_handoff.pdf").exists()
     assert all(path.suffix.lower() != ".mp4" for path in remote.rglob("*"))
+
+
+def test_existing_local_sync_config_stays_legacy_without_opt_in(tmp_path: Path):
+    project = MoonProject.open(tmp_path / "project", create=True)
+    (project.moon_dir / "bridge.json").write_text(
+        json.dumps(
+            {
+                "project_id": "legacy-project",
+                "transport": "local_sync",
+                "drive": {"sync_root": str(tmp_path / "drive")},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert DriveBridgeConfig.load(project.root).exchange_protocol == "legacy"
 
 
 def test_proposal_publish_creates_persistent_gpt_route_state(tmp_path: Path):
