@@ -32,6 +32,22 @@ class MirrorTransport:
         atomic_write_json(target, payload)
         return target
 
+    def write_text(self, relative_path: str, text: str) -> Path:
+        target = self.path(relative_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+                if text and not text.endswith("\n"):
+                    handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return target
+
     def read_json(self, relative_path: str) -> Any | None:
         path = self.path(relative_path)
         if not path.exists():
@@ -58,4 +74,3 @@ class MirrorTransport:
 
     def remove(self, relative_path: str) -> None:
         self.path(relative_path).unlink(missing_ok=True)
-

@@ -44,8 +44,22 @@ class AssetRecord:
     def public_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value.pop("modified_ns", None)
+        value.update(
+            source_filename=PurePosixPath(self.relative_path).name,
+            mirror_path=self.proxy_path,
+            source_sha256=self.content_sha256,
+            source_size=self.size_bytes,
+            source_duration=self.duration_seconds,
+            proxy={
+                "enabled": self.has_video,
+                "path": self.proxy_path,
+                "codec": "h264" if self.has_video else None,
+                "max_dimension": 720 if self.has_video else None,
+                "timeline_aligned": True,
+                "renamed": self.proxy_path != self.relative_path,
+            },
+        )
         return value
 
     def internal_dict(self) -> dict[str, Any]:
         return asdict(self)
-

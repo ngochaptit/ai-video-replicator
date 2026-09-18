@@ -5,13 +5,14 @@ import shutil
 import subprocess
 import uuid
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, Callable
 
 from moon.media.probe import probe_media
 
 
 AUDIO_EXTENSIONS = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".wav"}
-H264_CONTAINERS = {".avi", ".m4v", ".mkv", ".mov", ".mp4"}
+H264_CONTAINERS = {".m4v", ".mkv", ".mov", ".mp4"}
 
 
 class ProxyBuilder:
@@ -25,11 +26,14 @@ class ProxyBuilder:
         self.prober = prober
 
     @staticmethod
-    def proxy_relative_path(asset_id: str, source: Path, media: dict[str, Any]) -> str:
-        if not media.get("has_video"):
-            return f"proxies/{asset_id}{source.suffix.lower()}"
-        suffix = source.suffix.lower() if source.suffix.lower() in H264_CONTAINERS else ".mp4"
-        return f"proxies/{asset_id}{suffix}"
+    def proxy_relative_path(relative_path: str, source: Path, media: dict[str, Any]) -> str:
+        """Return the GPT-visible path, preserving source identity when possible."""
+        normalized = PurePosixPath(str(relative_path).replace("\\", "/"))
+        if not media.get("has_video") or source.suffix.lower() in H264_CONTAINERS:
+            return normalized.as_posix()
+        # A renamed container is explicit in manifest.proxy.path/renamed. Never
+        # silently pretend an MP4 payload still has the source extension.
+        return normalized.with_name(f"{normalized.name}.proxy.mp4").as_posix()
 
     def build(self, source: Path, destination: Path, media: dict[str, Any]) -> dict[str, Any]:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -42,7 +46,8 @@ class ProxyBuilder:
             else:
                 command = [
                     "ffmpeg", "-y", "-i", str(source), "-map", "0:v:0", "-map", "0:a?",
-                    "-vf", "scale=-2:'min(720,ih)'", "-c:v", "libx264", "-preset", "veryfast",
+                    "-vf", "scale=720:720:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                    "-c:v", "libx264", "-preset", "veryfast",
                     "-crf", "30", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k",
                     "-movflags", "+faststart", str(temporary),
                 ]

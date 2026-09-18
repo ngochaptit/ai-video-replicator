@@ -64,13 +64,19 @@ class ProjectMirrorService:
             )
             unchanged = bool(prior and prior.get("content_sha256") == content_sha256)
             media = self._media_metadata(source, prior if unchanged else None)
-            proxy_path = self.proxy_builder.proxy_relative_path(asset_id, source, media)
-            cached_proxy = self.proxy_cache_dir / Path(proxy_path).name
+            proxy_path = self.proxy_builder.proxy_relative_path(relative_path, source, media)
+            cached_proxy = (
+                self.proxy_cache_dir
+                / asset_id
+                / f"{content_sha256[:16]}{Path(proxy_path).suffix.lower()}"
+            )
             remote_proxy = self.transport.path(proxy_path)
             if unchanged and prior and Path(str(prior.get("proxy_cache", ""))).is_file():
                 cached_proxy = Path(str(prior["proxy_cache"]))
-            if not cached_proxy.exists():
+            if not unchanged or not cached_proxy.exists():
                 self.proxy_builder.build(source, cached_proxy, media)
+            if prior and prior.get("proxy_path") != proxy_path:
+                self.transport.remove(str(prior["proxy_path"]))
             if not unchanged or not remote_proxy.exists():
                 self.transport.copy_file(cached_proxy, proxy_path)
             status = "ready" if unchanged else ("invalidated" if prior else "new")
@@ -134,14 +140,20 @@ class ProjectMirrorService:
             },
             "assets": public_assets,
             "tombstones": deleted,
-            "gpt_instructions": self._gpt_instructions(),
+            "gpt_instructions_path": "GPT_INSTRUCTIONS.md",
         }
         internal_manifest = dict(public_manifest)
         internal_manifest["assets"] = []
         for asset in sorted(assets, key=lambda item: item.relative_path):
             item = asset.internal_dict()
             item["source_path"] = str((self.project.root / asset.relative_path).resolve())
-            item["proxy_cache"] = str((self.proxy_cache_dir / Path(asset.proxy_path).name).resolve())
+            item["proxy_cache"] = str(
+                (
+                    self.proxy_cache_dir
+                    / asset.asset_id
+                    / f"{asset.content_sha256[:16]}{Path(asset.proxy_path).suffix.lower()}"
+                ).resolve()
+            )
             internal_manifest["assets"].append(item)
 
         invalidation = {
@@ -155,7 +167,19 @@ class ProjectMirrorService:
         }
         self.local_dir.mkdir(parents=True, exist_ok=True)
         atomic_write_json(self.internal_manifest_path, internal_manifest)
+        public_project = {
+            "protocol": PROJECT_PROTOCOL,
+            "project_id": self.transport.root.name,
+            "manifest": "project_manifest.json",
+            "instructions": "GPT_INSTRUCTIONS.md",
+            "active_task": "agent/current.json",
+            "reference": project_config.get("reference", "reference.mp4"),
+            "footage_dir": project_config.get("footage_dir", "footage"),
+        }
+        self.transport.write_json("project.json", public_project)
+        self.transport.write_json("project_manifest.json", public_manifest)
         self.transport.write_json("manifest.json", public_manifest)
+        self.transport.write_text("GPT_INSTRUCTIONS.md", self._gpt_instructions())
         self.transport.write_json("analysis/invalidation.json", invalidation)
         self._sync_persistent_artifacts(previous)
         return public_manifest
@@ -220,9 +244,10 @@ class ProjectMirrorService:
     def _sync_persistent_artifacts(self, previous: dict[str, Any]) -> None:
         prior_hashes = previous.get("persistent_artifacts", {})
         current: dict[str, str] = {}
+        analysis_entries: list[dict[str, Any]] = []
         for local_root, remote_root in (
             (self.project.artifacts_dir, "artifacts"),
-            (self.project.evidence_dir, "evidence"),
+            (self.project.evidence_dir, "analysis/evidence"),
         ):
             if not local_root.exists():
                 continue
@@ -235,16 +260,41 @@ class ProjectMirrorService:
                 current[remote] = digest
                 if prior_hashes.get(remote) != digest or self.transport.read_bytes(remote) is None:
                     self.transport.copy_file(path, remote)
+                if remote_root.startswith("analysis/"):
+                    analysis_entries.append(
+                        {
+                            "path": remote,
+                            "sha256": digest,
+                            "size_bytes": path.stat().st_size,
+                        }
+                    )
+        for remote in sorted(set(prior_hashes) - set(current)):
+            self.transport.remove(remote)
+        self.transport.write_json(
+            "analysis/index.json",
+            {
+                "protocol": PROJECT_PROTOCOL,
+                "project_id": self.transport.root.name,
+                "updated_at": _utc_now(),
+                "files": analysis_entries,
+            },
+        )
         payload = self._load_internal_manifest()
         payload["persistent_artifacts"] = current
         atomic_write_json(self.internal_manifest_path, payload)
 
     @staticmethod
-    def _gpt_instructions() -> list[str]:
-        return [
-            "Read manifest.json before analyzing media.",
-            "Treat asset_id plus content_sha256 as the immutable asset identity.",
-            "Read task envelopes from tasks/<task_id>/request.json.",
-            "Write exactly one immutable response to tasks/<task_id>/response.json.",
-            "Use only relative mirror paths; never invent local machine paths.",
-        ]
+    def _gpt_instructions() -> str:
+        return """# MON EDIT Project Mirror V2
+
+1. Read `agent/current.json` and then its `request_path`.
+2. Read `project_manifest.json` before inspecting media or evidence.
+3. Treat `asset_id` plus `content_sha256` as immutable source identity.
+4. Media at each asset's `mirror_path` is a timeline-aligned viewing proxy.
+5. Return only semantic results. Never choose pipeline state, owner, or next action.
+6. Reference sources by `asset_id`, `relative_path`, and source timestamps.
+7. Never invent local machine paths, asset IDs, filenames, or timestamps.
+8. Write the response only to the active task's `response_path`.
+9. If `validation.json` reports an error, replace the unaccepted response with a corrected one.
+10. A task with `receipt.json` is immutable and must not be edited.
+"""
