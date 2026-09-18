@@ -24,7 +24,7 @@ from moon.drive_bridge import (
     REMOTE_ROOT_NAME,
 )
 from moon.media.inspection import VIDEO_EXTENSIONS
-from moon.project_mirror_bridge import bridge_for
+from moon.project_mirror_bridge import ProjectMirrorBridge
 from moon.runner.pipeline import PipelineRunner
 
 
@@ -726,7 +726,11 @@ class OperatorWorker:
 
     def _wait_for_agent(self, runner: PipelineRunner, stage: str) -> None:
         config = DriveBridgeConfig.load(self.root)
-        bridge = bridge_for(runner, config)
+        bridge = (
+            ProjectMirrorBridge(runner, config)
+            if config.exchange_protocol == "project_mirror_v2"
+            else MoonDriveBridge(runner, config)
+        )
         self._command(
             f'"{sys.executable}" -m moon bridge publish "{self.root}" {stage}'
         )

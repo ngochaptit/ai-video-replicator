@@ -166,7 +166,7 @@ class DriveBridgeConfig:
             transport=transport_name,
             exchange_protocol=str(
                 payload.get("exchange_protocol")
-                or ("project_mirror_v2" if transport_name == "local_sync" else "legacy")
+                or "legacy"
             ),
             poll_interval_seconds=float(payload.get("poll_interval_seconds", 10.0)),
             stale_after_seconds=int(payload.get("stale_after_seconds", 86400)),

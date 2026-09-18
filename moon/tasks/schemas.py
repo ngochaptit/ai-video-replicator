@@ -12,8 +12,31 @@ from moon.mirror.models import PROJECT_PROTOCOL
 
 
 TASK_PROTOCOL = "mon_edit_task/2"
-RESPONSE_PROTOCOL = "mon_edit_response/2"
+RESPONSE_PROTOCOL = TASK_PROTOCOL
 MAX_RESPONSE_BYTES = 50 * 1024 * 1024
+
+REFINEMENT_RESULT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["requests"],
+    "properties": {
+        "partial_result": {"type": "object"},
+        "requests": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "required": ["clip_id", "start_seconds", "end_seconds", "reason"],
+                "properties": {
+                    "clip_id": {"type": "string", "minLength": 1},
+                    "asset_id": {"type": "string", "minLength": 1},
+                    "start_seconds": {"type": "number", "minimum": 0},
+                    "end_seconds": {"type": "number", "exclusiveMinimum": 0},
+                    "reason": {"type": "string", "minLength": 1},
+                },
+            },
+        },
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -77,11 +100,19 @@ def validate_response(
         if response.get(field) != task.get(field):
             code = "stale_response" if field in {"revision", "project_generation"} else "wrong_task"
             raise TaskValidationError(code, f"expected {task.get(field)!r}, got {response.get(field)!r}", field)
-    if response.get("status") not in {"completed", "partial", "needs_refinement", "rejected"}:
+    if response.get("status") not in {"completed", "partial", "needs_refinement"}:
         raise TaskValidationError("invalid_status", "unsupported response status", "status")
     _parse_timestamp(response.get("created_at"), "created_at")
     result = response.get("result")
-    schema = task.get("result_schema") or {"type": "object"}
+    if response.get("status") == "needs_refinement":
+        requests = result.get("requests") if isinstance(result, dict) else None
+        if not isinstance(requests, list) or not requests:
+            raise TaskValidationError("empty_refinement", "needs_refinement requires a non-empty requests array", "result.requests")
+    schema = (
+        REFINEMENT_RESULT_SCHEMA
+        if response.get("status") == "needs_refinement"
+        else task.get("result_schema") or {"type": "object"}
+    )
     errors = sorted(Draft202012Validator(schema).iter_errors(result), key=lambda error: list(error.path))
     if errors:
         error = errors[0]
@@ -90,21 +121,36 @@ def validate_response(
     if manifest.get("protocol") != PROJECT_PROTOCOL:
         raise TaskValidationError("invalid_manifest", "task must validate against a project mirror V2 manifest")
     assets = {item.get("asset_id"): item for item in manifest.get("assets", [])}
-    _validate_asset_references(result, assets)
-    if response.get("status") == "needs_refinement":
-        requests = result.get("requests") if isinstance(result, dict) else None
-        if not isinstance(requests, list) or not requests:
-            raise TaskValidationError("empty_refinement", "needs_refinement requires a non-empty requests array", "result.requests")
+    paths = {item.get("relative_path"): item for item in manifest.get("assets", [])}
+    _validate_asset_references(result, assets, paths)
     return response
 
 
-def _validate_asset_references(value: Any, assets: dict[str, dict[str, Any]], path: str = "result") -> None:
+def _validate_asset_references(
+    value: Any,
+    assets: dict[str, dict[str, Any]],
+    paths: dict[str, dict[str, Any]],
+    path: str = "result",
+) -> None:
     if isinstance(value, dict):
         asset_id = value.get("asset_id")
+        relative_path = value.get("relative_path")
+        if relative_path is not None and relative_path not in paths:
+            raise TaskValidationError(
+                "unknown_asset_path",
+                f"unknown relative_path {relative_path!r}",
+                f"{path}.relative_path",
+            )
         if asset_id is not None:
             if asset_id not in assets:
                 raise TaskValidationError("unknown_asset", f"unknown asset_id {asset_id!r}", f"{path}.asset_id")
             expected = assets[asset_id].get("content_sha256")
+            if relative_path is not None and relative_path != assets[asset_id].get("relative_path"):
+                raise TaskValidationError(
+                    "asset_identity_mismatch",
+                    "asset_id and relative_path identify different sources",
+                    path,
+                )
             supplied = value.get("content_sha256")
             if supplied is not None and supplied != expected:
                 raise TaskValidationError("stale_asset", f"content hash does not match {asset_id}", f"{path}.content_sha256")
@@ -120,10 +166,10 @@ def _validate_asset_references(value: Any, assets: dict[str, dict[str, Any]], pa
                 if "start_seconds" in value and "end_seconds" in value and value["end_seconds"] <= value["start_seconds"]:
                     raise TaskValidationError("invalid_range", "end_seconds must be greater than start_seconds", path)
         for key, child in value.items():
-            _validate_asset_references(child, assets, f"{path}.{key}")
+            _validate_asset_references(child, assets, paths, f"{path}.{key}")
     elif isinstance(value, list):
         for index, child in enumerate(value):
-            _validate_asset_references(child, assets, f"{path}[{index}]")
+            _validate_asset_references(child, assets, paths, f"{path}[{index}]")
 
 
 def _parse_timestamp(value: Any, field: str) -> datetime:

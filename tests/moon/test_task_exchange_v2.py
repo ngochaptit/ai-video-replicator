@@ -78,7 +78,7 @@ def test_exchange_is_idempotent_and_receipt_is_immutable(tmp_path: Path) -> None
     created = exchange.create(stage="footage", revision=1, manifest=manifest(), result_schema={"type": "object"}, inputs={"x": 1})
     assert exchange.create(stage="footage", revision=1, manifest=manifest(), result_schema={"type": "object"}, inputs={"x": 1})["task_id"] == created["task_id"]
     valid = response(task_id=created["task_id"], result={})
-    transport.write_json(f"tasks/{created['task_id']}/response.json", valid)
+    transport.write_json(f"agent/tasks/{created['task_id']}/response.json", valid)
     accepted = exchange.poll(created, manifest())
     assert accepted["status"] == "accepted"
     assert exchange.poll(created, manifest())["receipt"] == accepted["receipt"]
@@ -90,8 +90,83 @@ def test_invalid_response_writes_correction_not_receipt(tmp_path: Path) -> None:
     store = TaskStore(project)
     exchange = TaskExchange(store, transport)
     created = exchange.create(stage="footage", revision=1, manifest=manifest(), result_schema={"type": "object"}, inputs={})
-    transport.write_json(f"tasks/{created['task_id']}/response.json", response(task_id="wrong"))
+    transport.write_json(f"agent/tasks/{created['task_id']}/response.json", response(task_id="wrong"))
     result = exchange.poll(created, manifest())
     assert result["status"] == "correction_required"
     assert store.read(created["task_id"], "receipt.json") is None
-    assert transport.read_json(f"tasks/{created['task_id']}/correction.json")["artifact"] == "task_correction"
+    assert transport.read_json(f"agent/tasks/{created['task_id']}/validation.json")["artifact"] == "task_correction"
+
+
+def test_correction_retry_accepts_replaced_response(tmp_path: Path) -> None:
+    project = MoonProject.open(tmp_path / "project", create=True)
+    transport = MirrorTransport(tmp_path / "drive", "p")
+    exchange = TaskExchange(TaskStore(project), transport)
+    created = exchange.create(stage="footage", revision=1, manifest=manifest(), result_schema={"type": "object"}, inputs={})
+    remote = f"agent/tasks/{created['task_id']}/response.json"
+    transport.write_json(remote, response(task_id="wrong"))
+    assert exchange.poll(created, manifest())["status"] == "correction_required"
+    transport.write_json(remote, response(task_id=created["task_id"]))
+    assert exchange.poll(created, manifest())["status"] == "accepted"
+    assert transport.read_json("agent/current.json")["status"] == "ACCEPTED"
+
+
+def test_semantic_validation_happens_before_receipt(tmp_path: Path) -> None:
+    project = MoonProject.open(tmp_path / "project", create=True)
+    transport = MirrorTransport(tmp_path / "drive", "p")
+    store = TaskStore(project)
+    exchange = TaskExchange(store, transport)
+    created = exchange.create(stage="footage", revision=1, manifest=manifest(), result_schema={"type": "object"}, inputs={})
+    transport.write_json(f"agent/tasks/{created['task_id']}/response.json", response(task_id=created["task_id"]))
+
+    result = exchange.poll(
+        created,
+        manifest(),
+        semantic_validator=lambda value: (_ for _ in ()).throw(ValueError("bad semantics")),
+    )
+
+    assert result["status"] == "correction_required"
+    assert store.read(created["task_id"], "receipt.json") is None
+
+
+def test_apply_recovers_after_interrupted_attempt(tmp_path: Path) -> None:
+    project = MoonProject.open(tmp_path / "project", create=True)
+    transport = MirrorTransport(tmp_path / "drive", "p")
+    exchange = TaskExchange(TaskStore(project), transport)
+    created = exchange.create(stage="footage", revision=1, manifest=manifest(), result_schema={"type": "object"}, inputs={})
+    transport.write_json(f"agent/tasks/{created['task_id']}/response.json", response(task_id=created["task_id"]))
+    exchange.poll(created, manifest())
+    attempts = 0
+
+    def callback(value: dict) -> dict:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("simulated crash")
+        return {"recovered": True}
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        exchange.apply(created, callback)
+    applied = exchange.apply(created, callback)
+
+    assert applied["attempt"] == 2
+    assert applied["result"] == {"recovered": True}
+    assert transport.read_json("agent/current.json")["status"] == "CONSUMED"
+
+
+def test_refinement_child_preserves_partial_and_sampled_evidence(tmp_path: Path) -> None:
+    project = MoonProject.open(tmp_path / "project", create=True)
+    transport = MirrorTransport(tmp_path / "drive", "p")
+    exchange = TaskExchange(TaskStore(project), transport)
+    parent = exchange.create(stage="footage", revision=1, manifest=manifest(), result_schema={"type": "object"}, inputs={})
+    child = exchange.create_refinement(
+        parent,
+        manifest(),
+        [{"clip_id": "c1", "start_seconds": 0.0, "end_seconds": 1.0, "reason": "boundary"}],
+        {"type": "object"},
+        partial_result={"clips": [{"clip_id": "done"}]},
+        sampled_evidence={"groups": [{"group_id": "g1"}]},
+    )
+
+    assert child["parent_task_id"] == parent["task_id"]
+    assert child["inputs"]["partial_result"]["clips"][0]["clip_id"] == "done"
+    assert child["inputs"]["sampled_evidence"]["groups"][0]["group_id"] == "g1"
