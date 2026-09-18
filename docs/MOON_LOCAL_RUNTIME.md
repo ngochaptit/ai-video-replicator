@@ -332,8 +332,10 @@ The quality goal is to avoid the failure mode where a long single-take clip with
 
 ## Project Mirror V2 (local sync)
 
-New local-sync projects default to `exchange_protocol: "project_mirror_v2"`.
-Moon mirrors only stable asset identities, metadata, bounded proxies, artifacts, and
+Project Mirror V2 is enabled explicitly with
+`exchange_protocol: "project_mirror_v2"`. Configurations that omit this key stay
+on `legacy`, including existing local-sync projects. Moon mirrors only stable
+asset identities, metadata, bounded proxies, artifacts, and
 evidence beneath `MON_EDIT/projects/<project_id>`. Original local paths never
 appear in the public manifest. Existing Google Drive API projects continue to use
 the legacy bridge unless explicitly migrated.

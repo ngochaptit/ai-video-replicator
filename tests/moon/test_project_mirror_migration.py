@@ -46,3 +46,18 @@ def test_migration_preserves_completed_and_active_batch_state(tmp_path: Path) ->
         "pending": ["coarse_002"],
         "active": "refinement_008",
     }
+
+
+def test_migration_inventories_reusable_artifacts(tmp_path: Path) -> None:
+    project = MoonProject.open(tmp_path / "project", create=True)
+    artifact = project.artifacts_dir / "reference_blueprint.json"
+    artifact.write_text('{"segments": []}', encoding="utf-8")
+    project.state_path.write_text(
+        json.dumps({"status": "waiting", "current_stage": "footage", "revision": 2, "completed": ["proposal", "analyze"]}),
+        encoding="utf-8",
+    )
+
+    result = migrate_project_mirror_v2(project)
+
+    assert result["pipeline"]["completed_stages"] == ["proposal", "analyze"]
+    assert result["reusable_files"][0]["relative_path"] == ".moon/artifacts/reference_blueprint.json"
